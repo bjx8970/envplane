@@ -9,7 +9,7 @@
 - [执行与持久化](docs/execution-persistence-contract.md)
 - [身份、授权与安全](docs/identity-security-contract.md)
 
-这些是已确认的 v1 目标设计，不是现有功能说明。当前运行代码仍为旧 Flask/Jinja 单体，尚无新插件运行时、Alembic 或 PostgreSQL Job/Operation 内核。变更说明必须区分“设计”“实现”“实测”，不能把规范写成已交付功能。
+这些是已确认的 v1 目标设计，不是完整功能交付说明。独立 `control_plane/` 已实现 P0 启动骨架和 P1 Alembic/领域表/持久协调租约与最小权限基座；业务入口仍为旧 Flask/Jinja 单体，尚无新插件运行时或 PostgreSQL Job/Operation 执行内核。变更说明必须区分“设计”“实现”“实测”，不能把完整规范写成已交付功能。
 
 ## 不得偏离的产品边界
 

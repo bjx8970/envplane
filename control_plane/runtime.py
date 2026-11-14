@@ -1,6 +1,10 @@
+from sqlalchemy import text
+
 from .config import COORDINATOR_LOCK_KEY
 from .coordination import CoordinatorLease
 from .database import create_database_engine
+from .migrations import SchemaMismatch, check_schema
+from .permissions import RuntimePermissionError, validate_runtime_permissions
 
 
 class CoordinatorConflict(RuntimeError):
@@ -31,24 +35,30 @@ class ControlPlaneRuntime:
         self._state = "stopped"
 
     def start(self) -> None:
-        if self._state == "running":
-            raise RuntimeError("control plane runtime is already running")
-        engine = create_database_engine(self.settings)
-        lease = CoordinatorLease(engine, COORDINATOR_LOCK_KEY)
+        if self._state != "stopped":
+            raise RuntimeError("control plane runtime is not stopped")
+        self._engine = create_database_engine(self.settings)
+        self._lease = CoordinatorLease(self._engine, COORDINATOR_LOCK_KEY, self.settings.lease_seconds)
+        self._state = "starting"
         try:
-            acquired = lease.acquire()
-        except (StartupInterrupted, StartupDeadlineExceeded):
-            engine.dispose()
+            with self._engine.connect() as connection:
+                check_schema(connection)
+                if not connection.scalar(text("SELECT session_user = current_user")):
+                    raise RuntimePermissionError("runtime must connect directly as its least-privilege login role")
+                validate_runtime_permissions(connection)
+            if not self._lease.acquire():
+                raise CoordinatorConflict("another coordinator is active")
+            self._state = "running"
+        except (StartupInterrupted, StartupDeadlineExceeded, SchemaMismatch,
+                RuntimePermissionError, CoordinatorConflict):
+            self.stop()
             raise
-        except Exception as exc:
-            engine.dispose()
-            raise DatabaseUnavailable("database connection failed") from exc
-        if not acquired:
-            engine.dispose()
-            raise CoordinatorConflict("another coordinator is active")
-        self._engine = engine
-        self._lease = lease
-        self._state = "running"
+        except Exception:
+            self.stop()
+            raise DatabaseUnavailable("database connection failed") from None
+        except BaseException:
+            self.stop()
+            raise
 
     def poll(self) -> None:
         if self._state != "running" or self._lease is None:
@@ -69,6 +79,17 @@ class ControlPlaneRuntime:
             lease.release()
         if engine is not None:
             engine.dispose()
+
+    def fenced_transaction(self):
+        if self._state != "running" or self._lease is None:
+            raise LeadershipLost("coordinator is not running")
+        return self._lease.fenced_transaction()
+
+    @property
+    def coordinator_identity(self):
+        if self._lease is None:
+            raise LeadershipLost("coordinator is not running")
+        return str(self._lease.owner_id), self._lease.revision
 
     @property
     def lock_backend_pid(self) -> int:

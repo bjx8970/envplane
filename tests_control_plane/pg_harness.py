@@ -117,20 +117,22 @@ def terminate_backend(url: str, backend_pid: int) -> None:
         engine.dispose()
 
 
-def enable_short_transaction_timeout(url: str) -> None:
+def enable_short_transaction_timeout(url: str, role_name="postgres") -> None:
     engine = engine_for(url)
     try:
         with engine.begin() as conn:
-            conn.execute(text("ALTER ROLE postgres SET transaction_timeout = '2s'"))
+            role = conn.dialect.identifier_preparer.quote_identifier(role_name)
+            conn.execute(text(f"ALTER ROLE {role} SET transaction_timeout = '2s'"))
     finally:
         engine.dispose()
 
 
-def reset_transaction_timeout(url: str) -> None:
+def reset_transaction_timeout(url: str, role_name="postgres") -> None:
     engine = engine_for(url)
     try:
         with engine.begin() as conn:
-            conn.execute(text("ALTER ROLE postgres RESET transaction_timeout"))
+            role = conn.dialect.identifier_preparer.quote_identifier(role_name)
+            conn.execute(text(f"ALTER ROLE {role} RESET transaction_timeout"))
     finally:
         engine.dispose()
 

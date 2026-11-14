@@ -1,3 +1,7 @@
 control_plane/** text eol=lf
 tests_control_plane/** text eol=lf
-scripts/run_p0_tests.sh text eol=lf
+scripts/*.sh text eol=lf
+scripts/*.py text eol=lf
+migrations/** text eol=lf
+alembic.ini text eol=lf
+.github/workflows/** text eol=lf

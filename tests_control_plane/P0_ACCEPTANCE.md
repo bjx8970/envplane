@@ -1,15 +1,23 @@
 # P0 运行基线验收案例
 
-状态：验收基线 v1.0，冻结日期 2026-11-06。
+状态：P0 历史验收基线 v1.0，冻结日期 2026-11-06；以下 P0 执行记录对应提交 `352437b`，不是 P1 的当前实测结果。
+
+## P1 演进说明
+
+P1 将未迁移数据库的启动行为改为失败关闭：先以迁移账号显式运行 `python -m control_plane db upgrade`，再用 `python -m control_plane db grant-runtime ROLE` 授权部署方预建的低权角色，最后使用该角色独立登录启动控制面，不把迁移凭据交给运行进程。普通启动检查 Alembic revision 和有效权限，不执行 DDL。成功启动同时取得 advisory lock 和带 owner/revision/期限的持久租约。审查增量修复要求 `0002_p1_review_guards`，覆盖心跳锁等待预算、强制 fenced Unit of Work、单调 Storage head 与运行账号最小权限；不改写 `0001_v1_foundation`。
+
+因此，P0-03 的“空库可启动”由“空库拒启且无 DDL、迁移后取得唯一资格”替代，P0-08 在已迁移库上核对启动前后表结构不变。其余导入、超时、信号、并发、失锁和事务时限断言继续保留；当前控制面测试入口为 `bash scripts/run_p1_tests.sh`。
+
+`p0_baseline.sha256` 保留原值，仅用于从 `352437b` 提取原始四个文件后核对历史冻结内容；本次不重写旧哈希，也不将 P1 演进后的文件冒充原始 P0 基线。P1 故障与约束测试见同目录 `test_p1_runtime.py`、`test_p1_schema.py`。
 
 本文件只覆盖 P0“无副作用启动骨架”：配置校验、显式 PostgreSQL 连接、唯一协调资格、显式启停和进程边界。它不包含领域表、Alembic 业务迁移、插件运行时、Job/Step/Operation、HTTP API、模板 UI 或旧系统迁移；这些属于后续阶段。P0 不修改旧 Flask/Jinja 代码，也不建立兼容层。
 
 依据：
 
-- [架构与产品边界](../../docs/architecture.md)：单进程模块化、显式后台组件、唯一协调实例、PostgreSQL 持久事实。
-- [执行与持久化规范](../../docs/execution-persistence-contract.md)：调用容量、失败关闭、恢复边界。
-- [身份与安全规范](../../docs/identity-security-contract.md)：错误和日志不得泄露秘密。
-- [AGENTS 验证约束](../../AGENTS.md)：测试优先在默认 WSL 运行；导入不得读库、连接外部系统或启动线程。
+- [架构与产品边界](../docs/architecture.md)：单进程模块化、显式后台组件、唯一协调实例、PostgreSQL 持久事实。
+- [执行与持久化规范](../docs/execution-persistence-contract.md)：调用容量、失败关闭、恢复边界。
+- [身份与安全规范](../docs/identity-security-contract.md)：错误和日志不得泄露秘密。
+- [AGENTS 验证约束](../AGENTS.md)：测试优先在默认 WSL 运行；导入不得读库、连接外部系统或启动线程。
 
 ## 运行契约
 
