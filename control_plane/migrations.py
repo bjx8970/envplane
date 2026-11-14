@@ -7,7 +7,8 @@ from .config import COORDINATOR_LOCK_KEY
 from .database import create_database_engine
 
 SCHEMA = "control_plane"
-HEAD_REVISION = "0001_v1_foundation"
+BASELINE_REVISION = "0001_v1_foundation"
+HEAD_REVISION = "0002_p1_review_guards"
 
 
 class SchemaMismatch(RuntimeError):
@@ -22,11 +23,11 @@ class MigrationError(RuntimeError):
     pass
 
 
-def check_schema(connection) -> None:
+def check_schema(connection, *, compatible_revisions=(HEAD_REVISION,)) -> None:
     if connection.scalar(text("SELECT to_regclass('control_plane.alembic_version')")) is None:
         raise SchemaMismatch("schema is not initialized; run python -m control_plane db upgrade")
     revisions = list(connection.scalars(text("SELECT version_num FROM control_plane.alembic_version")))
-    if revisions != [HEAD_REVISION]:
+    if len(revisions) != 1 or revisions[0] not in compatible_revisions:
         raise SchemaMismatch("schema revision is incompatible; run python -m control_plane db upgrade")
     required = {
         "users", "courses", "groups", "course_members", "templates", "template_versions",
@@ -61,7 +62,7 @@ def _validate_database(connection) -> None:
 
 @contextmanager
 def migration_transaction(settings, target="head", *, upgrade=True):
-    if target not in ("head", "base", HEAD_REVISION) or (upgrade and target == "base"):
+    if target not in ("head", "base", BASELINE_REVISION, HEAD_REVISION) or (upgrade and target == "base"):
         raise MigrationError("unsupported migration target")
     engine = create_database_engine(settings)
     try:
@@ -74,7 +75,7 @@ def migration_transaction(settings, target="head", *, upgrade=True):
             _validate_database(connection)
             connection.execute(text("CREATE SCHEMA IF NOT EXISTS control_plane"))
             if not upgrade:
-                check_schema(connection)
+                check_schema(connection, compatible_revisions=(BASELINE_REVISION, HEAD_REVISION))
                 tables = list(connection.scalars(text(
                     "SELECT tablename FROM pg_tables WHERE schemaname='control_plane' "
                     "AND tablename NOT IN ('alembic_version','coordinator_leases')"

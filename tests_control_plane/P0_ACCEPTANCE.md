@@ -4,7 +4,7 @@
 
 ## P1 演进说明
 
-P1 将未迁移数据库的启动行为改为失败关闭：先显式运行 `python -m control_plane db upgrade`，再启动控制面。普通启动检查 Alembic revision，不执行 DDL。成功启动同时取得 advisory lock 和带 owner/revision/期限的持久租约。
+P1 将未迁移数据库的启动行为改为失败关闭：先以迁移账号显式运行 `python -m control_plane db upgrade`，再用 `python -m control_plane db grant-runtime ROLE` 授权部署方预建的低权角色，最后使用该角色独立登录启动控制面，不把迁移凭据交给运行进程。普通启动检查 Alembic revision 和有效权限，不执行 DDL。成功启动同时取得 advisory lock 和带 owner/revision/期限的持久租约。审查增量修复要求 `0002_p1_review_guards`，覆盖心跳锁等待预算、强制 fenced Unit of Work、单调 Storage head 与运行账号最小权限；不改写 `0001_v1_foundation`。
 
 因此，P0-03 的“空库可启动”由“空库拒启且无 DDL、迁移后取得唯一资格”替代，P0-08 在已迁移库上核对启动前后表结构不变。其余导入、超时、信号、并发、失锁和事务时限断言继续保留；当前控制面测试入口为 `bash scripts/run_p1_tests.sh`。
 

@@ -87,18 +87,24 @@
 `control_plane/` 与旧 Flask 入口独立，不读取旧 `.db_config.json`、不导入旧业务模块，也不提供兼容层。只使用专用 PostgreSQL 数据库；应用表和 Alembic 版本表位于 `control_plane` schema。迁移发现无关用户表时拒绝执行，不迁移或覆盖旧库。
 
 ```sh
-# CONTROL_PLANE_DATABASE_URL 由受控部署环境提供，不将真实 URL/密码写入仓库。
+# 管理会话：CONTROL_PLANE_DATABASE_URL 指向专用库的迁移账号。
+# 运行角色由部署管理员预先创建，登录秘密通过受控渠道设置，不写入仓库。
 python -m control_plane db upgrade
+python -m control_plane db grant-runtime control_plane_runtime
+
+# 结束管理会话。使用独立低权运行账号的 URL 启动，不向运行进程注入迁移凭据。
 python -m control_plane start
 ```
 
 - `db upgrade [head]` 显式执行 Alembic 迁移。DDL 与版本写入在同一事务；并发迁移或正在运行的协调者占锁时拒绝迁移。
-- `start` 只校验 schema revision 和必需表，不执行 DDL。空库或不兼容版本退出 4，并给出安全提示。
-- 协调者持有专用连接的 advisory lock 及持久 owner/revision/期限；续期核对数据库时间和实际锁归属。失锁或过期退出 4，不自动重取。
-- 权威写入使用 `fenced_transaction()`，在同一短事务进入和提交前核对资格；失权时回滚。该 fencing 不能终止远端命令。
+- `start` 只校验 schema revision、必需表与有效数据库权限，不执行 DDL。空库、不兼容版本或不安全/不完整权限退出 4，并给出脱敏提示。当前 head 为 `0002_p1_review_guards`；旧 `0001_v1_foundation` 必须显式升级，不改写基线迁移。
+- `db grant-runtime ROLE` 在与迁移相同的事务/互斥/专用库守卫下向已有角色授予固定最小权限；不创建角色、存储密码或静默撤销 PUBLIC/其他角色权限。危险权限必须由部署管理员先纠正。运行进程必须直接用独立低权登录角色连接，拒绝高权会话 `SET ROLE` 伪装；运行账号不能是 superuser、owner、可提权成员或具有持久 DDL/TRUNCATE 权限的角色。
+- 运行账号对追加历史、审计、执行证据、日志只拥有 SELECT/INSERT；对 Alembic 版本表只 SELECT，对协调租约只 SELECT/UPDATE，其余应用表按固定策略授权。不授予 DELETE/TRUNCATE/TRIGGER/REFERENCES/MAINTAIN；数据库角色权限与语句级 TRUNCATE 保护共同守住证据，迁移账号不交给普通运行进程。数据库超级用户/部署管理员仍是可信管理边界，不承诺阻止其显式 DDL。
+- 协调者持有专用连接的 advisory lock 及持久 owner/revision/期限；续期核对数据库时间和实际锁归属。取得、续租、释放均设置数据库端 lock/statement timeout（每语句最多 1 秒且不超过租期的四分之一）；持锁阻塞或失锁/过期时失败关闭、退出 4，不自动重取。核心写事务应保持足够短，不能跨越外部 I/O。
+- 权威写入通过 `fenced_transaction()` 获取同线程、同事务的受控 Unit of Work；`write_storage()` / `admit_job()` 拒绝裸连接、过期/跨线程/已退出对象，入口和提交前核对数据库资格；失权时整体回滚。不暴露提前 commit/rollback 的连接或结果句柄，事务控制不属于 UoW 接口。此边界防止可信核心的误用，不是恶意 Python 代码沙箱，也不能终止远端命令。
 - `CONTROL_PLANE_LEASE_SECONDS` 默认 30 秒，范围 1～3600；必须大于两次 `CONTROL_PLANE_LOCK_POLL_SECONDS` 加一次连接预算。连接预算默认 5 秒、轮询默认 1 秒。
 - `db downgrade base` 只允许应用表为空；存在业务/执行/审计数据时拒绝降级。它不是旧库迁移、外部资源清理或生产回退方案。
-- 领域表覆盖身份、课程、配额、插件配置/Storage 历史、模板、环境、执行、冲突、秘密、会话与审计；包含唯一约束、跨作用域外键、JSON 上限与不可变历史保护。底层请求去重和 Storage CAS 已实现；完整 Storage API、Job 执行器、业务授权和 UI 仍属于后续阶段。
+- 领域表覆盖身份、课程、配额、插件配置/Storage 历史、模板、环境、执行、冲突、秘密、会话与审计；包含唯一约束、跨作用域外键、JSON 上限与不可变历史保护。Storage head 身份不可更改，不可删除重建或指向旧历史；延迟约束要求提交时指向最新历史，墓碑后也必须精确 CAS 前进。增量迁移发现旧 head 回退或有历史无 head 时整体回滚，不自动修复故障证据。底层请求去重和 Storage CAS 已实现；完整 Storage API、Job 执行器、业务授权和 UI 仍属于后续阶段。
 
 ## 当前测试与验证
 
@@ -112,7 +118,9 @@ bash scripts/run_p1_tests.sh
 
 P0 原始冻结文件及通过记录对应 `352437b`；P1 对空库拒启和显式迁移的演进见 `tests_control_plane/P0_ACCEPTANCE.md`，不重写历史冻结哈希。
 
-2026-11-11 实测：默认 WSL、Python 3.12.13、Podman 一次性 PostgreSQL 17，执行 `bash scripts/run_p1_tests.sh`，103 项全部通过，0 失败、0 错误、0 跳过。覆盖显式及原生 Alembic 升降级、迁移中断/回滚/并发/权限、空库与版本拒启、租约期限/旧写 fencing/等锁后过期、Storage CAS/历史快照、秘密跨环境隔离和审计保护。未运行旧 Flask 测试套件、GitHub 托管 CI 或真实设备/浏览器端到端验证。
+2026-11-11 历史实测：P1 初始版本在默认 WSL、Python 3.12.13、Podman 一次性 PostgreSQL 17 执行 `bash scripts/run_p1_tests.sh`，103 项全部通过，0 失败、0 错误、0 跳过。
+
+2026-11-14 审查修复实测：默认 WSL `RHEL-10.2`、项目隔离 Python 3.12 环境、Podman 一次性 PostgreSQL 17，执行同一严格入口，147 项全部通过，0 失败、0 错误、0 跳过（54.364 秒）。覆盖原有显式/原生 Alembic 升降级与故障矩阵，新增心跳长持锁/信号有界退出、失权 API 拒绝与整事务回滚、跨线程/退出后 UoW 拒绝、提前提交句柄隔离、真实低权运行账号正常提交及 TRUNCATE/DDL 拒绝、PUBLIC/继承/SET ROLE/列级提权拒启、Storage head 回退/孤立历史/并发/旧异常库升级回滚，以及 pg8000 pre_ping 连接池反复复用。最初回归暴露的 OID 角色重载和预检隐式事务已定位修复，最终严格全套通过；测试容器由脚本退出清理。未运行旧 Flask 套件、真实设备、生产迁移或浏览器端到端验证；本地通过不代替当前提交的 GitHub 托管 CI 或人工复审。
 
 
 旧系统的规范发现入口为：

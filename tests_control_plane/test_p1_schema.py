@@ -7,6 +7,8 @@ from uuid import uuid4
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
+from control_plane.config import COORDINATOR_LOCK_KEY
+from control_plane.coordination import CoordinatorLease
 from control_plane.persistence import RequestConflict, StorageConflict, admit_job, write_storage
 from tests_control_plane.p1_harness import migrated_database
 from tests_control_plane.pg_harness import engine_for
@@ -61,10 +63,12 @@ class SchemaConstraintTests(unittest.TestCase):
         cls.addClassCleanup(cls.engine.dispose)
 
     def setUp(self):
-        self.conn = self.engine.connect()
-        self.tx = self.conn.begin()
-        self.addCleanup(self.conn.close)
-        self.addCleanup(self.tx.rollback)
+        lease = CoordinatorLease(self.engine, COORDINATOR_LOCK_KEY)
+        self.addCleanup(lease.release)
+        self.assertTrue(lease.acquire())
+        context = lease.fenced_transaction()
+        self.conn = context.__enter__()
+        self.addCleanup(context.__exit__, RuntimeError, RuntimeError("test rollback"), None)
 
     def rejects(self, sql, params=None):
         with self.assertRaises(DBAPIError):
@@ -311,17 +315,76 @@ class SchemaConstraintTests(unittest.TestCase):
         self.rejects("DELETE FROM control_plane.secret_versions WHERE id=:id", {"id": version})
 
 
+class CoordinatorConnectionReuseTests(unittest.TestCase):
+    def test_pre_ping_reuse_does_not_retain_lease_locks_or_test_writes(self):
+        class RollbackProbe(Exception):
+            pass
+
+        with migrated_database() as url:
+            engine = engine_for(url)
+            probe_engine = engine_for(url)
+            try:
+                # Ensure acquire checks out an already-used connection, so the
+                # pg8000 pre_ping SELECT has run with autocommit initially off.
+                with engine.connect() as connection:
+                    connection.scalar(text("SELECT 1"))
+                for _ in range(3):
+                    lease = CoordinatorLease(engine, COORDINATOR_LOCK_KEY)
+                    try:
+                        self.assertTrue(lease.acquire())
+                        with probe_engine.begin() as probe:
+                            self.assertEqual(probe.scalar(text("""
+                                SELECT state FROM pg_stat_activity WHERE pid=:pid
+                            """), {"pid": lease.backend_pid}), "idle")
+                            probe.execute(text("""
+                                SELECT id FROM control_plane.coordinator_leases
+                                WHERE id=1 FOR UPDATE NOWAIT
+                            """))
+                        marker = f"rollback-probe-{uuid4().hex}"
+                        with self.assertRaises(RollbackProbe):
+                            with lease.fenced_transaction() as connection:
+                                insert(connection, "users", username=marker,
+                                       password_hash="test-hash", role="teacher")
+                                raise RollbackProbe()
+                        with probe_engine.begin() as probe:
+                            # Independent backend: neither leaked locks nor an
+                            # accidentally committed fixture can hide in reuse.
+                            probe.execute(text("""
+                                SELECT id FROM control_plane.coordinator_leases
+                                WHERE id=1 FOR UPDATE NOWAIT
+                            """))
+                            self.assertEqual(probe.scalar(text("""
+                                SELECT count(*) FROM control_plane.users WHERE username=:marker
+                            """), {"marker": marker}), 0)
+                    finally:
+                        lease.release()
+                    with probe_engine.begin() as probe:
+                        acquired = probe.scalar(text("SELECT pg_try_advisory_lock(:key)"),
+                                                {"key": COORDINATOR_LOCK_KEY})
+                        try:
+                            self.assertTrue(acquired, "released coordinator retained its advisory lock")
+                        finally:
+                            if acquired:
+                                probe.execute(text("SELECT pg_advisory_unlock(:key)"),
+                                              {"key": COORDINATOR_LOCK_KEY})
+            finally:
+                engine.dispose()
+                probe_engine.dispose()
+
+
 class PersistenceConcurrencyTests(unittest.TestCase):
     def test_concurrent_storage_cas_has_one_winner(self):
         with migrated_database() as url:
             engine = engine_for(url)
+            lease = CoordinatorLease(engine, COORDINATOR_LOCK_KEY)
             try:
-                with engine.begin() as conn:
+                self.assertTrue(lease.acquire())
+                with lease.fenced_transaction() as conn:
                     instance = insert(conn, "plugin_instances", plugin_key="fake")
                     original = write_storage(conn, instance, "hosts", {"initial": True})
                 def write(index):
                     try:
-                        with engine.begin() as conn:
+                        with lease.fenced_transaction() as conn:
                             write_storage(conn, instance, "hosts", {"writer": index}, expected_version=original.id)
                         return "ok"
                     except StorageConflict:
@@ -332,20 +395,24 @@ class PersistenceConcurrencyTests(unittest.TestCase):
                 with engine.connect() as conn:
                     self.assertEqual(conn.scalar(text("SELECT count(*) FROM control_plane.plugin_storage_versions WHERE instance_id=:id"), {"id": instance}), 2)
             finally:
+                lease.release()
                 engine.dispose()
 
     def test_concurrent_identical_requests_share_one_job(self):
         with migrated_database() as url:
             engine = engine_for(url)
+            lease = CoordinatorLease(engine, COORDINATOR_LOCK_KEY)
             try:
-                with engine.begin() as conn:
+                self.assertTrue(lease.acquire())
+                with lease.fenced_transaction() as conn:
                     args = job_arguments(conn)
                 def submit(_):
-                    with engine.begin() as conn:
+                    with lease.fenced_transaction() as conn:
                         return admit_job(conn, **args)
                 with ThreadPoolExecutor(max_workers=2) as pool:
                     results = list(pool.map(submit, (1, 2)))
                 self.assertEqual(results[0][0], results[1][0])
                 self.assertEqual(sorted(item[1] for item in results), [False, True])
             finally:
+                lease.release()
                 engine.dispose()

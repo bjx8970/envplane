@@ -7,6 +7,7 @@ import unittest
 from dataclasses import FrozenInstanceError
 
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 
 from control_plane.config import (
     COORDINATOR_LOCK_KEY,
@@ -14,7 +15,7 @@ from control_plane.config import (
     RuntimeSettings,
 )
 from control_plane.runtime import ControlPlaneRuntime
-from tests_control_plane.p1_harness import fresh_database, migrated_database
+from tests_control_plane.p1_harness import fresh_database, runtime_database
 from tests_control_plane.pg_harness import (
     ROOT,
     ChattyPostgresServer,
@@ -192,12 +193,12 @@ class CliConfigurationTests(unittest.TestCase):
 class StartupTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        database = migrated_database()
-        cls.url = database.__enter__()
+        database = runtime_database()
+        cls.url, cls.runtime_url = database.__enter__()
         cls.addClassCleanup(database.__exit__, None, None, None)
 
     def start_leader(self, **kwargs):
-        process = CliProcess(self.url, **kwargs)
+        process = CliProcess(self.runtime_url, **kwargs)
         self.addCleanup(process.kill)
         payload = process.read_event("ready")
         return process, payload
@@ -233,14 +234,14 @@ class StartupTests(unittest.TestCase):
 
     def test_duplicate_start_is_rejected(self):
         leader, _ = self.start_leader()
-        code, stdout, stderr = run_cli_once(self.url, timeout=10)
+        code, stdout, stderr = run_cli_once(self.runtime_url, timeout=10)
         self.assertEqual(code, 3, stdout + stderr)
         self.assertFalse(ready_events(stdout))
         self.assertIsNone(leader.proc.poll())
         self.stop_leader(leader)
 
     def test_concurrent_start_has_single_leader(self):
-        processes = [CliProcess(self.url) for _ in range(3)]
+        processes = [CliProcess(self.runtime_url) for _ in range(3)]
         for process in processes:
             self.addCleanup(process.kill)
         leader, _ = wait_for_one_ready(processes, timeout=15)
@@ -314,8 +315,9 @@ class StartupTests(unittest.TestCase):
         self.assertLess(elapsed, 3.0)
 
     def test_heartbeat_survives_transaction_timeout(self):
-        enable_short_transaction_timeout(self.url)
-        self.addCleanup(reset_transaction_timeout, self.url)
+        role = make_url(self.runtime_url).username
+        enable_short_transaction_timeout(self.url, role)
+        self.addCleanup(reset_transaction_timeout, self.url, role)
         leader, _ = self.start_leader(lock_poll_seconds=0.1)
         time.sleep(2.6)
         self.assertIsNone(leader.proc.poll())
@@ -367,12 +369,12 @@ class StartupTests(unittest.TestCase):
 class LeadershipTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        database = migrated_database()
-        cls.url = database.__enter__()
+        database = runtime_database()
+        cls.url, cls.runtime_url = database.__enter__()
         cls.addClassCleanup(database.__exit__, None, None, None)
 
     def test_terminated_lock_backend_forces_shutdown(self):
-        process = CliProcess(self.url, lock_poll_seconds=0.1)
+        process = CliProcess(self.runtime_url, lock_poll_seconds=0.1)
         self.addCleanup(process.kill)
         payload = process.read_event("ready")
         self.assertFalse(try_advisory_lock(self.url, COORDINATOR_LOCK_KEY))
@@ -392,13 +394,13 @@ class LeadershipTests(unittest.TestCase):
 class LifecycleUnitTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        database = migrated_database()
-        cls.url = database.__enter__()
+        database = runtime_database()
+        cls.url, cls.runtime_url = database.__enter__()
         cls.addClassCleanup(database.__exit__, None, None, None)
 
     def test_runtime_restart_and_idempotent_stop(self):
         settings = RuntimeSettings.from_env(
-            {"CONTROL_PLANE_DATABASE_URL": self.url}
+            {"CONTROL_PLANE_DATABASE_URL": self.runtime_url}
         )
         runtime = ControlPlaneRuntime(settings)
         try:
@@ -419,13 +421,13 @@ class LifecycleUnitTests(unittest.TestCase):
 
     def test_stop_without_start_is_safe(self):
         settings = RuntimeSettings.from_env(
-            {"CONTROL_PLANE_DATABASE_URL": self.url}
+            {"CONTROL_PLANE_DATABASE_URL": self.runtime_url}
         )
         ControlPlaneRuntime(settings).stop()
 
     def test_settings_are_immutable(self):
         settings = RuntimeSettings.from_env(
-            {"CONTROL_PLANE_DATABASE_URL": self.url}
+            {"CONTROL_PLANE_DATABASE_URL": self.runtime_url}
         )
         with self.assertRaises(FrozenInstanceError):
             settings.lock_poll_seconds = 2.0

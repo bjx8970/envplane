@@ -5,7 +5,11 @@ import sys
 import threading
 
 from .config import ConfigurationError, RuntimeSettings
-from .migrations import MigrationConflict, MigrationError, SchemaMismatch, run_migrations
+from .migrations import (
+    MigrationConflict, MigrationError, SchemaMismatch, check_schema,
+    migration_transaction, run_migrations,
+)
+from .permissions import RuntimePermissionError, grant_runtime_permissions
 from .runtime import (
     ControlPlaneRuntime,
     CoordinatorConflict,
@@ -138,7 +142,7 @@ def _run_start() -> int:
         _stop_quietly(runtime)
         print("startup deadline exceeded", file=sys.stderr, flush=True)
         return EXIT_RUNTIME_FAILURE
-    except SchemaMismatch as exc:
+    except (SchemaMismatch, RuntimePermissionError) as exc:
         _stop_quietly(runtime)
         print(str(exc), file=sys.stderr, flush=True)
         return EXIT_RUNTIME_FAILURE
@@ -197,14 +201,22 @@ def _run_database(args) -> int:
         return EXIT_CONFIGURATION
     try:
         with _StartupDeadline(120):
-            run_migrations(settings, args.revision, upgrade=args.db_command == "upgrade")
+            if args.db_command == "grant-runtime":
+                with migration_transaction(settings) as connection:
+                    check_schema(connection)
+                    grant_runtime_permissions(connection, args.role)
+            else:
+                run_migrations(settings, args.revision, upgrade=args.db_command == "upgrade")
     except MigrationConflict:
         print("another migration or coordinator is active", file=sys.stderr, flush=True)
         return EXIT_COORDINATOR_CONFLICT
-    except (MigrationError, SchemaMismatch, StartupDeadlineExceeded):
-        print("database migration failed; no changes were committed", file=sys.stderr, flush=True)
+    except (MigrationError, SchemaMismatch, RuntimePermissionError, StartupDeadlineExceeded):
+        print("database administration failed; no changes were committed", file=sys.stderr, flush=True)
         return EXIT_RUNTIME_FAILURE
-    _write_event("migrated", target=args.revision)
+    if args.db_command == "grant-runtime":
+        _write_event("runtime_permissions_granted")
+    else:
+        _write_event("migrated", target=args.revision)
     return EXIT_OK
 
 
@@ -218,6 +230,8 @@ def main(argv=None) -> int:
     upgrade.add_argument("revision", nargs="?", default="head")
     downgrade = commands.add_parser("downgrade", help="downgrade an empty application schema")
     downgrade.add_argument("revision", nargs="?", default="base")
+    grant = commands.add_parser("grant-runtime", help="grant a pre-created low-privilege runtime role")
+    grant.add_argument("role")
     args = parser.parse_args(argv)
     if args.command == "db":
         return _run_database(args)

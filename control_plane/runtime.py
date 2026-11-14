@@ -1,7 +1,10 @@
+from sqlalchemy import text
+
 from .config import COORDINATOR_LOCK_KEY
 from .coordination import CoordinatorLease
 from .database import create_database_engine
-from .migrations import SchemaMismatch
+from .migrations import SchemaMismatch, check_schema
+from .permissions import RuntimePermissionError, validate_runtime_permissions
 
 
 class CoordinatorConflict(RuntimeError):
@@ -38,10 +41,16 @@ class ControlPlaneRuntime:
         self._lease = CoordinatorLease(self._engine, COORDINATOR_LOCK_KEY, self.settings.lease_seconds)
         self._state = "starting"
         try:
+            with self._engine.connect() as connection:
+                check_schema(connection)
+                if not connection.scalar(text("SELECT session_user = current_user")):
+                    raise RuntimePermissionError("runtime must connect directly as its least-privilege login role")
+                validate_runtime_permissions(connection)
             if not self._lease.acquire():
                 raise CoordinatorConflict("another coordinator is active")
             self._state = "running"
-        except (StartupInterrupted, StartupDeadlineExceeded, SchemaMismatch, CoordinatorConflict):
+        except (StartupInterrupted, StartupDeadlineExceeded, SchemaMismatch,
+                RuntimePermissionError, CoordinatorConflict):
             self.stop()
             raise
         except Exception:

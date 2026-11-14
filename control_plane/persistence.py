@@ -4,6 +4,8 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import text
 
+from .coordination import require_fenced_connection
+
 
 class StorageConflict(RuntimeError):
     pass
@@ -21,8 +23,7 @@ class StorageVersion:
 
 
 def write_storage(connection, instance_id, key, value, *, expected_version=None, delete=False):
-    if not connection.in_transaction():
-        raise RuntimeError("storage writes require an explicit transaction")
+    require_fenced_connection(connection)
     if not isinstance(key, str) or not key or len(key) > 255:
         raise ValueError("invalid storage key")
     if not delete and not isinstance(value, dict):
@@ -64,8 +65,7 @@ def write_storage(connection, instance_id, key, value, *, expected_version=None,
 
 def admit_job(connection, *, actor_id, request_key, request_digest, environment_id,
               execution_group_id, logical_invocation_id, kind, input, execution_snapshot):
-    if not connection.in_transaction():
-        raise RuntimeError("job admission requires an explicit transaction")
+    require_fenced_connection(connection)
     job_id = uuid4()
     inserted = connection.scalar(text("""
         INSERT INTO control_plane.jobs
