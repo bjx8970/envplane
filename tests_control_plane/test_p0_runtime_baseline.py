@@ -6,12 +6,15 @@ import time
 import unittest
 from dataclasses import FrozenInstanceError
 
+from sqlalchemy import text
+
 from control_plane.config import (
     COORDINATOR_LOCK_KEY,
     ConfigurationError,
     RuntimeSettings,
 )
 from control_plane.runtime import ControlPlaneRuntime
+from tests_control_plane.p1_harness import fresh_database, migrated_database
 from tests_control_plane.pg_harness import (
     ROOT,
     ChattyPostgresServer,
@@ -19,7 +22,7 @@ from tests_control_plane.pg_harness import (
     SilentTcpServer,
     TestDatabaseIsolationError,
     enable_short_transaction_timeout,
-    public_table_count,
+    engine_for,
     reset_transaction_timeout,
     require_disposable_database_url,
     run_cli_once,
@@ -28,6 +31,24 @@ from tests_control_plane.pg_harness import (
     validate_disposable_database_url,
     wait_for_one_ready,
 )
+
+
+def application_table_count(url: str) -> int:
+    # P1 tables live in control_plane, not public. Count all application schemas
+    # so implicit initialization cannot hide behind an unchanged public schema.
+    engine = engine_for(url)
+    try:
+        with engine.connect() as connection:
+            return int(
+                connection.scalar(
+                    text(
+                        "SELECT count(*) FROM information_schema.tables "
+                        "WHERE table_schema NOT IN ('pg_catalog', 'information_schema')"
+                    )
+                )
+            )
+    finally:
+        engine.dispose()
 
 
 def parse_events(text: str) -> list[dict]:
@@ -171,7 +192,9 @@ class CliConfigurationTests(unittest.TestCase):
 class StartupTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.url = require_disposable_database_url()
+        database = migrated_database()
+        cls.url = database.__enter__()
+        cls.addClassCleanup(database.__exit__, None, None, None)
 
     def start_leader(self, **kwargs):
         process = CliProcess(self.url, **kwargs)
@@ -187,8 +210,21 @@ class StartupTests(unittest.TestCase):
         self.assertNotIn("postgresql", stderr.lower())
         self.assertNotIn("control_plane_test", stderr)
 
-    def test_empty_database_acquires_coordination(self):
-        self.assertEqual(public_table_count(self.url), 0)
+    def test_empty_database_requires_explicit_migration(self):
+        with fresh_database() as url:
+            before = application_table_count(url)
+            self.assertEqual(before, 0)
+            code, stdout, stderr = run_cli_once(url, timeout=10)
+            self.assertEqual(code, 4, stdout + stderr)
+            self.assertFalse(ready_events(stdout))
+            self.assertIn("python -m control_plane db upgrade", stderr)
+            self.assertNotIn("postgresql", stderr.lower())
+            self.assertNotIn("control_plane_test", stderr)
+            self.assertEqual(application_table_count(url), before)
+            self.assertTrue(try_advisory_lock(url, COORDINATOR_LOCK_KEY))
+
+    def test_migrated_database_acquires_coordination(self):
+        self.assertGreater(application_table_count(self.url), 0)
         process, payload = self.start_leader()
         self.assertGreater(int(payload["lock_backend_pid"]), 0)
         self.assertFalse(try_advisory_lock(self.url, COORDINATOR_LOCK_KEY))
@@ -321,21 +357,25 @@ class StartupTests(unittest.TestCase):
         self.assertLess(elapsed, 6.0)
 
     def test_startup_does_not_create_schema(self):
-        self.assertEqual(public_table_count(self.url), 0)
+        before = application_table_count(self.url)
+        self.assertGreater(before, 0)
         leader, _ = self.start_leader()
         self.stop_leader(leader)
-        self.assertEqual(public_table_count(self.url), 0)
+        self.assertEqual(application_table_count(self.url), before)
 
 
 class LeadershipTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.url = require_disposable_database_url()
+        database = migrated_database()
+        cls.url = database.__enter__()
+        cls.addClassCleanup(database.__exit__, None, None, None)
 
     def test_terminated_lock_backend_forces_shutdown(self):
         process = CliProcess(self.url, lock_poll_seconds=0.1)
         self.addCleanup(process.kill)
         payload = process.read_event("ready")
+        self.assertFalse(try_advisory_lock(self.url, COORDINATOR_LOCK_KEY))
         terminate_backend(self.url, int(payload["lock_backend_pid"]))
         started = time.monotonic()
         code, stdout, stderr = process.wait_for_exit(timeout=6)
@@ -352,7 +392,9 @@ class LeadershipTests(unittest.TestCase):
 class LifecycleUnitTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.url = require_disposable_database_url()
+        database = migrated_database()
+        cls.url = database.__enter__()
+        cls.addClassCleanup(database.__exit__, None, None, None)
 
     def test_runtime_restart_and_idempotent_stop(self):
         settings = RuntimeSettings.from_env(
@@ -362,10 +404,16 @@ class LifecycleUnitTests(unittest.TestCase):
         try:
             runtime.start()
             self.assertGreater(runtime.lock_backend_pid, 0)
+            self.assertFalse(try_advisory_lock(self.url, COORDINATOR_LOCK_KEY))
+            with self.assertRaises(RuntimeError):
+                runtime.start()
+            self.assertFalse(try_advisory_lock(self.url, COORDINATOR_LOCK_KEY))
             runtime.stop()
             runtime.stop()
+            self.assertTrue(try_advisory_lock(self.url, COORDINATOR_LOCK_KEY))
             runtime.start()
             self.assertGreater(runtime.lock_backend_pid, 0)
+            self.assertFalse(try_advisory_lock(self.url, COORDINATOR_LOCK_KEY))
         finally:
             runtime.stop()
 

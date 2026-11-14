@@ -4,7 +4,7 @@
 
 ## 项目状态
 
-**本仓库已确定 v1 目标设计，运行代码尚未按该设计重构。本文及 `docs/` 中的新规范不表示相关功能已经实现。**
+**本仓库已确定 v1 目标设计；新控制面已实现 P0 启动骨架与 P1 持久化基座，但业务运行代码尚未切换。`docs/` 中完整插件、执行、模板和授权契约仍是目标设计，不表示已经交付。**
 
 当前代码仍是 Flask/Jinja 单体，直接调用 PVE、OpenWrt，使用进程内任务队列和旧 `clusters`、`vms` 等模型。目标是彻底重建运行结构，不要求旧 API、旧表或旧页面兼容；本文不提供旧系统到新系统的迁移承诺，也不授权清空真实数据库或外部资源。
 
@@ -82,7 +82,38 @@
 
 当前启动也存在顺序限制：`app.py` 在数据库初始化前创建 `SSHManager`，其构造过程会读配置表。没有数据库配置或面对空 schema 时不能把现有启动路径视为可用的新系统初始化向导。新系统必须遵守显式初始化、导入无副作用的规范。
 
+## 新控制面 P1 持久化基座
+
+`control_plane/` 与旧 Flask 入口独立，不读取旧 `.db_config.json`、不导入旧业务模块，也不提供兼容层。只使用专用 PostgreSQL 数据库；应用表和 Alembic 版本表位于 `control_plane` schema。迁移发现无关用户表时拒绝执行，不迁移或覆盖旧库。
+
+```sh
+# CONTROL_PLANE_DATABASE_URL 由受控部署环境提供，不将真实 URL/密码写入仓库。
+python -m control_plane db upgrade
+python -m control_plane start
+```
+
+- `db upgrade [head]` 显式执行 Alembic 迁移。DDL 与版本写入在同一事务；并发迁移或正在运行的协调者占锁时拒绝迁移。
+- `start` 只校验 schema revision 和必需表，不执行 DDL。空库或不兼容版本退出 4，并给出安全提示。
+- 协调者持有专用连接的 advisory lock 及持久 owner/revision/期限；续期核对数据库时间和实际锁归属。失锁或过期退出 4，不自动重取。
+- 权威写入使用 `fenced_transaction()`，在同一短事务进入和提交前核对资格；失权时回滚。该 fencing 不能终止远端命令。
+- `CONTROL_PLANE_LEASE_SECONDS` 默认 30 秒，范围 1～3600；必须大于两次 `CONTROL_PLANE_LOCK_POLL_SECONDS` 加一次连接预算。连接预算默认 5 秒、轮询默认 1 秒。
+- `db downgrade base` 只允许应用表为空；存在业务/执行/审计数据时拒绝降级。它不是旧库迁移、外部资源清理或生产回退方案。
+- 领域表覆盖身份、课程、配额、插件配置/Storage 历史、模板、环境、执行、冲突、秘密、会话与审计；包含唯一约束、跨作用域外键、JSON 上限与不可变历史保护。底层请求去重和 Storage CAS 已实现；完整 Storage API、Job 执行器、业务授权和 UI 仍属于后续阶段。
+
 ## 当前测试与验证
+
+新控制面的严格测试入口（Linux/默认 WSL）：
+
+```sh
+bash scripts/run_p1_tests.sh
+```
+
+脚本在项目 `tmp/p1-venv` 安装最小依赖，创建仅回环开放、密码认证的一次性 PostgreSQL 17，退出时清理自身容器。CI 默认只发现 `tests_control_plane/`，拒绝 skip、零测试、未运行完或失败；不把新控制面通过解释为旧系统通过。`scripts/run_ci_tests.py --legacy` 才额外发现旧套件，并要求事先安装其依赖。
+
+P0 原始冻结文件及通过记录对应 `352437b`；P1 对空库拒启和显式迁移的演进见 `tests_control_plane/P0_ACCEPTANCE.md`，不重写历史冻结哈希。
+
+2026-11-11 实测：默认 WSL、Python 3.12.13、Podman 一次性 PostgreSQL 17，执行 `bash scripts/run_p1_tests.sh`，103 项全部通过，0 失败、0 错误、0 跳过。覆盖显式及原生 Alembic 升降级、迁移中断/回滚/并发/权限、空库与版本拒启、租约期限/旧写 fencing/等锁后过期、Storage CAS/历史快照、秘密跨环境隔离和审计保护。未运行旧 Flask 测试套件、GitHub 托管 CI 或真实设备/浏览器端到端验证。
+
 
 旧系统的规范发现入口为：
 
@@ -90,7 +121,7 @@
 python -B -m unittest discover -s tests -t .
 ```
 
-测试使用 unittest、模拟供应商和临时数据库。测试文件存在，但当前树没有 CI workflow、Alembic migration 或新插件运行时。历史测试通过次数不作为本次文档更新的新回归结果，也不证明真实 PostgreSQL/PVE/OpenWrt/SSH 或浏览器端到端验收已经完成。
+旧测试使用 unittest、模拟供应商和临时数据库。新控制面现有 Alembic migration 与独立严格 CI workflow，但尚无新插件运行时、Job 执行器或业务 UI；旧测试不证明这些目标已实现。历史通过次数也不作为当前回归结果，不证明真实 PVE/OpenWrt/SSH 或浏览器端到端验收已经完成。
 
 新旧部署按[架构中的退役前置条件](docs/architecture.md#91-旧部署退役与硬切换前置条件)硬切换：先确认旧外部对象、未决任务、责任人和管理通道，验证旧库、凭据密文及独立密钥的备份恢复路径；新旧系统不得无协调同时修改同一对象。不要求自动迁移或兼容，不等于授权销毁真实资源、旧库、唯一管理凭据或故障证据。
 

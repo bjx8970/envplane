@@ -35,6 +35,7 @@ class RuntimeSettings:
     database_url: str = field(repr=False)
     connect_timeout_seconds: float = _DEFAULT_CONNECT_TIMEOUT
     lock_poll_seconds: float = _DEFAULT_LOCK_POLL
+    lease_seconds: float = 30.0
 
     @classmethod
     def from_env(cls, environ=None) -> "RuntimeSettings":
@@ -58,7 +59,7 @@ class RuntimeSettings:
             raise ConfigurationError(
                 "CONTROL_PLANE_DATABASE_URL must name a database"
             )
-        return cls(
+        settings = cls(
             database_url=url.render_as_string(hide_password=False),
             connect_timeout_seconds=_read_seconds(
                 env,
@@ -74,4 +75,10 @@ class RuntimeSettings:
                 0.05,
                 60.0,
             ),
+            lease_seconds=_read_seconds(
+                env, "CONTROL_PLANE_LEASE_SECONDS", 30.0, 1.0, 3600.0
+            ),
         )
+        if settings.lease_seconds <= 2 * settings.lock_poll_seconds + settings.connect_timeout_seconds:
+            raise ConfigurationError("lease duration must exceed two polls and a connection timeout")
+        return settings
