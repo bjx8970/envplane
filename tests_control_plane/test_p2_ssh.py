@@ -9,6 +9,7 @@ import multiprocessing
 import json
 from pathlib import Path
 import socket
+import threading
 import time
 from types import SimpleNamespace
 import unittest
@@ -32,6 +33,10 @@ def _server(private_key, ready, mode):
             return paramiko.OPEN_SUCCEEDED if kind == "session" else paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
         def check_channel_exec_request(self, channel, command):
             self.command = command
+            if mode == "exec_ack_timeout":
+                # Accept the request but never return: the transport reply
+                # thread is held here, so no exec ACK is ever sent back.
+                time.sleep(2)
             return True
     listener = socket.socket()
     listener.settimeout(4)
@@ -62,6 +67,10 @@ def _server(private_key, ready, mode):
             transport.close()
         elif mode == "wait_timeout":
             time.sleep(2)
+        elif mode == "exec_ack_timeout":
+            # Stay silent longer than the client's total deadline so the
+            # client's deadline is what expires, not the connection.
+            time.sleep(1)
         else:
             channel.sendall(b"x" * 8192 if mode == "output_limit" else b"test-output\n")
             channel.sendall_stderr(b"test-error\n")
@@ -227,6 +236,31 @@ class SSHPluginTests(unittest.TestCase):
                 self.assertLess(time.monotonic() - started, 3)
                 self.assertEqual(result.outcome, "unknown")
                 self.assertIsNone(result.output)
+
+    def test_exec_acknowledgement_wait_is_bounded_by_total_deadline(self):
+        # The server completes handshake+auth+channel open but never sends the
+        # exec request ACK.  execute must return within the total deadline,
+        # report unknown (dispatch may have happened, never a safe retry),
+        # close its resources, and leave no threads behind.
+        with self.server("exec_ack_timeout") as port:
+            context = self.context(port, seconds=.3)
+            plugin = SSHPlugin()
+            prepared = plugin.prepare("execute_command", {"host_id": "test", "command": "mutate"}, context)
+            before = threading.enumerate()
+            started = time.monotonic()
+            result = plugin.execute(prepared, context)
+            self.assertLess(time.monotonic() - started, 1.5)
+            self.assertEqual(result.outcome, "unknown")
+            self.assertIsNone(result.output)
+            self.assertEqual(result.error.retry_hint, "manual_review")
+            deadline = time.monotonic() + 2
+            after = before
+            while time.monotonic() < deadline:
+                after = threading.enumerate()
+                if after == before:
+                    break
+                time.sleep(.05)
+            self.assertEqual(after, before)
 
     def test_banner_budget_fails_without_claiming_dispatched_command(self):
         with self.server("banner_timeout") as port:

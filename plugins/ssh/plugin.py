@@ -14,6 +14,7 @@ import ipaddress
 import json
 from pathlib import Path
 import socket
+import threading
 import time
 
 from control_plane.plugins.sdk import (ExecutionPolicy, ExecutionResult, PluginError, PreparedCall,
@@ -164,9 +165,10 @@ class SSHPlugin:
             deadline.check()
             channel = transport.open_session(timeout=min(phase["readwrite"], deadline.check()))
             channel.settimeout(min(phase["readwrite"], deadline.check()))
-            # The request may have reached the server even if its acknowledgement is lost.
+            # The request may have reached the server even if its acknowledgement
+            # is lost, so a failure from here on is unknown, never a safe retry.
             dispatched = True
-            channel.exec_command(prepared_call.resolved_input["command"])
+            self._exec_command(channel, transport, prepared_call.resolved_input["command"], deadline)
             wait_until = min(time.monotonic() + phase["wait"], time.monotonic() + deadline.check())
             stdout, stderr, size = bytearray(), bytearray(), 0
             while True:
@@ -205,9 +207,45 @@ class SSHPlugin:
                         pass
 
     @staticmethod
+    def _exec_command(channel, transport, command, deadline):
+        """Send the exec request and wait for its acknowledgement within budget.
+
+        ``Channel.exec_command()`` blocks inside ``_wait_for_event()`` on an
+        unbounded ``Event.wait()`` that ``Channel.settimeout()`` cannot bound,
+        so the request is assembled at the same low level as ``exec_command``
+        and the acknowledgement is polled on the total deadline.  No
+        background thread exists and nothing outlives this call.  Sending is
+        bounded by the socket timeout and by ``clear_to_send_timeout`` for
+        the rekey wait; on expiry the caller's finally closes the channel,
+        transport and socket, which wakes any pending waiter and stops the
+        recv thread.  The caller has already recorded the dispatch, so every
+        failure here is unknown, never a safe retry.
+        """
+        import paramiko.common
+        if deadline.expired:
+            raise PluginError("timeout", "SSH exec acknowledgement budget exhausted")
+        # Bound the internal rekey wait (default 30s) by the remaining budget.
+        transport.clear_to_send_timeout = min(transport.clear_to_send_timeout, deadline.check())
+        message = paramiko.Message()
+        message.add_byte(paramiko.common.cMSG_CHANNEL_REQUEST)
+        message.add_int(channel.remote_chanid)
+        message.add_string("exec")
+        message.add_boolean(True)
+        message.add_string(command)
+        channel._event_pending()
+        transport._send_user_message(message)
+        while not channel.event.is_set():
+            if not transport.is_active() or channel.closed:
+                raise PluginError("connection_lost", "SSH exec acknowledgement is unknown")
+            if deadline.expired:
+                raise PluginError("timeout", "SSH exec acknowledgement budget exhausted")
+            channel.event.wait(min(0.02, max(0.001, deadline.remaining())))
+        if not channel.event_ready or channel.closed or not transport.is_active():
+            raise PluginError("connection_lost", "SSH exec acknowledgement is unknown")
+
+    @staticmethod
     def _limit(config, name, default, low, high, integer=False):
         value = config.get(name, default)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= high or (integer and not isinstance(value, int)):
             raise PluginError("invalid_input", "invalid SSH execution budget")
         return value
-

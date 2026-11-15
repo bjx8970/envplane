@@ -361,6 +361,7 @@ class SessionService:
         self.startup_seconds, self.recovery_seconds, self.recovery_batch = startup_seconds, recovery_seconds, recovery_batch
         self._live, self._lock, self._started = {}, threading.RLock(), False
         self._pending = {}
+        self._closing = set()
         self._restart_before = datetime.now(timezone.utc)
         self._opening_count = 0
 
@@ -397,6 +398,42 @@ class SessionService:
     def poll(self):
         self._ensure_started()
         self._recover_batch(Deadline.after(self.recovery_seconds))
+        self._sweep_queued_receivers()
+
+    def _mark_closing(self, session_id):
+        """Claim the one-time cleanup of a queued receiver; False if taken."""
+        with self._lock:
+            if session_id in self._closing:
+                return False
+            self._closing.add(session_id)
+            return True
+
+    def _sweep_queued_receivers(self):
+        """Close receivers that expired while still queued.
+
+        A receiver submitted to the session lane may sit in the queue; if its
+        budget expires before a worker picks it up, ``_receive_loop`` never runs
+        and therefore cannot run its own cleanup. This bounded sweep performs
+        that cleanup exactly once per session.
+        """
+        with self._lock:
+            candidates = [(session_id, live) for session_id, live in self._live.items()
+                          if live.receiver is not None and session_id not in self._closing]
+        for session_id, live in candidates:
+            handle = live.receiver
+            if handle.running or not handle.done() or not handle.expired:
+                continue  # Started (its own loop cleans up) or still queued in budget.
+            if not self._mark_closing(session_id):
+                continue
+            live.stop.set()
+            self._close_handle(live, "receiver_queue_expired")
+            try:
+                row = self.store.get(session_id)
+                if row["state"] in ("active", "closing"):
+                    self.store.transition(session_id, row["state"], "disconnected",
+                                          "receiver_queue_expired")
+            except Exception:
+                pass  # Recovery facts remain; never claim the remote was stopped.
 
     def quiesce(self):
         """Non-waiting ingress/forwarding revocation, safe before lease release."""

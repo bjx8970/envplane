@@ -108,6 +108,30 @@ class PluginLoadingTests(unittest.TestCase):
             with self.assertRaises(ManifestError):
                 LocalSchemas(root).compile({'$ref': '#/$defs/missing'})
 
+    def test_in_document_id_subschema_needs_no_file_on_disk(self):
+        # `$ref` may target a nested `$id` sub-schema of the same document; no
+        # matching item.json file is required (review finding).
+        with tempfile.TemporaryDirectory() as root:
+            validator = LocalSchemas(root).compile({
+                '$schema': 'https://json-schema.org/draft/2020-12/schema',
+                '$defs': {'item': {'$id': 'item.json', 'type': 'integer'}},
+                '$ref': 'item.json'})
+            validator.validate(42)
+            with self.assertRaises(ValidationError):
+                validator.validate('abc')
+            self.assertFalse((Path(root) / 'item.json').exists())
+
+    def test_nested_relative_id_changes_reference_base(self):
+        with tempfile.TemporaryDirectory() as root:
+            validator = LocalSchemas(root).compile({
+                '$schema': 'https://json-schema.org/draft/2020-12/schema',
+                '$defs': {'a': {'$id': 'folder/a.json',
+                                '$defs': {'x': {'type': 'string'}}, '$ref': '#/$defs/x'}},
+                '$ref': 'folder/a.json'})
+            validator.validate('hello')
+            with self.assertRaises(ValidationError):
+                validator.validate(5)
+
     def test_remote_absolute_and_escaping_schema_refs_are_rejected(self):
         with tempfile.TemporaryDirectory() as root:
             for ref in ('https://example.org/schema', 'file:///etc/passwd', '../outside.json', '//example.org/a', '%2e%2e/outside.json'):

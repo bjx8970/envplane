@@ -6,7 +6,8 @@ from pathlib import Path
 import re
 import sys
 from types import MappingProxyType
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
+from urllib.request import url2pathname
 from uuid import uuid4
 
 import yaml
@@ -91,8 +92,31 @@ class LocalSchemas:
 
     def compile(self, schema):
         Draft202012Validator.check_schema(schema)
-        registry = ReferenceRegistry()
+        # The in-document resource is registered FIRST so refs to a nested `$id`
+        # sub-schema resolve without requiring a matching file on disk.
+        base_uri = (self.root / '__inline_schema__.json').as_uri()
+        wrapper = dict(schema) if isinstance(schema, dict) else schema
+        if isinstance(wrapper, dict):
+            wrapper['$id'] = base_uri
+        registry = ReferenceRegistry().with_resource(
+            base_uri, Resource.from_contents(wrapper, default_specification=DRAFT202012))
         seen = set()
+
+        def resolves(base, reference):
+            """True when the reference is satisfiable by already-registered content."""
+            try:
+                registry.resolver(base_uri=base).lookup(reference)
+                return True
+            except Exception:
+                return False
+
+        def filesystem_path(base, reference):
+            """Resolve a package-relative reference against the current base URI."""
+            resolved = urljoin(base, reference)
+            parts = urlsplit(resolved)
+            if parts.scheme not in ('', 'file') or parts.netloc:
+                raise ManifestError('only package-local schema references are allowed')
+            return _inside(self.root, Path(url2pathname(parts.path)))
 
         def walk(value, base):
             nonlocal registry
@@ -103,61 +127,42 @@ class LocalSchemas:
                     if identity.scheme or identity.netloc or identity.path.startswith(('/', '\\\\')):
                         raise ManifestError('schema IDs must be package-local')
                     if identity.path:
-                        _inside(self.root, base / unquote(identity.path))
+                        filesystem_path(base, value['$id'])
+                        base = urljoin(base, value['$id'])
                 for keyword in ('$ref', '$dynamicRef'):
-                    if keyword in value:
-                        uri = urlsplit(value[keyword])
-                        if uri.scheme or uri.netloc or uri.query or uri.path.startswith(('/', '\\')):
-                            raise ManifestError('only package-local schema references are allowed')
-                        if uri.path:
-                            path = _inside(self.root, base / unquote(uri.path))
-                            if not path.is_file():
-                                raise ManifestError('local schema reference is missing')
-                            if path not in seen:
-                                seen.add(path)
-                                document = safe_yaml(path)
-                                Draft202012Validator.check_schema(document)
-                                resource = Resource.from_contents(document, default_specification=DRAFT202012)
-                                registry = registry.with_resource(path.as_uri(), resource)
-                                walk(document, path.parent)
+                    if keyword not in value:
+                        continue
+                    uri = urlsplit(value[keyword])
+                    if uri.scheme or uri.netloc or uri.query or uri.path.startswith(('/', '\\')):
+                        raise ManifestError('only package-local schema references are allowed')
+                    # In-document `$id` sub-schemas and already loaded package files
+                    # are resolved from the registry, not from the filesystem.
+                    if resolves(base, value[keyword]):
+                        continue
+                    if not uri.path:
+                        raise ManifestError('unresolvable local schema reference')
+                    path = filesystem_path(base, value[keyword])
+                    if not path.is_file():
+                        raise ManifestError('local schema reference is missing')
+                    resource_uri = path.as_uri()
+                    if path not in seen:
+                        seen.add(path)
+                        document = safe_yaml(path)
+                        Draft202012Validator.check_schema(document)
+                        resource = Resource.from_contents(document, default_specification=DRAFT202012)
+                        registry = registry.with_resource(resource_uri, resource)
+                        walk(document, resource_uri)
                 for child in value.values():
                     walk(child, base)
             elif isinstance(value, list):
                 for child in value:
                     walk(child, base)
 
-        walk(schema, self.root)
+        walk(schema, base_uri)
         # Explicit retrieve callback always refuses network/unknown resources.
         def retrieve(uri):
             raise ManifestError('unregistered schema reference')
         registry = ReferenceRegistry(retrieve=retrieve).with_resources(registry.items())
-        # A local file base makes nested package references deterministic.
-        wrapper = dict(schema) if isinstance(schema, dict) else schema
-        if isinstance(wrapper, dict):
-            wrapper['$id'] = (self.root / '__inline_schema__.json').as_uri()
-        base_uri = (self.root / '__inline_schema__.json').as_uri()
-        registry = registry.with_resource(base_uri, Resource.from_contents(wrapper, default_specification=DRAFT202012))
-        # Resolve fragments at startup as well: a dangling local pointer must not
-        # survive loading and fail only when a particular input branch executes.
-        from urllib.parse import urljoin
-        def check_refs(value, base):
-            if isinstance(value, dict):
-                if '$id' in value:
-                    base = urljoin(base, value['$id'])
-                for keyword in ('$ref', '$dynamicRef'):
-                    if keyword in value:
-                        try:
-                            registry.resolver(base_uri=base).lookup(value[keyword])
-                        except Exception:
-                            raise ManifestError('unresolvable local schema reference') from None
-                for child in value.values():
-                    check_refs(child, base)
-            elif isinstance(value, list):
-                for child in value:
-                    check_refs(child, base)
-        check_refs(wrapper, base_uri)
-        for path in seen:
-            check_refs(safe_yaml(path), path.as_uri())
         validator = Draft202012Validator(wrapper, registry=registry)
         return validator
 

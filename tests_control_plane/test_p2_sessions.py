@@ -384,6 +384,43 @@ class SessionProtocolTests(unittest.TestCase):
         with self.assertRaises(PluginError):
             self.service.observe("teacher", self.sid)
 
+    def test_queued_receiver_expiry_is_finalized_by_bounded_sweep(self):
+        """A receiver that expires while queued still closes its channel."""
+        transport, store = FakeTransport(), MemoryStore()
+        capacity = CapacitySupervisor(CapacitySettings(
+            ordinary_workers=1, control_workers=1, session_workers=1, queue_limit=2,
+            instance_limit=2, shutdown_grace_seconds=0.2))
+        self.addCleanup(capacity.stop, 0.2)
+        capacity.start()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        busy = capacity.submit("instance", lambda: (entered.set(), release.wait(5)), lane="session",
+                               deadline_at=Deadline.after(5).expires_at)
+        self.assertTrue(entered.wait(2))
+        plan = OpeningPlan("operation", "job", "environment", "student", "instance", "secret-v1",
+                           "terminal-entry", PreparedCall("terminal"), transport,
+                           SimpleNamespace(deadline=Deadline.after(10)))
+        service = SessionService(None, None, capacity, store=store,
+                                 authorizer=lambda *a, **k: True, opening_adapter=FakeOpening(plan),
+                                 lifetime_seconds=.2, recovery_seconds=.05)
+        service.start()
+        sid = service.open({})["id"]
+        live = service._live[sid]
+        self.assertFalse(live.receiver.running, "receiver should be queued behind the busy worker")
+        end = time.monotonic() + 3
+        while not live.receiver.expired and time.monotonic() < end:
+            time.sleep(.02)
+        self.assertTrue(live.receiver.expired, "queued receiver budget should expire")
+        release.set()
+        busy.result(5)
+        service.poll()
+        self.assertEqual(transport.closed, ["receiver_queue_expired"])
+        self.assertTrue(live.stop.is_set())
+        self.assertEqual(store.get(sid)["state"], "disconnected")
+        service.poll()
+        self.assertEqual(transport.closed, ["receiver_queue_expired"])
+        service.stop(grace=0)
+
 
 class SessionPostgreSQLTests(unittest.TestCase):
     @classmethod

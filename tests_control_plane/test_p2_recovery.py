@@ -261,3 +261,75 @@ class DriverBudgetTests(unittest.TestCase):
         driver.tick()
         repo.block.assert_called_once()
         self.assertNotIn(str(lease.job_id), driver._leases)
+
+    def _ticking_driver(self, repo):
+        capacity = mock.Mock()
+        driver = ExecutionDriver(repo, capacity, mock.Mock(), mock.Mock())
+        driver.start()
+        repo.recover_expired.return_value = []
+        repo.candidate_instances.return_value = []
+        repo.claim.return_value = None
+        return driver
+
+    def test_job_fault_is_isolated_and_other_jobs_still_advance(self):
+        """A scope conflict on one job must never terminate the coordinator."""
+        repo = mock.Mock()
+        conflicting, healthy = mock.Mock(job_id=uuid4()), mock.Mock(job_id=uuid4())
+        calls = []
+        driver = self._ticking_driver(repo)
+        def advance(lease):
+            calls.append(lease.job_id)
+            if lease is conflicting:
+                raise ExecutionConflict("scope has unresolved execution")
+        driver._advance = advance
+        driver._leases = {str(conflicting.job_id): conflicting, str(healthy.job_id): healthy}
+        repo.block_job.side_effect = ExecutionConflict("already blocked")
+        driver.tick()  # Must not raise despite the repeated-block conflict.
+        self.assertEqual(set(calls), {conflicting.job_id, healthy.job_id})
+        # Only the failing job is dropped; the healthy one keeps advancing.
+        self.assertNotIn(str(conflicting.job_id), driver._leases)
+        self.assertIn(str(healthy.job_id), driver._leases)
+        repo.block_job.assert_called_once()
+
+    def test_global_fault_still_propagates(self):
+        repo = mock.Mock()
+        lease = mock.Mock(job_id=uuid4())
+        driver = self._ticking_driver(repo)
+        def advance(_lease):
+            raise DBAPIError("SELECT 1", {}, Exception("connection lost"))
+        driver._advance = advance
+        driver._leases = {str(lease.job_id): lease}
+        with self.assertRaises(DBAPIError):
+            driver.tick()
+
+    def _cancelling_driver(self, cancellation_result):
+        lease = mock.Mock(job_id=uuid4(), token=uuid4())
+        operation = {"id": uuid4(), "state": "pending_external", "protocol_error": None,
+                     "prepared_call": PreparedCall("run", execution_policy=ExecutionPolicy(
+                         cancellation="requestable", recovery="queryable")).to_dict(),
+                     "step_id": uuid4(), "dispatch_intent_at": "set",
+                     "cancellation_result": cancellation_result, "plugin_instance_id": uuid4()}
+        job = {"cancel_requested_at": "set", "available_at": 0, "database_now": 1,
+               "execution_snapshot": {}}
+        repo = mock.Mock()
+        repo.view.return_value = (job, [{"id": operation["step_id"], "step_path": "s", "item_key": "",
+                                         "state": "waiting_external", "input": {}, "output": None}], [operation])
+        repo.saved_success.return_value = None
+        driver = ExecutionDriver(repo, mock.Mock(), mock.Mock(), mock.Mock())
+        driver._accepting = False
+        chosen = []
+        driver._submit_operation = lambda *a, **k: chosen.append(a[4])
+        return driver, lease, chosen
+
+    def test_settled_cancellation_switches_from_cancel_to_poll(self):
+        """A delivered or late cancellation must not repeat forever."""
+        for settled in ("requested", "too_late"):
+            with self.subTest(cancellation_result=settled):
+                driver, lease, chosen = self._cancelling_driver(settled)
+                driver._advance(lease)
+                self.assertEqual(chosen, ["poll"])
+
+    def test_open_cancellation_still_requests_cancel(self):
+        driver, lease, chosen = self._cancelling_driver(None)
+        driver._advance(lease)
+        self.assertEqual(chosen, ["cancel"])

@@ -13,6 +13,16 @@ from .adapters import UNAVAILABLE, AdapterUnavailable
 from .repository import JobLeaseLost, ExecutionConflict, InvalidTransition
 
 
+class DriverDiagnostic(RuntimeError):
+    """Internal marker for a job-scoped failure already persisted as blocked."""
+
+
+# Job-scoped failures must never terminate the coordinator. Anything else (DB
+# connectivity, coordinator leadership) is a global fault and must still surface.
+JOB_FAULTS = (ExecutionConflict, InvalidTransition, AdapterUnavailable, PluginError,
+              ValueError, KeyError, DriverDiagnostic)
+
+
 @dataclass(frozen=True)
 class DriverSettings:
     lease_seconds: float = 30
@@ -119,9 +129,28 @@ class ExecutionDriver:
                 self._advance(lease)
             except JobLeaseLost:
                 self._leases.pop(key, None)
-            except (ExecutionConflict, InvalidTransition, AdapterUnavailable, PluginError, ValueError, KeyError):
-                self.repository.block_job(lease)
-                self._leases.pop(key, None)
+            except JOB_FAULTS as exc:
+                self._isolate(lease, exc)
+
+    def _isolate(self, lease, exc):
+        """Persist a job-scoped failure as blocked and never re-raise it.
+
+        Repeated blocking is not an error: a job that is already blocked (or
+        whose lease/group has moved on) is simply dropped from this worker.
+        Global faults are re-raised by the caller's exception filter, not here.
+        """
+        try:
+            self.repository.block_job(lease)
+        except (JobLeaseLost, ExecutionConflict, InvalidTransition):
+            pass  # Already blocked/terminal, or no longer authoritative.
+        except Exception as block_error:  # noqa: BLE001 - classified by caller
+            if isinstance(block_error, JOB_FAULTS):
+                pass
+            else:
+                raise
+        finally:
+            self._leases.pop(str(lease.job_id), None)
+        return exc
 
     def _binding(self, lease, instance_id):
         return self.repository.binding(lease, instance_id)
@@ -168,8 +197,19 @@ class ExecutionDriver:
                 if evidence is not None:
                     self.repository.replay_result(lease, evidence, projector=self.projector, applicator=self.applicator)
                     return
+            # A cancellation attempt is only useful before its outcome is known.
+            # `requested`/`too_late` mean the request was already delivered (or
+            # arrived too late); repeating it would never observe the remote task.
+            cancellation_open = current.get("cancellation_result") in (None, "unsupported", "unknown")
+            cancellation_settled = current.get("cancellation_result") in ("requested", "too_late")
             if job["cancel_requested_at"] is not None and prepared.execution_policy.cancellation == "requestable":
-                method = "cancel"
+                if cancellation_open:
+                    method = "cancel"
+                elif cancellation_settled and current["state"] in ("pending_external", "unknown") \
+                        and prepared.execution_policy.recovery == "queryable":
+                    method = "poll"
+                else:
+                    method = None
             elif current["state"] == "prepared":
                 method = "execute"
             elif current["state"] in ("pending_external", "unknown") and prepared.execution_policy.recovery == "queryable":
@@ -177,9 +217,12 @@ class ExecutionDriver:
             elif current["state"] == "unknown" and (prepared.execution_policy.effect == "read_only" or prepared.execution_policy.idempotency == "keyed"):
                 method = "execute"
             else:
-                # A running operation after restart is NOT proof it was unsent.
+                method = None
+            if method is None:
+                # A running operation after restart is NOT proof it was unsent,
+                # and a settled cancellation with no query protocol stays put.
                 previous = self.repository.latest_call(current["id"])
-                if previous:
+                if previous and current["state"] == "running":
                     self.repository.block(lease, previous["id"], "unrecoverable_dispatched_execution")
                 self._leases.pop(key, None)
                 return
@@ -262,12 +305,18 @@ class ExecutionDriver:
                         checkpoints=result.checkpoints, error=result.error,
                         protocol_error={"code": "protocol_error", "message": "output schema validation failed"})
             return result
-        # Capacity rejection after intent is conservative unknown, not unsent.
+        # Capacity rejection after a committed dispatch intent is conservatively
+        # unknown, never "unsent"; blocking it must not surface as a global fault.
         try:
             handle = self.capacity.submit(str(instance_id), invoke, deadline_at=attempt.deadline_at,
                                           call_id=attempt.id, lane="ordinary" if method == "execute" else "control")
-        except Exception:
-            self.repository.block(lease, attempt.id, "dispatch_capacity_unavailable")
+        except Exception as exc:
+            try:
+                self.repository.block(lease, attempt.id, "dispatch_capacity_unavailable")
+            except (JobLeaseLost, ExecutionConflict, InvalidTransition):
+                pass
+            if isinstance(exc, JOB_FAULTS):
+                raise DriverDiagnostic("dispatch capacity unavailable") from None
             raise
         self._calls[str(attempt.id)] = {"handle": handle, "lease": lease, "step": step,
             "stage": method, "operation": operation, "attempt": attempt, "deadline": deadline, "timed_out": False}
@@ -305,8 +354,12 @@ class ExecutionDriver:
                 if not call["timed_out"]:
                     try:
                         self.repository.commit_prepared(lease, call["step"]["id"], result, call["instance_id"])
-                    except (JobLeaseLost, InvalidTransition):
+                    except JobLeaseLost:
                         self._leases.pop(str(lease.job_id), None)
+                    except JOB_FAULTS as exc:
+                        # A conflicting scope or an invalid transition belongs to
+                        # this job alone; never escalate to a coordinator exit.
+                        self._isolate(lease, exc)
                 continue
             try:
                 if call["stage"] == "cancel":
@@ -316,6 +369,8 @@ class ExecutionDriver:
                                                   projector=self.projector, applicator=self.applicator)
             except JobLeaseLost:
                 self._leases.pop(str(lease.job_id), None)
+            except JOB_FAULTS as exc:
+                self._isolate(lease, exc)
             self._next_poll[str(call["operation"]["id"])] = monotonic() + self.settings.poll_interval_seconds
 
 
