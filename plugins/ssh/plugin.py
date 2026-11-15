@@ -14,7 +14,6 @@ import ipaddress
 import json
 from pathlib import Path
 import socket
-import threading
 import time
 
 from control_plane.plugins.sdk import (ExecutionPolicy, ExecutionResult, PluginError, PreparedCall,
