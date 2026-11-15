@@ -16,6 +16,7 @@ class RuntimePermissionError(RuntimeError):
 _APPEND_ONLY = frozenset({
     "plugin_storage_versions", "plugin_storage_snapshots", "plugin_instance_versions",
     "audit_events", "operation_evidence", "job_logs", "job_plugin_snapshots", "job_secret_refs",
+    "operation_call_attempts",
 })
 _MUTABLE = frozenset({
     "users", "courses", "groups", "course_members", "templates", "template_versions",

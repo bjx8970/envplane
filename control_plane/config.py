@@ -36,6 +36,7 @@ class RuntimeSettings:
     connect_timeout_seconds: float = _DEFAULT_CONNECT_TIMEOUT
     lock_poll_seconds: float = _DEFAULT_LOCK_POLL
     lease_seconds: float = 30.0
+    deployment_path: str | None = field(default=None, repr=False)
 
     @classmethod
     def from_env(cls, environ=None) -> "RuntimeSettings":
@@ -78,6 +79,7 @@ class RuntimeSettings:
             lease_seconds=_read_seconds(
                 env, "CONTROL_PLANE_LEASE_SECONDS", 30.0, 1.0, 3600.0
             ),
+            deployment_path=(env.get("CONTROL_PLANE_RUNTIME_CONFIG") or "").strip() or None,
         )
         if settings.lease_seconds <= 2 * settings.lock_poll_seconds + settings.connect_timeout_seconds:
             raise ConfigurationError("lease duration must exceed two polls and a connection timeout")

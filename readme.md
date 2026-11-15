@@ -4,7 +4,7 @@
 
 ## 项目状态
 
-**本仓库已确定 v1 目标设计；新控制面已实现 P0 启动骨架与 P1 持久化基座，但业务运行代码尚未切换。`docs/` 中完整插件、执行、模板和授权契约仍是目标设计，不表示已经交付。**
+**本仓库已确定 v1 目标设计；新控制面已实现 P0 启动骨架、P1 持久化基座和 P2 插件运行时/持久执行内核（服务层，未接入 HTTP/UI），但业务运行代码尚未切换。`docs/` 中模板、业务授权/配额和浏览器入口契约仍是目标设计，不表示已经交付。**
 
 当前代码仍是 Flask/Jinja 单体，直接调用 PVE、OpenWrt，使用进程内任务队列和旧 `clusters`、`vms` 等模型。目标是彻底重建运行结构，不要求旧 API、旧表或旧页面兼容；本文不提供旧系统到新系统的迁移承诺，也不授权清空真实数据库或外部资源。
 
@@ -97,7 +97,7 @@ python -m control_plane start
 ```
 
 - `db upgrade [head]` 显式执行 Alembic 迁移。DDL 与版本写入在同一事务；并发迁移或正在运行的协调者占锁时拒绝迁移。
-- `start` 只校验 schema revision、必需表与有效数据库权限，不执行 DDL。空库、不兼容版本或不安全/不完整权限退出 4，并给出脱敏提示。当前 head 为 `0002_p1_review_guards`；旧 `0001_v1_foundation` 必须显式升级，不改写基线迁移。
+- `start` 只校验 schema revision、必需表与有效数据库权限，不执行 DDL。空库、不兼容版本或不安全/不完整权限退出 4，并给出脱敏提示。当前 head 为 `0003_p2_runtime_contracts`；旧 `0001_v1_foundation`、`0002_p1_review_guards` 必须显式升级，不改写基线迁移。
 - `db grant-runtime ROLE` 在与迁移相同的事务/互斥/专用库守卫下向已有角色授予固定最小权限；不创建角色、存储密码或静默撤销 PUBLIC/其他角色权限。危险权限必须由部署管理员先纠正。运行进程必须直接用独立低权登录角色连接，拒绝高权会话 `SET ROLE` 伪装；运行账号不能是 superuser、owner、可提权成员或具有持久 DDL/TRUNCATE 权限的角色。
 - 运行账号对追加历史、审计、执行证据、日志只拥有 SELECT/INSERT；对 Alembic 版本表只 SELECT，对协调租约只 SELECT/UPDATE，其余应用表按固定策略授权。不授予 DELETE/TRUNCATE/TRIGGER/REFERENCES/MAINTAIN；数据库角色权限与语句级 TRUNCATE 保护共同守住证据，迁移账号不交给普通运行进程。数据库超级用户/部署管理员仍是可信管理边界，不承诺阻止其显式 DDL。
 - 协调者持有专用连接的 advisory lock 及持久 owner/revision/期限；续期核对数据库时间和实际锁归属。取得、续租、释放仍使用数据库端 lock/statement timeout（每语句最多 1 秒且不超过租期的四分之一）。本实例合法 UoW 持有租约行期间，心跳只做非锁定数据库资格校验、不更新租期，避免与自身写事务争锁；忙时留下的续租请求在下一笔 UoW 开始前或空闲心跳取得本地写门后执行，不能在同一长事务内无限续活。门覆盖实际提交/回滚；本地门和待续租标志只是同步机制，不是协调资格或恢复事实。数据库确认失锁/过期、外部未知行锁超时或资格校验失败仍退出 4，不自动重取。核心写事务必须在现有租约有效期内完成，不能跨越外部 I/O。
@@ -105,6 +105,21 @@ python -m control_plane start
 - `CONTROL_PLANE_LEASE_SECONDS` 默认 30 秒，范围 1～3600；必须大于两次 `CONTROL_PLANE_LOCK_POLL_SECONDS` 加一次连接预算。连接预算默认 5 秒、轮询默认 1 秒。
 - `db downgrade base` 只允许应用表为空；存在业务/执行/审计数据时拒绝降级。它不是旧库迁移、外部资源清理或生产回退方案。
 - 领域表覆盖身份、课程、配额、插件配置/Storage 历史、模板、环境、执行、冲突、秘密、会话与审计；包含唯一约束、跨作用域外键、JSON 上限与不可变历史保护。Storage head 身份不可更改，不可删除重建或指向旧历史；延迟约束要求提交时指向最新历史，墓碑后也必须精确 CAS 前进。增量迁移发现旧 head 回退或有历史无 head 时整体回滚，不自动修复故障证据。底层请求去重和 Storage CAS 已实现；完整 Storage API、Job 执行器、业务授权和 UI 仍属于后续阶段。
+
+## 新控制面 P2 插件运行时与持久执行内核
+
+P2 仍为**服务层实现**：没有 HTTP API、模板驱动 UI 或 WebSSH 浏览器入口，也没有把旧 Flask 单体切换过来。它提供后续阶段依赖的稳定边界，业务模板语义、真实授权/配额与退款规则仍由 P3 提供。
+
+- **插件加载**：启动时从部署配置指定的可信目录扫描，`manifest.yaml`（JSON Schema 2020-12，本地引用）与包内代码摘要一并固定；required 失败阻止启动，optional 失败标记不可用且不删数据；不热更新、不联网取 Schema、不从数据库加载可执行路径。样例 `plugins/ssh/` 为可部署包（摘要覆盖真实 provider 源码）。
+- **唯一 SecretService**：AES-256-GCM，部署 keyring 无默认密钥；AAD 绑定秘密身份/版本/用途/环境；授权链为“管理员配置显式允许集合 → Job 固定版本映射 → `(job, instance, exact_version)` grant → PreparedCall 实际引用子集 → Handle”，插件自报引用或 Storage 中出现引用本身不产生权限；吊销/失效即时阻断，不回退旧版本也不换 latest。
+- **Storage**：实例绑定、Job as-of 快照、稳定分页游标、精确 CAS 与墓碑；写成功不刷新原 Job 视图；只有受控成功输出或 `trusted_for_derivation` 检查点可显式派生更晚版本。
+- **执行内核**：PostgreSQL 是事实来源。短事务 `FOR UPDATE SKIP LOCKED` 领取并校验 coordinator fence、Job token/期限与执行组 revision；prepare 在事务外且预算固定一次；Step→running 与 prepared Operation 同事务；派发意图与不可变 `operation_call_attempts` 先提交再调用插件；外部调用不持有事务。
+- **结果与恢复**：安全原结果先追加为证据，再在同一事务内应用输出/资源/本地生成项/生命周期；映射失败保留现场并 blocked。晚到结果只能由当前有效协调者按原 call 来源追加证据，不能改权威状态、释放配额或解锁；未知变更不重发，`keyed/read_only` 重试也被原 Operation deadline 与次数限制。
+- **有界容量与降级**：普通/控制/会话分道限额，超期调用继续占真实 slot，不补线程；饱和时停止受影响派发、拒绝新准入并显示 degraded，等待人工重启。
+- **会话协议**：与 execute JSON 结果分离的独立帧协议，单输入控制者（CAS + epoch）、旁观只读、接管审计、旧世代输入丢弃、有界缓冲与限速、撤权/停止立即 fail-closed，重启标记 disconnected 而非 failed。
+- **准入边界**：`AdmissionController` 在单一受控事务内做实时授权、请求幂等、有限持久队列与容量检查；缺少 P3 `AdmissionPolicy` 时默认拒绝，绝不使用成功 no-op 策略。
+
+启用 P2 服务需要显式部署配置（`CONTROL_PLANE_RUNTIME_CONFIG`）、插件目录与加密 keyring 环境变量；缺少其中任一项时基础模式不构造秘密服务、不启用执行，也不生成默认密钥。真实连接配置、密钥与凭据密文不得提交到仓库。
 
 ## 当前测试与验证
 
@@ -125,13 +140,17 @@ P0 原始冻结文件及通过记录对应 `352437b`；P1 对空库拒启和显�
 
 2026-11-14 二轮复审实测：针对合法 UoW 与心跳自竞争，在旧 `bc32ee3` 源码上以新增确定性低权回归复现 `LeadershipLost`；同一回归在修复后通过。默认 WSL、隔离 Python 3.12、一次性 PostgreSQL 17 执行严格入口，158 项全部通过（63.820 秒），0 失败、0 错误、0 跳过。新增 11 项覆盖慢写与多次 poll、忙时不续租、单笔过期/失锁回滚、连续短写事务边界续租、真实提交与异常回滚期间的门、排队写世代/重入拒绝、专用连接串行及 stop/续租计数交错；原有 147 项与迁移未改动。未运行旧 Flask、真实供应商、生产库或浏览器验证；托管 CI 和人工复审另行核实。
 
+2026-11-15 P2 实测：默认 WSL `RHEL-10.2`、项目隔离 Python 3.12、Podman 一次性 PostgreSQL 17，同一严格入口执行 `bash scripts/run_p1_tests.sh`，352 项全部通过，0 失败、0 错误、0 跳过（107.645 秒），测试容器由脚本退出清理。新增 P2 覆盖：迁移增量与旧 P1 数据升级前置拒绝、执行状态图与终态保护、claim/heartbeat/token/组 revision 双重 fencing、prepare 原子性与预算不刷新、派发意图与 call 来源先提交、同步/晚到证据去重与 `trusted_for_derivation` 边界、结果原子应用与本地重放、两恢复者 CAS、取消与真实成功竞态、未知/超时不重发、容量超期不返 slot 与饱和拒新、会话单控制者/接管/背压/撤权重启语义、Storage 快照与 CAS、Secrets 的实例级授权/轮换/吊销/派生幂等、准入同事务去重与回滚，以及最小 SSH 插件对隔离回环 Paramiko 服务的真实握手、严格 host key、命令与预算验证。
+
+首轮该套件曾以 342 通过 / 10 失败运行，10 个失败同源于受控 Unit of Work 结果缺少 `.mappings()` 读取能力；已在 `coordination.py` 补齐只读映射包装（不暴露连接句柄）后全绿，并非放宽断言。未运行旧 Flask 套件、真实 PVE/OpenWrt/SSH 设备、生产迁移、浏览器端到端或真实业务授权/配额流程；HTTP 202/409/503、模板 UI 与 WebSSH 入口属后续阶段。本地通过不代替托管 CI 或人工复审。
+
 旧系统的规范发现入口为：
 
 ```sh
 python -B -m unittest discover -s tests -t .
 ```
 
-旧测试使用 unittest、模拟供应商和临时数据库。新控制面现有 Alembic migration 与独立严格 CI workflow，但尚无新插件运行时、Job 执行器或业务 UI；旧测试不证明这些目标已实现。历史通过次数也不作为当前回归结果，不证明真实 PVE/OpenWrt/SSH 或浏览器端到端验收已经完成。
+旧测试使用 unittest、模拟供应商和临时数据库。新控制面现有 Alembic migration、独立严格 CI workflow 与 P2 服务层运行时/执行内核，但尚无业务模板 UI、HTTP 入口或真实 P3 授权/配额实现；旧测试不证明这些目标已实现。历史通过次数也不作为当前回归结果，不证明真实 PVE/OpenWrt/SSH 设备或浏览器端到端验收已经完成。
 
 新旧部署按[架构中的退役前置条件](docs/architecture.md#91-旧部署退役与硬切换前置条件)硬切换：先确认旧外部对象、未决任务、责任人和管理通道，验证旧库、凭据密文及独立密钥的备份恢复路径；新旧系统不得无协调同时修改同一对象。不要求自动迁移或兼容，不等于授权销毁真实资源、旧库、唯一管理凭据或故障证据。
 

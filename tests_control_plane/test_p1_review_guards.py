@@ -246,7 +246,13 @@ class ReviewDeploymentTests(unittest.TestCase):
                         with self.assertRaises(DBAPIError) as raised:
                             with conn.begin_nested():
                                 conn.execute(text(f"TRUNCATE control_plane.{table}"))
-                        self.assertEqual(raised.exception.orig.args[0]["C"], "23514")
+                        code = raised.exception.orig.args[0]["C"]
+                        if table == "operation_evidence":
+                            # P2 provenance adds an incoming composite FK. PostgreSQL
+                            # can reject owner TRUNCATE before its statement trigger.
+                            self.assertIn(code, ("23514", "0A000"))
+                        else:
+                            self.assertEqual(code, "23514")
                 run_migrations(settings, "base", upgrade=False)
                 with engine.connect() as conn:
                     self.assertIsNone(conn.scalar(text("SELECT to_regnamespace('control_plane')")))

@@ -22,7 +22,8 @@ if [ ! -x "$PY" ]; then
 fi
 # Install exactly the minimal control-plane dependencies, not legacy requirements.
 "$PY" -m pip install --disable-pip-version-check \
-  'sqlalchemy==2.0.49' 'pg8000==1.31.5' 'alembic==1.17.2'
+  'sqlalchemy==2.0.49' 'pg8000==1.31.5' 'alembic==1.17.2' \
+  'jsonschema==4.25.1' 'PyYAML==6.0.3' 'cryptography==48.0.0' 'paramiko==5.0.0'
 
 TOKEN="$("$PY" -c 'import secrets; print(secrets.token_hex(12))')"
 CONTAINER="k8s-lab-p1-pg-$TOKEN"

@@ -15,6 +15,7 @@ from .runtime import (
     CoordinatorConflict,
     DatabaseUnavailable,
     LeadershipLost,
+    RuntimeInitializationFailed,
     StartupDeadlineExceeded,
     StartupInterrupted,
 )
@@ -151,6 +152,10 @@ def _run_start() -> int:
             return EXIT_OK
         print("coordinator already active", file=sys.stderr, flush=True)
         return EXIT_COORDINATOR_CONFLICT
+    except RuntimeInitializationFailed:
+        _stop_quietly(runtime)
+        print("plugin runtime initialization failed", file=sys.stderr, flush=True)
+        return EXIT_RUNTIME_FAILURE
     except DatabaseUnavailable:
         if stop_event.is_set():
             return EXIT_OK
@@ -167,12 +172,18 @@ def _run_start() -> int:
     try:
         if not stop_event.is_set():
             owner_id, revision = runtime.coordinator_identity
-            _write_event("ready", lock_backend_pid=runtime.lock_backend_pid,
-                         coordinator_id=owner_id, coordinator_revision=revision)
+            health = runtime.health()
+            _write_event("degraded" if health["degraded"] else "ready", lock_backend_pid=runtime.lock_backend_pid,
+                         coordinator_id=owner_id, coordinator_revision=revision, health=health)
             ready_announced = True
+            was_degraded = health["degraded"]
             while not stop_event.wait(settings.lock_poll_seconds):
                 try:
                     runtime.poll()
+                    health = runtime.health()
+                    if health["degraded"] != was_degraded:
+                        _write_event("degraded" if health["degraded"] else "ready", health=health)
+                        was_degraded = health["degraded"]
                 except LeadershipLost:
                     _write_event("leadership_lost", error=True)
                     exit_code = EXIT_RUNTIME_FAILURE
