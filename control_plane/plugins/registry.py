@@ -152,6 +152,11 @@ class LocalSchemas:
                         resource = Resource.from_contents(document, default_specification=DRAFT202012)
                         registry = registry.with_resource(resource_uri, resource)
                         walk(document, resource_uri)
+                    # Resolve the ORIGINAL full reference now that the target file
+                    # is registered: a present file with a missing JSON Pointer or
+                    # anchor must fail at load, not at first validate().
+                    if not resolves(base, value[keyword]):
+                        raise ManifestError('unresolvable local schema reference')
                 for child in value.values():
                     walk(child, base)
             elif isinstance(value, list):

@@ -414,11 +414,43 @@ class SessionProtocolTests(unittest.TestCase):
         release.set()
         busy.result(5)
         service.poll()
+        # The plugin close runs on supervised control capacity, not inline.
+        end = time.monotonic() + 3
+        while not transport.closed and time.monotonic() < end:
+            time.sleep(.02)
         self.assertEqual(transport.closed, ["receiver_queue_expired"])
         self.assertTrue(live.stop.is_set())
         self.assertEqual(store.get(sid)["state"], "disconnected")
         service.poll()
-        self.assertEqual(transport.closed, ["receiver_queue_expired"])
+        time.sleep(.1)
+        self.assertEqual(transport.closed, ["receiver_queue_expired"], "close must be idempotent")
+
+    def test_finished_receiver_is_not_closed_twice(self):
+        """A receiver that already ran its own cleanup is skipped by the sweep."""
+        transport, store = FakeTransport(), MemoryStore()
+        capacity = CapacitySupervisor(CapacitySettings(
+            ordinary_workers=1, control_workers=1, session_workers=1, queue_limit=2,
+            instance_limit=2, shutdown_grace_seconds=0.2))
+        self.addCleanup(capacity.stop, 0.2)
+        capacity.start()
+        plan = OpeningPlan("operation", "job", "environment", "student", "instance", "secret-v1",
+                           "terminal-entry", PreparedCall("terminal"), transport,
+                           SimpleNamespace(deadline=Deadline.after(10)))
+        service = SessionService(None, None, capacity, store=store,
+                                 authorizer=lambda *a, **k: True, opening_adapter=FakeOpening(plan),
+                                 lifetime_seconds=.2, recovery_seconds=.05, receive_wait=.02)
+        service.start()
+        sid = service.open({})["id"]
+        live = service._live[sid]
+        # The receive loop itself ends the session on lifetime expiry.
+        end = time.monotonic() + 3
+        while (live.receiver is None or not live.receiver.done()) and time.monotonic() < end:
+            time.sleep(.02)
+        self.assertTrue(live.receiver.done())
+        closes = len(transport.closed)
+        service.poll()
+        time.sleep(.1)
+        self.assertEqual(len(transport.closed), closes, "finished receiver must not be re-closed")
         service.stop(grace=0)
 
 

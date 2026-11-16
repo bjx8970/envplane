@@ -262,6 +262,43 @@ class SSHPluginTests(unittest.TestCase):
                 time.sleep(.05)
             self.assertEqual(after, before)
 
+    def test_stalled_socket_writes_do_not_bypass_the_total_deadline(self):
+        """Packetizer.write_all retries socket.timeout forever on its own.
+
+        The dispatch path must therefore be interruptible: with a client socket
+        that never becomes writable, execute still returns within the budget
+        instead of blocking a worker indefinitely.
+        """
+        from unittest import mock as _mock
+        with self.server("success") as port:
+            context = self.context(port, seconds=.3)
+            plugin = SSHPlugin()
+            prepared = plugin.prepare("execute_command", {"host_id": "test", "command": "mutate"}, context)
+            real_connection = socket.create_connection
+
+            class StalledSocket:
+                """A connected socket whose writes always time out."""
+                def __init__(self, inner):
+                    self._inner = inner
+                def __getattr__(self, name):
+                    return getattr(self._inner, name)
+                def send(self, *_args, **_kwargs):
+                    raise socket.timeout("injected write stall")
+                sendall = send
+
+            def connect(address, *args, **kwargs):
+                return StalledSocket(real_connection(address, *args, **kwargs))
+
+            started = time.monotonic()
+            with _mock.patch("socket.create_connection", side_effect=connect):
+                result = plugin.execute(prepared, context)
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 2.0, "stalled write must not bypass the deadline")
+            # The stall happens before the exec request is dispatched, so this is
+            # a proven failure to establish the connection, not an unknown change.
+            self.assertEqual(result.outcome, "failed")
+            self.assertIsNone(result.output)
+
     def test_banner_budget_fails_without_claiming_dispatched_command(self):
         with self.server("banner_timeout") as port:
             context = self.context(port, seconds=.2, limits={"banner": .1})

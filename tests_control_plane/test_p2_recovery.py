@@ -302,7 +302,7 @@ class DriverBudgetTests(unittest.TestCase):
         with self.assertRaises(DBAPIError):
             driver.tick()
 
-    def _cancelling_driver(self, cancellation_result):
+    def _cancelling_driver(self, cancellation_result, *, prior_cancels=0):
         lease = mock.Mock(job_id=uuid4(), token=uuid4())
         operation = {"id": uuid4(), "state": "pending_external", "protocol_error": None,
                      "prepared_call": PreparedCall("run", execution_policy=ExecutionPolicy(
@@ -315,6 +315,8 @@ class DriverBudgetTests(unittest.TestCase):
         repo.view.return_value = (job, [{"id": operation["step_id"], "step_path": "s", "item_key": "",
                                          "state": "waiting_external", "input": {}, "output": None}], [operation])
         repo.saved_success.return_value = None
+        repo.method_call_count.return_value = prior_cancels
+        repo.latest_call.return_value = {"id": uuid4()} if prior_cancels else None
         driver = ExecutionDriver(repo, mock.Mock(), mock.Mock(), mock.Mock())
         driver._accepting = False
         chosen = []
@@ -333,3 +335,41 @@ class DriverBudgetTests(unittest.TestCase):
         driver, lease, chosen = self._cancelling_driver(None)
         driver._advance(lease)
         self.assertEqual(chosen, ["cancel"])
+
+    def test_unsupported_cancellation_polls_the_original_task(self):
+        """A plugin declaring "unsupported" must not be asked again and again."""
+        driver, lease, chosen = self._cancelling_driver("unsupported", prior_cancels=1)
+        driver._advance(lease)
+        self.assertEqual(chosen, ["poll"])
+
+    def test_unknown_cancellation_retry_is_bounded_then_polls(self):
+        driver, lease, chosen = self._cancelling_driver("unknown", prior_cancels=1)
+        driver._advance(lease)
+        self.assertEqual(chosen, ["cancel"], "one retry is allowed")
+        driver, lease, chosen = self._cancelling_driver(
+            "unknown", prior_cancels=DriverSettings().max_cancel_attempts)
+        driver._advance(lease)
+        self.assertEqual(chosen, ["poll"], "retries are bounded, polling wins")
+
+    def test_no_safe_path_persists_block_instead_of_only_dropping_the_lease(self):
+        """An unrecoverable dispatched operation must become blocked, not vanish."""
+        lease = mock.Mock(job_id=uuid4(), token=uuid4())
+        operation = {"id": uuid4(), "state": "pending_external", "protocol_error": None,
+                     "prepared_call": PreparedCall("run", execution_policy=ExecutionPolicy(
+                         cancellation="unsupported", recovery="unsupported")).to_dict(),
+                     "step_id": uuid4(), "dispatch_intent_at": "set",
+                     "cancellation_result": None, "plugin_instance_id": uuid4()}
+        job = {"cancel_requested_at": None, "available_at": 0, "database_now": 1,
+               "execution_snapshot": {}}
+        repo = mock.Mock()
+        repo.view.return_value = (job, [{"id": operation["step_id"], "step_path": "s", "item_key": "",
+                                         "state": "waiting_external", "input": {}, "output": None}], [operation])
+        repo.saved_success.return_value = None
+        repo.latest_call.return_value = {"id": uuid4()}
+        driver = ExecutionDriver(repo, mock.Mock(), mock.Mock(), mock.Mock())
+        driver._accepting = False
+        driver._leases = {str(lease.job_id): lease}
+        driver._advance(lease)
+        repo.block.assert_called_once()
+        self.assertEqual(repo.block.call_args[0][2], "no_safe_recovery_path")
+        self.assertNotIn(str(lease.job_id), driver._leases)

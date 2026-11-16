@@ -14,6 +14,7 @@ import ipaddress
 import json
 from pathlib import Path
 import socket
+import threading
 import time
 
 from control_plane.plugins.sdk import (ExecutionPolicy, ExecutionResult, PluginError, PreparedCall,
@@ -211,14 +212,13 @@ class SSHPlugin:
 
         ``Channel.exec_command()`` blocks inside ``_wait_for_event()`` on an
         unbounded ``Event.wait()`` that ``Channel.settimeout()`` cannot bound,
-        so the request is assembled at the same low level as ``exec_command``
-        and the acknowledgement is polled on the total deadline.  No
-        background thread exists and nothing outlives this call.  Sending is
-        bounded by the socket timeout and by ``clear_to_send_timeout`` for
-        the rekey wait; on expiry the caller's finally closes the channel,
-        transport and socket, which wakes any pending waiter and stops the
-        recv thread.  The caller has already recorded the dispatch, so every
-        failure here is unknown, never a safe retry.
+        and ``Packetizer.write_all`` retries forever on ``socket.timeout``.
+        Both the send and the acknowledgement wait therefore run on one
+        supervised thread whose deadline is enforced by the caller: on expiry
+        the channel and transport are closed, which breaks the write retry with
+        EOFError and sets the channel event, so the thread terminates and is
+        joined before returning.  The caller has already recorded the
+        dispatch, so every failure here is unknown, never a safe retry.
         """
         import paramiko.common
         if deadline.expired:
@@ -232,14 +232,42 @@ class SSHPlugin:
         message.add_boolean(True)
         message.add_string(command)
         channel._event_pending()
-        transport._send_user_message(message)
-        while not channel.event.is_set():
-            if not transport.is_active() or channel.closed:
-                raise PluginError("connection_lost", "SSH exec acknowledgement is unknown")
-            if deadline.expired:
-                raise PluginError("timeout", "SSH exec acknowledgement budget exhausted")
-            channel.event.wait(min(0.02, max(0.001, deadline.remaining())))
-        if not channel.event_ready or channel.closed or not transport.is_active():
+        outcome = {"error": None, "done": threading.Event()}
+
+        def dispatch():
+            try:
+                transport._send_user_message(message)
+                while not channel.event.is_set():
+                    if not transport.is_active() or channel.closed:
+                        raise PluginError("connection_lost", "SSH exec acknowledgement is unknown")
+                    if deadline.expired:
+                        raise PluginError("timeout", "SSH exec acknowledgement budget exhausted")
+                    channel.event.wait(min(0.02, max(0.001, deadline.remaining())))
+                if not channel.event_ready or channel.closed or not transport.is_active():
+                    raise PluginError("connection_lost", "SSH exec acknowledgement is unknown")
+            except BaseException as exc:  # Reported to the caller, never raised here.
+                outcome["error"] = exc
+            finally:
+                outcome["done"].set()
+
+        worker = threading.Thread(target=dispatch, name="ssh-exec-dispatch", daemon=True)
+        worker.start()
+        if not outcome["done"].wait(max(0.001, deadline.remaining())):
+            # Closing the connection is the only way to interrupt a blocked
+            # Packetizer.write_all retry loop; it also wakes any event waiter.
+            for resource in (channel, transport):
+                try:
+                    resource.close()
+                except Exception:
+                    pass
+            if not outcome["done"].wait(1.0):
+                raise PluginError("timeout", "SSH exec dispatch did not stop after disconnect")
+            raise PluginError("timeout", "SSH exec acknowledgement budget exhausted")
+        worker.join(1.0)
+        error = outcome["error"]
+        if error is not None:
+            if isinstance(error, PluginError):
+                raise error
             raise PluginError("connection_lost", "SSH exec acknowledgement is unknown")
 
     @staticmethod

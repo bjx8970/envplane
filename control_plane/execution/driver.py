@@ -35,12 +35,16 @@ class DriverSettings:
     recovery_interval_seconds: float = 5
     max_jobs: int = 16
     scan_limit: int = 32
+    max_cancel_attempts: int = 2
 
     def __post_init__(self):
         from .repository import _seconds
         for name in ("lease_seconds", "heartbeat_seconds", "prepare_seconds", "execute_seconds",
                      "poll_seconds", "cancel_seconds", "poll_interval_seconds", "recovery_interval_seconds"):
             _seconds(getattr(self, name))
+        if isinstance(self.max_cancel_attempts, bool) or not isinstance(self.max_cancel_attempts, int) \
+                or not 1 <= self.max_cancel_attempts <= 10:
+            raise ValueError("cancel retry attempts must be a small bounded integer")
         if self.heartbeat_seconds * 2 >= self.lease_seconds:
             raise ValueError("heartbeat must fit job lease")
         if not 1 <= self.max_jobs <= 1000 or not 1 <= self.scan_limit <= 1000:
@@ -152,6 +156,10 @@ class ExecutionDriver:
             self._leases.pop(str(lease.job_id), None)
         return exc
 
+    def _cancel_retry_exhausted(self, operation_id):
+        """Bounded cancel retries; the count comes from durable call intents."""
+        return self.repository.method_call_count(operation_id, "cancel") >= self.settings.max_cancel_attempts
+
     def _binding(self, lease, instance_id):
         return self.repository.binding(lease, instance_id)
 
@@ -199,31 +207,38 @@ class ExecutionDriver:
                     return
             # A cancellation attempt is only useful before its outcome is known.
             # `requested`/`too_late` mean the request was already delivered (or
-            # arrived too late); repeating it would never observe the remote task.
-            cancellation_open = current.get("cancellation_result") in (None, "unsupported", "unknown")
-            cancellation_settled = current.get("cancellation_result") in ("requested", "too_late")
+            # arrived too late) and `unsupported` means the plugin declared it
+            # cannot cancel this call: repeating it never observes the remote
+            # task, so the original task must be polled instead. `unknown` may be
+            # retried, but only a bounded number of times before polling wins.
+            cancellation_result = current.get("cancellation_result")
+            cancel_attempted = self.repository.latest_call(current["id"], "cancel") is not None
+            recovery_possible = (current["state"] in ("pending_external", "unknown")
+                                 and prepared.execution_policy.recovery == "queryable")
             if job["cancel_requested_at"] is not None and prepared.execution_policy.cancellation == "requestable":
-                if cancellation_open:
+                if cancellation_result is None and not cancel_attempted:
                     method = "cancel"
-                elif cancellation_settled and current["state"] in ("pending_external", "unknown") \
-                        and prepared.execution_policy.recovery == "queryable":
+                elif cancellation_result == "unknown" and not self._cancel_retry_exhausted(current["id"]):
+                    method = "cancel"
+                elif recovery_possible:
                     method = "poll"
                 else:
                     method = None
             elif current["state"] == "prepared":
                 method = "execute"
-            elif current["state"] in ("pending_external", "unknown") and prepared.execution_policy.recovery == "queryable":
+            elif recovery_possible:
                 method = "poll"
             elif current["state"] == "unknown" and (prepared.execution_policy.effect == "read_only" or prepared.execution_policy.idempotency == "keyed"):
                 method = "execute"
             else:
                 method = None
             if method is None:
-                # A running operation after restart is NOT proof it was unsent,
-                # and a settled cancellation with no query protocol stays put.
+                # No safe progress path exists. Persist the block first: leaving
+                # the fact in running/waiting_external would be re-claimed after
+                # lease expiry and silently dropped again.
                 previous = self.repository.latest_call(current["id"])
-                if previous and current["state"] == "running":
-                    self.repository.block(lease, previous["id"], "unrecoverable_dispatched_execution")
+                if previous:
+                    self.repository.block(lease, previous["id"], "no_safe_recovery_path")
                 self._leases.pop(key, None)
                 return
             if method == "execute" and current["state"] == "unknown" and job["available_at"] > job["database_now"]:

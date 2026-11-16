@@ -641,6 +641,11 @@ class Repository:
             row = uow.execute(text("SELECT * FROM control_plane.operation_call_attempts WHERE operation_id=:op AND method=:method ORDER BY created_at DESC,id DESC LIMIT 1"), {"op": operation_id, "method": method}).first()
             return _dict(row)
 
+    def method_call_count(self, operation_id, method):
+        """Count committed call intents of one method (append-only provenance)."""
+        with self.runtime.fenced_transaction() as uow:
+            return int(uow.scalar(text("SELECT count(*) FROM control_plane.operation_call_attempts WHERE operation_id=:op AND method=:method"), {"op": operation_id, "method": method}))
+
     def replay_result(self, lease, evidence_id, *, projector=UNAVAILABLE, applicator=UNAVAILABLE):
         """Reapply only local mapping from saved evidence; never invokes a plugin.
 

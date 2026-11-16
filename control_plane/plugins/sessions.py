@@ -325,6 +325,7 @@ class _Live:
     stop: Any = field(default_factory=threading.Event)
     last_activity: float = field(default_factory=monotonic)
     receiver: Any = None
+    received: bool = False
 
 
 class SessionService:
@@ -409,24 +410,31 @@ class SessionService:
             return True
 
     def _sweep_queued_receivers(self):
-        """Close receivers that expired while still queued.
+        """Finalize receivers that expired before their loop ever started.
 
-        A receiver submitted to the session lane may sit in the queue; if its
-        budget expires before a worker picks it up, ``_receive_loop`` never runs
-        and therefore cannot run its own cleanup. This bounded sweep performs
-        that cleanup exactly once per session.
+        A receiver queued in the session lane may expire before a worker picks
+        it up; ``_receive_loop`` then never runs, so its own cleanup never runs.
+        This sweep performs only bounded local bookkeeping on the coordinator
+        thread: the actual plugin close is handed to supervised *control*
+        capacity, because a non-cooperating plugin must never block polling.
+        Receivers that already ran (``done`` without ``running``) are handled by
+        ``_receive_loop`` itself and are not closed a second time.
         """
         with self._lock:
             candidates = [(session_id, live) for session_id, live in self._live.items()
-                          if live.receiver is not None and session_id not in self._closing]
+                          if live.receiver is not None and session_id not in self._closing
+                          and not live.stop.is_set()]
         for session_id, live in candidates:
             handle = live.receiver
-            if handle.running or not handle.done() or not handle.expired:
-                continue  # Started (its own loop cleans up) or still queued in budget.
+            # `received` records that the loop actually began. A capacity
+            # rejection marks the handle started too, so `running` cannot
+            # distinguish "never ran" from "already finished".
+            if live.received or not handle.expired:
+                continue  # The loop owns its cleanup, or the budget is still valid.
             if not self._mark_closing(session_id):
                 continue
             live.stop.set()
-            self._close_handle(live, "receiver_queue_expired")
+            # Durable bookkeeping first so the fact survives a failed close.
             try:
                 row = self.store.get(session_id)
                 if row["state"] in ("active", "closing"):
@@ -434,6 +442,22 @@ class SessionService:
                                           "receiver_queue_expired")
             except Exception:
                 pass  # Recovery facts remain; never claim the remote was stopped.
+            if not self._schedule_close(live, "receiver_queue_expired"):
+                # Saturated control capacity keeps the disconnect fact; the
+                # channel handle stays tracked for a later bounded attempt.
+                with self._lock:
+                    self._closing.discard(session_id)
+
+    def _schedule_close(self, live, reason):
+        """Run the plugin close on supervised control capacity, never inline."""
+        try:
+            self.capacity.submit(str(live.plan.plugin_instance_id),
+                                 lambda: self._close_handle(live, reason),
+                                 lane="control", deadline_at=Deadline.after(self.close_seconds).expires_at,
+                                 call_id="session-close:" + str(id(live)))
+            return True
+        except Exception:
+            return False
 
     def quiesce(self):
         """Non-waiting ingress/forwarding revocation, safe before lease release."""
@@ -732,6 +756,7 @@ class SessionService:
             self.store.touch(session_id)
 
     def _receive_loop(self, session_id, live):
+        live.received = True
         end = monotonic() + self.lifetime_seconds
         reason = "channel_lost"
         try:

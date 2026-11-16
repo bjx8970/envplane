@@ -132,6 +132,19 @@ class PluginLoadingTests(unittest.TestCase):
             with self.assertRaises(ValidationError):
                 validator.validate(5)
 
+    def test_missing_fragment_in_existing_external_file_fails_at_load(self):
+        """A present file with a dangling pointer/anchor must not load."""
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / 'shape.json').write_text('{"type": "integer"}', encoding='utf-8')
+            for reference in ('shape.json#/$defs/missing', 'shape.json#missingAnchor'):
+                with self.subTest(reference=reference), self.assertRaises(ManifestError):
+                    LocalSchemas(root).compile({'$ref': reference})
+            # A resolvable fragment in the same file still loads.
+            (Path(root) / 'anchored.json').write_text(
+                '{"$defs": {"ok": {"type": "string"}}}', encoding='utf-8')
+            validator = LocalSchemas(root).compile({'$ref': 'anchored.json#/$defs/ok'})
+            validator.validate('text')
+
     def test_remote_absolute_and_escaping_schema_refs_are_rejected(self):
         with tempfile.TemporaryDirectory() as root:
             for ref in ('https://example.org/schema', 'file:///etc/passwd', '../outside.json', '//example.org/a', '%2e%2e/outside.json'):
