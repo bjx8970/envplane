@@ -26,6 +26,25 @@ EXISTS (SELECT 1 FROM pg_locks
 _FENCE_ISSUER = object()
 
 
+class _FencedMappingResult:
+    """RowMapping rows without exposing CursorResult.connection/cursor/context."""
+
+    def __init__(self, mappings):
+        self._mappings = mappings
+
+    def __iter__(self):
+        yield from self._mappings
+
+    def first(self):
+        return self._mappings.first()
+
+    def one(self):
+        return self._mappings.one()
+
+    def all(self):
+        return self._mappings.all()
+
+
 class _FencedResult:
     """Expose row data, never CursorResult.connection/cursor/context."""
 
@@ -34,6 +53,11 @@ class _FencedResult:
 
     def __iter__(self):
         yield from self._result
+
+    def mappings(self):
+        # Mapping access is ordinary read data. The wrapping type deliberately
+        # omits CursorResult attributes so a caller cannot reach the connection.
+        return _FencedMappingResult(self._result.mappings())
 
     def first(self):
         return self._result.first()
