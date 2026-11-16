@@ -363,6 +363,9 @@ class SessionService:
         self._live, self._lock, self._started = {}, threading.RLock(), False
         self._pending = {}
         self._closing = set()
+        self._close_retry = set()
+        self._close_inflight = {}
+        self._close_started = set()
         self._restart_before = datetime.now(timezone.utc)
         self._opening_count = 0
 
@@ -417,13 +420,23 @@ class SessionService:
         This sweep performs only bounded local bookkeeping on the coordinator
         thread: the actual plugin close is handed to supervised *control*
         capacity, because a non-cooperating plugin must never block polling.
-        Receivers that already ran (``done`` without ``running``) are handled by
-        ``_receive_loop`` itself and are not closed a second time.
+        Receivers that already ran (``live.received``) own their cleanup.
         """
         with self._lock:
             candidates = [(session_id, live) for session_id, live in self._live.items()
-                          if live.receiver is not None and session_id not in self._closing
-                          and not live.stop.is_set()]
+                          if live.receiver is not None and not live.received
+                          and session_id not in self._closing]
+            pending = list(self._close_retry)
+        # Retry closes whose submission was rejected or whose queued task never
+        # started: the remote channel is still open, so the fact stays durable
+        # in memory until a supervised close actually runs.
+        for session_id in pending:
+            live = self._live.get(session_id)
+            if live is None or live.close_confirmed:
+                with self._lock:
+                    self._close_retry.discard(session_id)
+                continue
+            self._schedule_close(session_id, live, "receiver_queue_expired")
         for session_id, live in candidates:
             handle = live.receiver
             # `received` records that the loop actually began. A capacity
@@ -442,22 +455,47 @@ class SessionService:
                                           "receiver_queue_expired")
             except Exception:
                 pass  # Recovery facts remain; never claim the remote was stopped.
-            if not self._schedule_close(live, "receiver_queue_expired"):
-                # Saturated control capacity keeps the disconnect fact; the
-                # channel handle stays tracked for a later bounded attempt.
-                with self._lock:
-                    self._closing.discard(session_id)
+            with self._lock:
+                self._close_retry.add(session_id)
+            self._schedule_close(session_id, live, "receiver_queue_expired")
 
-    def _schedule_close(self, live, reason):
-        """Run the plugin close on supervised control capacity, never inline."""
+    def _schedule_close(self, session_id, live, reason):
+        """Run the plugin close on supervised control capacity, never inline.
+
+        Untracked failures (submission rejected, or the queued task expired
+        before the lambda ran) keep the session in ``_close_retry`` so the next
+        bounded sweep retries. A close that actually started keeps its capacity
+        slot and is never re-submitted concurrently.
+        """
+        with self._lock:
+            if session_id in self._close_inflight or session_id in self._close_started:
+                return True  # Already scheduled or running; never double-close.
         try:
-            self.capacity.submit(str(live.plan.plugin_instance_id),
-                                 lambda: self._close_handle(live, reason),
-                                 lane="control", deadline_at=Deadline.after(self.close_seconds).expires_at,
-                                 call_id="session-close:" + str(id(live)))
-            return True
+            handle = self.capacity.submit(
+                str(live.plan.plugin_instance_id),
+                lambda: self._run_close(session_id, live, reason),
+                lane="control", deadline_at=Deadline.after(self.close_seconds).expires_at,
+                call_id="session-close:" + session_id)
         except Exception:
-            return False
+            return False  # Retried by the next sweep; the channel is still open.
+        with self._lock:
+            self._close_inflight[session_id] = handle
+        return True
+
+    def _run_close(self, session_id, live, reason):
+        """Executed inside supervised capacity: mark progress, then close once."""
+        with self._lock:
+            self._close_started.add(session_id)
+            self._close_inflight.pop(session_id, None)
+        try:
+            self._close_handle(live, reason)
+        finally:
+            with self._lock:
+                if live.close_confirmed:
+                    self._close_retry.discard(session_id)
+                # An unconfirmed close stays retryable: the remote may still be
+                # open, and we must not pretend it was stopped.
+                self._close_started.discard(session_id)
 
     def quiesce(self):
         """Non-waiting ingress/forwarding revocation, safe before lease release."""

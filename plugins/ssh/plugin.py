@@ -21,6 +21,22 @@ from control_plane.plugins.sdk import (ExecutionPolicy, ExecutionResult, PluginE
                   SafeError, SecretRef, StorageRef, finite_json)
 
 
+def _abort_transport(transport):
+    """Break a stalled packet write without enqueueing any channel message.
+
+    ``Transport.close()`` may also try to send; forcing the underlying socket
+    down first is what actually unblocks ``Packetizer.write_all`` and the recv
+    thread. Every step is best effort because the connection is already faulty.
+    """
+    for step in (lambda: transport.sock and transport.sock.close(),
+                 lambda: transport.packetizer and transport.packetizer.close(),
+                 transport.close):
+        try:
+            step()
+        except Exception:
+            pass
+
+
 class SSHPlugin:
     def describe(self):
         return json.loads(Path(__file__).with_name("manifest.yaml").read_text(encoding="utf-8"))
@@ -253,13 +269,11 @@ class SSHPlugin:
         worker = threading.Thread(target=dispatch, name="ssh-exec-dispatch", daemon=True)
         worker.start()
         if not outcome["done"].wait(max(0.001, deadline.remaining())):
-            # Closing the connection is the only way to interrupt a blocked
-            # Packetizer.write_all retry loop; it also wakes any event waiter.
-            for resource in (channel, transport):
-                try:
-                    resource.close()
-                except Exception:
-                    pass
+            # Aborting must not send anything: Channel.close() would enqueue
+            # EOF/CLOSE and block on the very clear_to_send_lock the stalled
+            # sender holds. Interrupt the transport/socket first (that breaks
+            # Packetizer.write_all with EOFError), then unwind the channel.
+            _abort_transport(transport)
             if not outcome["done"].wait(1.0):
                 raise PluginError("timeout", "SSH exec dispatch did not stop after disconnect")
             raise PluginError("timeout", "SSH exec acknowledgement budget exhausted")

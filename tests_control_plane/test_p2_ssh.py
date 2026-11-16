@@ -262,42 +262,59 @@ class SSHPluginTests(unittest.TestCase):
                 time.sleep(.05)
             self.assertEqual(after, before)
 
-    def test_stalled_socket_writes_do_not_bypass_the_total_deadline(self):
-        """Packetizer.write_all retries socket.timeout forever on its own.
+    def test_exec_send_stall_is_interrupted_by_transport_close(self):
+        """A write stall during the exec request must still respect the deadline.
 
-        The dispatch path must therefore be interruptible: with a client socket
-        that never becomes writable, execute still returns within the budget
-        instead of blocking a worker indefinitely.
+        Paramiko's ``Packetizer.write_all`` retries ``socket.timeout`` forever
+        while holding ``clear_to_send_lock``. The abort path must therefore
+        break the transport/socket (not ``Channel.close``, which would need
+        that same lock), and the helper thread must exit before returning.
         """
         from unittest import mock as _mock
+        import paramiko.transport as _transport
         with self.server("success") as port:
             context = self.context(port, seconds=.3)
             plugin = SSHPlugin()
             prepared = plugin.prepare("execute_command", {"host_id": "test", "command": "mutate"}, context)
-            real_connection = socket.create_connection
+            real_write_all = _transport.Packetizer.write_all
+            armed = threading.Event()
+            send_timeouts = []
 
-            class StalledSocket:
-                """A connected socket whose writes always time out."""
-                def __init__(self, inner):
-                    self._inner = inner
-                def __getattr__(self, name):
-                    return getattr(self._inner, name)
-                def send(self, *_args, **_kwargs):
+            def stalling_write_all(self_, data):
+                """Stall only while the exec request is being written."""
+                if armed.is_set():
+                    armed.clear()
+                    send_timeouts.append(1)
                     raise socket.timeout("injected write stall")
-                sendall = send
+                return real_write_all(self_, data)
 
-            def connect(address, *args, **kwargs):
-                return StalledSocket(real_connection(address, *args, **kwargs))
+            real_open_session = _transport.Transport.open_session
+
+            def arm_after_channel(self_, *args, **kwargs):
+                # Arm only once the channel exists, so the stall lands on the
+                # exec request instead of channel-open or auth traffic.
+                channel = real_open_session(self_, *args, **kwargs)
+                armed.set()
+                return channel
 
             started = time.monotonic()
-            with _mock.patch("socket.create_connection", side_effect=connect):
+            with _mock.patch.object(_transport.Packetizer, "write_all", stalling_write_all), \
+                    _mock.patch.object(_transport.Transport, "open_session", arm_after_channel):
                 result = plugin.execute(prepared, context)
             elapsed = time.monotonic() - started
-            self.assertLess(elapsed, 2.0, "stalled write must not bypass the deadline")
-            # The stall happens before the exec request is dispatched, so this is
-            # a proven failure to establish the connection, not an unknown change.
-            self.assertEqual(result.outcome, "failed")
+            self.assertLess(elapsed, 2.0, "exec send stall must not bypass the deadline")
+            self.assertGreater(send_timeouts, [], "the stall must occur during exec dispatch")
+            # The request may have reached the server, so the outcome is unknown.
+            self.assertEqual(result.outcome, "unknown")
             self.assertIsNone(result.output)
+            self.assertEqual(result.error.retry_hint, "manual_review")
+            # No auxiliary dispatch thread may outlive the call.
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                if not [t for t in threading.enumerate() if t.name == "ssh-exec-dispatch"]:
+                    break
+                time.sleep(.05)
+            self.assertEqual([t for t in threading.enumerate() if t.name == "ssh-exec-dispatch"], [])
 
     def test_banner_budget_fails_without_claiming_dispatched_command(self):
         with self.server("banner_timeout") as port:

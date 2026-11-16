@@ -498,6 +498,25 @@ class Repository:
         environment = uow.scalar(text("SELECT environment_id FROM control_plane.jobs WHERE id=:job"), {"job": lease.job_id})
         self._quarantine(uow, environment)
 
+    def block_operation(self, lease, operation_id, code):
+        """Block an operation by identity under the *current* lease.
+
+        Recovery runs under a fresh Job token, so it cannot satisfy
+        ``_match_call``'s historical-call fencing (and must not weaken it).
+        This entry point therefore validates the current coordinator, Job
+        lease, execution-group revision and Operation ownership instead.
+        """
+        with self.runtime.fenced_transaction() as uow:
+            self._guard(uow, lease)
+            op = _dict(uow.execute(text(
+                "SELECT * FROM control_plane.operations WHERE id=:op AND job_id=:job FOR UPDATE"),
+                {"op": operation_id, "job": lease.job_id}).one())
+            if op["state"] not in ("running", "pending_external", "unknown"):
+                raise InvalidTransition("operation is not recoverable for blocking")
+            self._block_in(uow, lease, op, code)
+            self._guard(uow, lease, terminal=True)
+            return True
+
     def block(self, lease, call_id, code):
         with self.runtime.fenced_transaction() as uow:
             self._guard(uow, lease)

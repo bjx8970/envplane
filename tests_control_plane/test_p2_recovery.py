@@ -365,11 +365,12 @@ class DriverBudgetTests(unittest.TestCase):
         repo.view.return_value = (job, [{"id": operation["step_id"], "step_path": "s", "item_key": "",
                                          "state": "waiting_external", "input": {}, "output": None}], [operation])
         repo.saved_success.return_value = None
-        repo.latest_call.return_value = {"id": uuid4()}
         driver = ExecutionDriver(repo, mock.Mock(), mock.Mock(), mock.Mock())
         driver._accepting = False
         driver._leases = {str(lease.job_id): lease}
         driver._advance(lease)
-        repo.block.assert_called_once()
-        self.assertEqual(repo.block.call_args[0][2], "no_safe_recovery_path")
+        # Blocking must be operation-scoped: a recovery lease carries a new Job
+        # token and can never satisfy the historical-call fencing.
+        repo.block_operation.assert_called_once_with(lease, operation["id"], "no_safe_recovery_path")
+        repo.block.assert_not_called()
         self.assertNotIn(str(lease.job_id), driver._leases)

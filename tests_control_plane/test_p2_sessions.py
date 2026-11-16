@@ -453,6 +453,49 @@ class SessionProtocolTests(unittest.TestCase):
         self.assertEqual(len(transport.closed), closes, "finished receiver must not be re-closed")
         service.stop(grace=0)
 
+    def test_rejected_close_is_retried_once_capacity_returns(self):
+        """A close refused by saturated control capacity must not be forgotten."""
+        transport, store = FakeTransport(), MemoryStore()
+        capacity = CapacitySupervisor(CapacitySettings(
+            ordinary_workers=1, control_workers=1, session_workers=1, queue_limit=3,
+            instance_limit=2, shutdown_grace_seconds=0.2))
+        self.addCleanup(capacity.stop, 0.2)
+        capacity.start()
+        session_free, control_free = threading.Event(), threading.Event()
+        self.addCleanup(capacity.stop, 0.2)
+        # Occupy the single session worker so the receiver stays queued.
+        busy_session = capacity.submit("instance", lambda: session_free.wait(5), lane="session",
+                                       deadline_at=Deadline.after(5).expires_at)
+        # Occupy the single control worker so the close submission is rejected.
+        busy_control = capacity.submit("instance", lambda: control_free.wait(5), lane="control",
+                                       deadline_at=Deadline.after(5).expires_at)
+        plan = OpeningPlan("operation", "job", "environment", "student", "instance", "secret-v1",
+                           "terminal-entry", PreparedCall("terminal"), transport,
+                           SimpleNamespace(deadline=Deadline.after(10)))
+        service = SessionService(None, None, capacity, store=store,
+                                 authorizer=lambda *a, **k: True, opening_adapter=FakeOpening(plan),
+                                 lifetime_seconds=.2, recovery_seconds=.05)
+        service.start()
+        sid = service.open({})["id"]
+        live = service._live[sid]
+        end = time.monotonic() + 3
+        while not live.receiver.expired and time.monotonic() < end:
+            time.sleep(.02)
+        service.poll()  # Close cannot be admitted while control capacity is full.
+        self.assertEqual(transport.closed, [])
+        self.assertIn(sid, service._close_retry, "unstarted close must stay tracked")
+        # Free capacity; the next sweep must reschedule and actually close once.
+        control_free.set()
+        busy_control.result(5)
+        end = time.monotonic() + 3
+        while not transport.closed and time.monotonic() < end:
+            service.poll()
+            time.sleep(.02)
+        self.assertEqual(transport.closed, ["receiver_queue_expired"])
+        session_free.set()
+        busy_session.result(5)
+        service.stop(grace=0)
+
 
 class SessionPostgreSQLTests(unittest.TestCase):
     @classmethod

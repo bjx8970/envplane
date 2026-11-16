@@ -235,10 +235,10 @@ class ExecutionDriver:
             if method is None:
                 # No safe progress path exists. Persist the block first: leaving
                 # the fact in running/waiting_external would be re-claimed after
-                # lease expiry and silently dropped again.
-                previous = self.repository.latest_call(current["id"])
-                if previous:
-                    self.repository.block(lease, previous["id"], "no_safe_recovery_path")
+                # lease expiry and silently dropped again. A recovery lease has a
+                # new token, so the historical-call fencing cannot apply; use the
+                # current-lease, operation-scoped block instead.
+                self.repository.block_operation(lease, current["id"], "no_safe_recovery_path")
                 self._leases.pop(key, None)
                 return
             if method == "execute" and current["state"] == "unknown" and job["available_at"] > job["database_now"]:
