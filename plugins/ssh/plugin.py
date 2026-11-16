@@ -24,11 +24,12 @@ from control_plane.plugins.sdk import (ExecutionPolicy, ExecutionResult, PluginE
 def _abort_transport(transport):
     """Break a stalled packet write without enqueueing any channel message.
 
-    ``Transport.close()`` may also try to send; forcing the underlying socket
-    down first is what actually unblocks ``Packetizer.write_all`` and the recv
-    thread. Every step is best effort because the connection is already faulty.
+    Shut down the socket first to interrupt packet writes and wake the receive
+    thread. Transport cleanup then unlinks channels without sending EOF/CLOSE.
+    Every step is best effort because the connection may already be faulty.
     """
-    for step in (lambda: transport.sock and transport.sock.close(),
+    for step in (lambda: transport.sock and transport.sock.shutdown(socket.SHUT_RDWR),
+                 lambda: transport.sock and transport.sock.close(),
                  lambda: transport.packetizer and transport.packetizer.close(),
                  transport.close):
         try:
@@ -215,7 +216,13 @@ class SSHPlugin:
                                    error=SafeError(code, "SSH execution could not be confirmed" if dispatched
                                                    else "SSH connection was not established", retry_hint="manual_review" if dispatched else None))
         finally:
-            for resource in (channel, transport, sock):
+            # Channel.close sends EOF/CLOSE and can itself retry socket writes
+            # forever, including after exec has already been acknowledged.
+            # Interrupt the connection before any channel cleanup on every
+            # outcome; closing this connection does not prove a command ended.
+            if transport is not None:
+                _abort_transport(transport)
+            for resource in (channel, sock):
                 if resource is not None:
                     try:
                         resource.close()
@@ -231,7 +238,7 @@ class SSHPlugin:
         and ``Packetizer.write_all`` retries forever on ``socket.timeout``.
         Both the send and the acknowledgement wait therefore run on one
         supervised thread whose deadline is enforced by the caller: on expiry
-        the channel and transport are closed, which breaks the write retry with
+        the socket/transport are interrupted, which breaks the write retry with
         EOFError and sets the channel event, so the thread terminates and is
         joined before returning.  The caller has already recorded the
         dispatch, so every failure here is unknown, never a safe retry.
@@ -274,10 +281,12 @@ class SSHPlugin:
             # sender holds. Interrupt the transport/socket first (that breaks
             # Packetizer.write_all with EOFError), then unwind the channel.
             _abort_transport(transport)
-            if not outcome["done"].wait(1.0):
-                raise PluginError("timeout", "SSH exec dispatch did not stop after disconnect")
+            # A timed join must not release the caller's capacity while this
+            # helper is still executing. Socket interruption stops Paramiko;
+            # an uncooperative call must retain its slot until it really exits.
+            worker.join()
             raise PluginError("timeout", "SSH exec acknowledgement budget exhausted")
-        worker.join(1.0)
+        worker.join()
         error = outcome["error"]
         if error is not None:
             if isinstance(error, PluginError):

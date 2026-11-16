@@ -13,6 +13,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import paramiko
 from jsonschema import Draft202012Validator
@@ -120,6 +121,29 @@ class FakeSecrets:
         if ref != SecretRef("test-secret", "secret-v1"):
             raise PluginError("unavailable")
         return FakeHandle()
+
+
+class StallingSocket:
+    """Fault only socket.send; Paramiko's packet retries and locks stay real."""
+    def __init__(self, sock, armed):
+        self.sock = sock
+        self.armed = armed
+        self.closed = threading.Event()
+        self.send_timeouts = 0
+
+    def __getattr__(self, name):
+        return getattr(self.sock, name)
+
+    def send(self, data, *args, **kwargs):
+        if self.armed.is_set() and not self.closed.is_set():
+            self.send_timeouts += 1
+            time.sleep(.005)
+            raise socket.timeout("injected persistent socket write timeout")
+        return self.sock.send(data, *args, **kwargs)
+
+    def close(self):
+        self.closed.set()
+        self.sock.close()
 
 
 class SSHPluginTests(unittest.TestCase):
@@ -262,59 +286,90 @@ class SSHPluginTests(unittest.TestCase):
                 time.sleep(.05)
             self.assertEqual(after, before)
 
-    def test_exec_send_stall_is_interrupted_by_transport_close(self):
-        """A write stall during the exec request must still respect the deadline.
+    def _execute_with_stalled_socket(self, *, after_ack, wait=2):
+        armed = threading.Event()
+        sockets, observed, results = [], {}, []
+        real_connect = socket.create_connection
 
-        Paramiko's ``Packetizer.write_all`` retries ``socket.timeout`` forever
-        while holding ``clear_to_send_lock``. The abort path must therefore
-        break the transport/socket (not ``Channel.close``, which would need
-        that same lock), and the helper thread must exit before returning.
-        """
-        from unittest import mock as _mock
-        import paramiko.transport as _transport
-        with self.server("success") as port:
-            context = self.context(port, seconds=.3)
-            plugin = SSHPlugin()
+        def connect(*args, **kwargs):
+            wrapped = StallingSocket(real_connect(*args, **kwargs), armed)
+            sockets.append(wrapped)
+            return wrapped
+
+        class ObservedPlugin(SSHPlugin):
+            @staticmethod
+            def _exec_command(channel, transport, command, deadline):
+                observed.update(transport=transport, channel=channel,
+                                authenticated=transport.is_authenticated(),
+                                channel_active=channel.active)
+                if not after_ack:
+                    armed.set()
+                SSHPlugin._exec_command(channel, transport, command, deadline)
+                if after_ack:
+                    # The real ACK has been processed and the real dispatch
+                    # helper has exited. Only subsequent writes can fail.
+                    observed["ack_ready"] = channel.event_ready
+                    observed["dispatch_at_ack"] = [t for t in threading.enumerate()
+                                                   if t.name == "ssh-exec-dispatch"]
+                    armed.set()
+
+        with self.server("wait_timeout") as port:
+            context = self.context(port, seconds=.7, limits={"wait": wait})
+            plugin = ObservedPlugin()
             prepared = plugin.prepare("execute_command", {"host_id": "test", "command": "mutate"}, context)
-            real_write_all = _transport.Packetizer.write_all
-            armed = threading.Event()
-            send_timeouts = []
+            completed = threading.Event()
 
-            def stalling_write_all(self_, data):
-                """Stall only while the exec request is being written."""
-                if armed.is_set():
-                    armed.clear()
-                    send_timeouts.append(1)
-                    raise socket.timeout("injected write stall")
-                return real_write_all(self_, data)
+            def execute():
+                try:
+                    results.append(plugin.execute(prepared, context))
+                finally:
+                    observed["dispatch_at_return"] = [t for t in threading.enumerate()
+                                                      if t.name == "ssh-exec-dispatch"]
+                    completed.set()
 
-            real_open_session = _transport.Transport.open_session
+            worker = threading.Thread(target=execute, name="ssh-stall-regression", daemon=True)
+            with mock.patch.object(socket, "create_connection", connect):
+                started = time.monotonic()
+                worker.start()
+                try:
+                    # Assert before emergency test cleanup: closing a socket
+                    # here must not be what makes production execute return.
+                    self.assertTrue(completed.wait(1.2), "SSH cleanup exceeded the total deadline")
+                    self.assertLess(time.monotonic() - started, 1.2)
+                    self.assertTrue(armed.is_set(), "the requested SSH phase was not reached")
+                    self.assertTrue(observed["authenticated"])
+                    self.assertTrue(observed["channel_active"])
+                    if after_ack:
+                        self.assertTrue(observed["ack_ready"])
+                        self.assertEqual(observed["dispatch_at_ack"], [])
+                    else:
+                        self.assertGreater(sockets[0].send_timeouts, 1,
+                                           "exercise real Packetizer.write_all timeout retries")
+                    self.assertEqual(len(results), 1)
+                    result = results[0]
+                    self.assertEqual(result.outcome, "unknown")
+                    self.assertEqual(result.error.code, "timeout")
+                    self.assertEqual(result.error.retry_hint, "manual_review")
+                    self.assertIsNone(result.output)
+                    self.assertFalse(observed["transport"].is_active())
+                    self.assertTrue(sockets[0].closed.is_set())
+                    self.assertEqual(observed["dispatch_at_return"], [])
+                finally:
+                    for wrapped in sockets:
+                        wrapped.close()
+                    if "transport" in observed:
+                        observed["transport"].close()
+                    worker.join(2)
+                    self.assertFalse(worker.is_alive())
 
-            def arm_after_channel(self_, *args, **kwargs):
-                # Arm only once the channel exists, so the stall lands on the
-                # exec request instead of channel-open or auth traffic.
-                channel = real_open_session(self_, *args, **kwargs)
-                armed.set()
-                return channel
+    def test_exec_send_stall_is_interrupted_by_transport_close(self):
+        self._execute_with_stalled_socket(after_ack=False)
 
-            started = time.monotonic()
-            with _mock.patch.object(_transport.Packetizer, "write_all", stalling_write_all), \
-                    _mock.patch.object(_transport.Transport, "open_session", arm_after_channel):
-                result = plugin.execute(prepared, context)
-            elapsed = time.monotonic() - started
-            self.assertLess(elapsed, 2.0, "exec send stall must not bypass the deadline")
-            self.assertGreater(send_timeouts, [], "the stall must occur during exec dispatch")
-            # The request may have reached the server, so the outcome is unknown.
-            self.assertEqual(result.outcome, "unknown")
-            self.assertIsNone(result.output)
-            self.assertEqual(result.error.retry_hint, "manual_review")
-            # No auxiliary dispatch thread may outlive the call.
-            deadline = time.monotonic() + 2
-            while time.monotonic() < deadline:
-                if not [t for t in threading.enumerate() if t.name == "ssh-exec-dispatch"]:
-                    break
-                time.sleep(.05)
-            self.assertEqual([t for t in threading.enumerate() if t.name == "ssh-exec-dispatch"], [])
+    def test_cleanup_after_exec_ack_never_sends_on_a_stalled_socket(self):
+        for wait in (.15, 2):
+            with self.subTest(wait=wait):
+                # Cover both the command's wait limit and the total deadline.
+                self._execute_with_stalled_socket(after_ack=True, wait=wait)
 
     def test_banner_budget_fails_without_claiming_dispatched_command(self):
         with self.server("banner_timeout") as port:

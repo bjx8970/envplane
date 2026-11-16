@@ -12,7 +12,7 @@ from sqlalchemy.exc import DBAPIError
 from control_plane.config import COORDINATOR_LOCK_KEY
 from control_plane.coordination import CoordinatorLease
 from control_plane.persistence import admit_job
-from control_plane.plugins.sdk import AuthorizationDenied, Deadline, PluginError, PreparedCall, SessionOpenResult
+from control_plane.plugins.sdk import AuthorizationDenied, BudgetExceeded, Deadline, PluginError, PreparedCall, SessionOpenResult
 from control_plane.plugins.sessions import (OpeningNotEstablished, OpeningPlan, RepositoryOpeningAdapter, SessionConflict,
     SessionService, SessionStore, validate_client_frame, validate_server_frame)
 from control_plane.plugins.capacity import CapacitySettings, CapacitySupervisor
@@ -455,46 +455,226 @@ class SessionProtocolTests(unittest.TestCase):
 
     def test_rejected_close_is_retried_once_capacity_returns(self):
         """A close refused by saturated control capacity must not be forgotten."""
+        service, capacity, transport, sid, live = self._queued_close_service()
+        release, busy = self._occupy_lane(capacity, "control")
+        queued = capacity.submit("queued-blocker", lambda: None, lane="control",
+                                 deadline_at=Deadline.after(5).expires_at)
+        self.assertEqual(capacity.snapshot()["lanes"]["control"]["queued"], 1)
+        service.poll()
+        self.assertNotIn(sid, service._close_inflight, "the full queue must actually reject close")
+        self.assertIn(sid, service._close_retry)
+        for _ in range(3):
+            service.poll()
+        self.assertFalse(live.close_confirmed)
+        self.assertEqual(transport.closed, [])
+        release.set()
+        busy.result(2)
+        queued.result(2)
+        self._wait_until(lambda: live.close_confirmed and
+                         capacity.snapshot()["lanes"]["control"]["active"] == 0,
+                         advance=service.poll)
+        service.poll()
+        self.assertNotIn(sid, service._close_retry)
+        self.assertEqual(transport.closed, ["receiver_queue_expired"])
+
+    def _wait_until(self, predicate, *, advance=lambda: None):
+        end = time.monotonic() + 2
+        while not predicate() and time.monotonic() < end:
+            advance()
+            time.sleep(.005)
+        self.assertTrue(predicate(), "condition did not become true before test deadline")
+
+    def _occupy_lane(self, capacity, lane):
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        handle = capacity.submit("busy-" + lane, lambda: (entered.set(), release.wait(5)),
+                                 lane=lane, deadline_at=Deadline.after(5).expires_at)
+        self.assertTrue(entered.wait(2))
+        return release, handle
+
+    def _queued_close_service(self, *, close_seconds=.1, max_sessions=64):
         transport, store = FakeTransport(), MemoryStore()
         capacity = CapacitySupervisor(CapacitySettings(
-            ordinary_workers=1, control_workers=1, session_workers=1, queue_limit=3,
+            ordinary_workers=1, control_workers=1, session_workers=1, queue_limit=1,
             instance_limit=2, shutdown_grace_seconds=0.2))
         self.addCleanup(capacity.stop, 0.2)
         capacity.start()
-        session_free, control_free = threading.Event(), threading.Event()
-        self.addCleanup(capacity.stop, 0.2)
-        # Occupy the single session worker so the receiver stays queued.
-        busy_session = capacity.submit("instance", lambda: session_free.wait(5), lane="session",
-                                       deadline_at=Deadline.after(5).expires_at)
-        # Occupy the single control worker so the close submission is rejected.
-        busy_control = capacity.submit("instance", lambda: control_free.wait(5), lane="control",
-                                       deadline_at=Deadline.after(5).expires_at)
+        session_free, busy_session = self._occupy_lane(capacity, "session")
+        self.blocked_receiver = (session_free, busy_session)
         plan = OpeningPlan("operation", "job", "environment", "student", "instance", "secret-v1",
                            "terminal-entry", PreparedCall("terminal"), transport,
                            SimpleNamespace(deadline=Deadline.after(10)))
         service = SessionService(None, None, capacity, store=store,
                                  authorizer=lambda *a, **k: True, opening_adapter=FakeOpening(plan),
-                                 lifetime_seconds=.2, recovery_seconds=.05)
+                                 lifetime_seconds=.05, recovery_seconds=.05,
+                                 close_seconds=close_seconds, max_sessions=max_sessions)
         service.start()
+        self.addCleanup(service.stop, 0)
         sid = service.open({})["id"]
         live = service._live[sid]
-        end = time.monotonic() + 3
-        while not live.receiver.expired and time.monotonic() < end:
-            time.sleep(.02)
-        service.poll()  # Close cannot be admitted while control capacity is full.
-        self.assertEqual(transport.closed, [])
-        self.assertIn(sid, service._close_retry, "unstarted close must stay tracked")
-        # Free capacity; the next sweep must reschedule and actually close once.
-        control_free.set()
-        busy_control.result(5)
-        end = time.monotonic() + 3
-        while not transport.closed and time.monotonic() < end:
+        self._wait_until(lambda: live.receiver.expired)
+        self.assertFalse(live.receiver.done(), "receiver must still be queued")
+        return service, capacity, transport, sid, live
+
+    def test_queued_close_remains_tracked_during_repeated_poll(self):
+        service, capacity, transport, sid, live = self._queued_close_service(close_seconds=1)
+        release, busy = self._occupy_lane(capacity, "control")
+        service.poll()
+        close = service._close_inflight[sid]
+        self.assertFalse(close.running)
+        for _ in range(3):
             service.poll()
-            time.sleep(.02)
+            self.assertIs(service._close_inflight[sid], close)
+        self.assertFalse(live.close_confirmed)
+        self.assertEqual(transport.closed, [])
+        release.set()
+        busy.result(2)
+        close.result(2)
+        service.poll()
+        self.assertTrue(live.close_confirmed)
+        self.assertNotIn(sid, service._close_inflight)
         self.assertEqual(transport.closed, ["receiver_queue_expired"])
+
+    def test_running_overdue_close_retains_capacity_without_duplicate_close(self):
+        service, capacity, transport, sid, live = self._queued_close_service()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        def slow_close(handle, reason, *, deadline):
+            transport.closed.append(reason)
+            entered.set()
+            release.wait(5)
+            return {"channel_closed": True}
+        transport.close_session = slow_close
+        service.poll()
+        self.assertTrue(entered.wait(2))
+        self._wait_until(lambda: capacity.snapshot()["lanes"]["control"]["overdue"] == 1)
+        started = time.monotonic()
+        for _ in range(3):
+            service.poll()
+        self.assertLess(time.monotonic() - started, .5, "poll must not wait for plugin close")
+        close = service._close_inflight[sid]
+        lane = capacity.snapshot()["lanes"]["control"]
+        self.assertEqual((lane["active"], lane["overdue"], lane["queued"]), (1, 1, 0))
+        self.assertFalse(close.done())
+        self.assertFalse(live.close_confirmed)
+        self.assertEqual(transport.closed, ["receiver_queue_expired"])
+        release.set()
+        close.result(2)
+        service.poll()
+        self.assertNotIn(sid, service._close_retry)
+        self.assertEqual(transport.closed, ["receiver_queue_expired"])
+
+    def test_expired_queued_close_is_retried_after_actual_capacity_recovery(self):
+        service, capacity, transport, sid, live = self._queued_close_service()
+        transport.confirm_close = False
+        service.poll()
+        self._wait_until(lambda: len(transport.closed) == 1 and
+                         capacity.snapshot()["lanes"]["control"]["active"] == 0)
+        self.assertFalse(live.close_confirmed)
+        release, busy = self._occupy_lane(capacity, "control")
+        transport.confirm_close = True
+        service.poll()
+        queued_close = service._close_inflight[sid]
+        self.assertFalse(queued_close.done())
+        self.assertFalse(queued_close.running)
+        self._wait_until(lambda: queued_close.expired)
+        release.set()
+        busy.result(2)
+        with self.assertRaises(BudgetExceeded):
+            queued_close.result(2)
+        self.assertEqual(len(transport.closed), 1, "expired task never entered plugin close")
+        self._wait_until(lambda: live.close_confirmed and
+                         capacity.snapshot()["lanes"]["control"]["active"] == 0,
+                         advance=service.poll)
+        service.poll()
+        self.assertNotIn(sid, service._close_retry)
+        self.assertNotIn(sid, service._close_inflight)
+        self.assertEqual(transport.closed, ["receiver_queue_expired"] * 2)
+
+    def test_open_does_not_evict_unconfirmed_cleanup_when_receiver_has_exited(self):
+        service, capacity, transport, sid, live = self._queued_close_service(max_sessions=1)
+        transport.confirm_close = False
+        service.poll()
+        self._wait_until(lambda: bool(transport.closed) and
+                         capacity.snapshot()["lanes"]["control"]["active"] == 0)
+        release, busy = self.blocked_receiver
+        release.set()
+        busy.result(2)
+        with self.assertRaises(BudgetExceeded):
+            live.receiver.result(2)
+        self.assertTrue(live.receiver.done())
+        with self.assertRaises(PluginError) as raised:
+            service.open({})
+        self.assertEqual(raised.exception.code, "capacity")
+        self.assertIs(service._live[sid], live)
+        self.assertIn(sid, service._close_retry)
+
+    def test_expiry_sweep_and_receiver_entry_share_one_cleanup_owner(self):
+        transport, store = FakeTransport(), MemoryStore()
+        capacity = CapacitySupervisor(CapacitySettings(
+            ordinary_workers=1, control_workers=1, session_workers=1, queue_limit=1,
+            instance_limit=2, shutdown_grace_seconds=.2))
+        capacity.start()
+        self.addCleanup(capacity.stop, .2)
+        plan = OpeningPlan("operation", "job", "environment", "student", "instance", "secret-v1",
+                           "terminal-entry", PreparedCall("terminal"), transport,
+                           SimpleNamespace(deadline=Deadline.after(10)))
+        service = SessionService(None, None, capacity, store=store,
+                                 authorizer=lambda *a, **k: True, opening_adapter=FakeOpening(plan),
+                                 lifetime_seconds=.1, close_seconds=1)
+        service.start()
+        self.addCleanup(service.stop, 0)
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        receive = service._receive_loop
+        def pause_before_receiver_entry(*args):
+            entered.set()
+            release.wait(5)
+            return receive(*args)
+        service._receive_loop = pause_before_receiver_entry
+        sid = service.open({})["id"]
+        live = service._live[sid]
+        self.assertTrue(entered.wait(2), "capacity has passed its pre-call deadline check")
+        self._wait_until(lambda: live.receiver.expired)
+        service.poll()
+        self._wait_until(lambda: transport.closed == ["receiver_queue_expired"])
+        release.set()
+        live.receiver.result(2)
+        service.poll()
+        self.assertEqual(transport.closed, ["receiver_queue_expired"])
+        self.assertEqual(store.get(sid)["state"], "disconnected")
+
+    def test_open_retains_cleanup_owner_before_retry_registration(self):
+        service, capacity, transport, sid, live = self._queued_close_service(max_sessions=1)
+        transport.confirm_close = False
+        session_free, busy = self.blocked_receiver
         session_free.set()
-        busy_session.result(5)
-        service.stop(grace=0)
+        busy.result(2)
+        with self.assertRaises(BudgetExceeded):
+            live.receiver.result(2)
+        entered, release = threading.Event(), threading.Event()
+        get = service.store.get
+        def pause_cleanup_metadata(session_id):
+            if session_id == sid and not entered.is_set():
+                entered.set()
+                release.wait(5)
+            return get(session_id)
+        service.store.get = pause_cleanup_metadata
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            sweep = pool.submit(service.poll)
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertIn(sid, service._closing)
+                self.assertNotIn(sid, service._close_retry)
+                with self.assertRaises(PluginError) as raised:
+                    service.open({})
+                self.assertEqual(raised.exception.code, "capacity")
+                self.assertIs(service._live[sid], live)
+            finally:
+                release.set()
+                sweep.result(2)
+        self._wait_until(lambda: bool(transport.closed))
+        self.assertIn(sid, service._close_retry)
 
 
 class SessionPostgreSQLTests(unittest.TestCase):

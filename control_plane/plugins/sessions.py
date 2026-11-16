@@ -326,6 +326,7 @@ class _Live:
     last_activity: float = field(default_factory=monotonic)
     receiver: Any = None
     received: bool = False
+    close_confirmed: bool = False
 
 
 class SessionService:
@@ -365,7 +366,6 @@ class SessionService:
         self._closing = set()
         self._close_retry = set()
         self._close_inflight = {}
-        self._close_started = set()
         self._restart_before = datetime.now(timezone.utc)
         self._opening_count = 0
 
@@ -404,10 +404,10 @@ class SessionService:
         self._recover_batch(Deadline.after(self.recovery_seconds))
         self._sweep_queued_receivers()
 
-    def _mark_closing(self, session_id):
+    def _mark_closing(self, session_id, live):
         """Claim the one-time cleanup of a queued receiver; False if taken."""
         with self._lock:
-            if session_id in self._closing:
+            if live.received or session_id in self._closing:
                 return False
             self._closing.add(session_id)
             return True
@@ -428,11 +428,11 @@ class SessionService:
                           and session_id not in self._closing]
             pending = list(self._close_retry)
         # Retry closes whose submission was rejected or whose queued task never
-        # started: the remote channel is still open, so the fact stays durable
-        # in memory until a supervised close actually runs.
+        # started: the remote channel may still be open, so retain the local
+        # cleanup obligation until a supervised close confirms otherwise.
         for session_id in pending:
             live = self._live.get(session_id)
-            if live is None or live.close_confirmed:
+            if live is None:
                 with self._lock:
                     self._close_retry.discard(session_id)
                 continue
@@ -444,7 +444,7 @@ class SessionService:
             # distinguish "never ran" from "already finished".
             if live.received or not handle.expired:
                 continue  # The loop owns its cleanup, or the budget is still valid.
-            if not self._mark_closing(session_id):
+            if not self._mark_closing(session_id, live):
                 continue
             live.stop.set()
             # Durable bookkeeping first so the fact survives a failed close.
@@ -462,40 +462,33 @@ class SessionService:
     def _schedule_close(self, session_id, live, reason):
         """Run the plugin close on supervised control capacity, never inline.
 
-        Untracked failures (submission rejected, or the queued task expired
+        Unstarted failures (submission rejected, or the queued task expired
         before the lambda ran) keep the session in ``_close_retry`` so the next
         bounded sweep retries. A close that actually started keeps its capacity
         slot and is never re-submitted concurrently.
         """
         with self._lock:
-            if session_id in self._close_inflight or session_id in self._close_started:
-                return True  # Already scheduled or running; never double-close.
-        try:
-            handle = self.capacity.submit(
-                str(live.plan.plugin_instance_id),
-                lambda: self._run_close(session_id, live, reason),
-                lane="control", deadline_at=Deadline.after(self.close_seconds).expires_at,
-                call_id="session-close:" + session_id)
-        except Exception:
-            return False  # Retried by the next sweep; the channel is still open.
-        with self._lock:
-            self._close_inflight[session_id] = handle
-        return True
-
-    def _run_close(self, session_id, live, reason):
-        """Executed inside supervised capacity: mark progress, then close once."""
-        with self._lock:
-            self._close_started.add(session_id)
+            handle = self._close_inflight.get(session_id)
+            if handle is not None and not handle.done():
+                return True  # Queued or running, even if overdue: retain the slot.
+            # done() is set only after capacity has left the callable. It also
+            # covers queue expiry before the callable was ever entered; neither
+            # case can depend on a callback inside that callable for cleanup.
             self._close_inflight.pop(session_id, None)
-        try:
-            self._close_handle(live, reason)
-        finally:
-            with self._lock:
-                if live.close_confirmed:
-                    self._close_retry.discard(session_id)
-                # An unconfirmed close stays retryable: the remote may still be
-                # open, and we must not pretend it was stopped.
-                self._close_started.discard(session_id)
+            if live.close_confirmed:
+                self._close_retry.discard(session_id)
+                return True
+            try:
+                # Keep admission and registration atomic relative to another
+                # sweep/open. The worker never removes its own tracking entry.
+                self._close_inflight[session_id] = self.capacity.submit(
+                    str(live.plan.plugin_instance_id),
+                    lambda: self._close_handle(live, reason),
+                    lane="control", deadline_at=Deadline.after(self.close_seconds).expires_at,
+                    call_id="session-close:" + session_id)
+            except Exception:
+                return False  # A later sweep retries; the channel may remain open.
+            return True
 
     def quiesce(self):
         """Non-waiting ingress/forwarding revocation, safe before lease release."""
@@ -535,8 +528,13 @@ class SessionService:
             # Bound retained replay/clients too, not only active receivers. Only
             # actual completed calls are evicted; stuck calls keep their slots.
             for key, old in list(self._live.items()):
-                if old.stop.is_set() and old.receiver is not None and old.receiver.done():
+                close = self._close_inflight.get(key)
+                if (old.stop.is_set() and old.receiver is not None and old.receiver.done()
+                        and (key not in self._closing or old.close_confirmed)
+                        and key not in self._close_retry and (close is None or close.done())):
                     del self._live[key]
+                    self._close_inflight.pop(key, None)
+                    self._closing.discard(key)
             if len(self._live) + self._opening_count >= self.max_sessions:
                 raise PluginError("capacity", "session capacity is exhausted")
             self._opening_count += 1
@@ -794,7 +792,13 @@ class SessionService:
             self.store.touch(session_id)
 
     def _receive_loop(self, session_id, live):
-        live.received = True
+        with self._lock:
+            # Capacity can pass its deadline check, then be descheduled before
+            # entering here. If the expiry sweep won ownership meanwhile, its
+            # control call alone closes the handle; do not run our finally too.
+            if session_id in self._closing:
+                return
+            live.received = True
         end = monotonic() + self.lifetime_seconds
         reason = "channel_lost"
         try:
@@ -833,7 +837,7 @@ class SessionService:
             row = self.store.get(session_id)
             if row["state"] == "closing":
                 # Only explicit transport confirmation closes the platform channel.
-                state = "closed" if getattr(live, "close_confirmed", False) else "disconnected"
+                state = "closed" if live.close_confirmed else "disconnected"
                 self.store.transition(session_id, "closing", state, reason)
                 self._publish(session_id, live, {"type": "closed", "reason": reason} if state == "closed"
                               else {"type": "state", "state": state, "epoch": row["controller_revision"]})
