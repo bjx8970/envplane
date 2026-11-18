@@ -48,10 +48,11 @@ def verify_password(password, encoded):
         return False
 
 
-def active_role(uow, actor_id):
-    return uow.scalar(text("""
-        SELECT role FROM control_plane.users WHERE id=:id AND active AND deleted_at IS NULL
-    """), {"id": actor_id})
+def active_role(uow, actor_id, *, lock=False):
+    query = "SELECT role FROM control_plane.users WHERE id=:id AND active AND deleted_at IS NULL"
+    # Ownership creation must serialize with role changes and tombstones on the
+    # owner row. A plain FK verifies identity, but not role or deleted_at.
+    return uow.scalar(text(query + (" FOR SHARE" if lock else "")), {"id": actor_id})
 
 
 def can_manage_course(uow, actor_id, course_id):
@@ -173,6 +174,21 @@ def _account(uow, actor_id, user_id, *, personal=False):
     raise AuthorizationDenied()
 
 
+def _require_resolved_teacher_ownership(uow, user_id):
+    # The caller has already locked this user FOR UPDATE. Disabled students
+    # still have an exclusive manager until sharing or account deletion.
+    row = uow.execute(text("""
+        SELECT EXISTS(SELECT FROM control_plane.courses WHERE owner_teacher_id=:id
+                      AND deleted_at IS NULL) AS owns_courses,
+               EXISTS(SELECT FROM control_plane.users WHERE created_by=:id AND role='student'
+                      AND exclusive_management AND deleted_at IS NULL) AS manages_students
+    """), {"id": user_id}).one()
+    if row.owns_courses:
+        raise ValueError("teacher still owns courses")
+    if row.manages_students:
+        raise ValueError("teacher still exclusively manages students")
+
+
 class IdentityService:
     def __init__(self, runtime):
         self.runtime = runtime
@@ -204,7 +220,7 @@ class IdentityService:
     def create_user(self, actor_id, username, password, *, role="student"):
         username, hashed = _label(username), _hash_password(password)
         with self.runtime.fenced_transaction() as uow:
-            creator_role = active_role(uow, actor_id)
+            creator_role = active_role(uow, actor_id, lock=True)
             if role not in {"admin", "teacher", "student"}:
                 raise ValueError("unknown account role")
             if creator_role != "admin" and (creator_role != "teacher" or role != "student"):
@@ -262,11 +278,8 @@ class IdentityService:
             # An account cannot become a non-teacher while still responsible for
             # a course, or leave the student role while enrolled. Handle those
             # relationships explicitly; changing a role must not destroy them.
-            if account.role == "teacher" and uow.scalar(text("""
-                    SELECT EXISTS (SELECT FROM control_plane.courses
-                                   WHERE owner_teacher_id=:id AND deleted_at IS NULL)
-            """), {"id": account.id}):
-                raise ValueError("teacher still owns courses")
+            if account.role == "teacher":
+                _require_resolved_teacher_ownership(uow, account.id)
             if account.role == "student" and uow.scalar(text("""
                     SELECT EXISTS (SELECT FROM control_plane.course_members m
                                    JOIN control_plane.courses c ON c.id=m.course_id
@@ -292,6 +305,7 @@ class IdentityService:
     def delete_user(self, actor_id, user_id):
         with self.runtime.fenced_transaction() as uow:
             _account(uow, actor_id, user_id)
+            _require_resolved_teacher_ownership(uow, user_id)
             with _track_student_access(uow, actor_id, student_id=user_id):
                 uow.execute(text("""
                     UPDATE control_plane.users SET active=false,deleted_at=clock_timestamp() WHERE id=:id
@@ -303,7 +317,7 @@ class IdentityService:
             actor_role = active_role(uow, actor_id)
             if actor_role != "admin" and not (actor_role == "teacher" and str(actor_id) == str(owner_teacher_id)):
                 raise AuthorizationDenied()
-            if active_role(uow, owner_teacher_id) != "teacher":
+            if active_role(uow, owner_teacher_id, lock=True) != "teacher":
                 raise ValueError("course owner must be an active teacher")
             course = uow.scalar(text("""
                 INSERT INTO control_plane.courses(owner_teacher_id,name) VALUES (:owner,:name) RETURNING id

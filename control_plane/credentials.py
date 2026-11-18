@@ -5,7 +5,7 @@ from uuid import UUID
 from sqlalchemy import text
 
 from .coordination import require_fenced_connection
-from .identity import can_access_environment
+from .identity import can_access_environment, can_read_environment_status
 from .execution.repository import ExecutionConflict
 from .persistence import RequestConflict
 from .plugins.capacity import CapacityRejected
@@ -233,7 +233,7 @@ class CredentialService:
             row = uow.execute(text("""
                 SELECT environment_id,student_id,status,reason,job_id FROM control_plane.access_revocations WHERE id=:id
             """), {"id": revocation_id}).mappings().first()
-            if row is None or not can_access_environment(uow, actor_id, row["environment_id"], manage=True):
+            if row is None or not can_read_environment_status(uow, actor_id, row["environment_id"], manage=True):
                 raise AuthorizationDenied()
             return dict(row)
 

@@ -136,6 +136,112 @@ def _group(uow, environment_id, kind, source_group=None):
     return group, parent
 
 
+def _input_refs(expression, tail=()):
+    """References whose *values* enter a step. Operators produce scalars, never grants."""
+    if isinstance(expression, dict):
+        if "$ref" in expression:
+            yield tuple(expression["$ref"].split(".")) + tuple(tail)
+        elif "$expr" not in expression:
+            if tail:
+                if tail[0] in expression:
+                    yield from _input_refs(expression[tail[0]], tail[1:])
+            else:
+                for child in expression.values():
+                    yield from _input_refs(child)
+    elif isinstance(expression, list) and not tail:
+        for child in expression:
+            yield from _input_refs(child)
+
+
+def _template_credentials(steps, instances, environment, resource):
+    """Read the template-selected parts of fixed products; data is never evaluated as a template."""
+    products = {("environment", "create_results"): environment["create_results"],
+                ("resource", "data"): resource["data"] if resource else None}
+    requests, inspected = {}, set()
+    # The same fixed collection may appear in many step inputs or expanded items.
+    budget = 1_048_576
+    count = 0
+
+    def scan(instance, step, source, data):
+        nonlocal budget
+        budget -= len(source) + 1
+        if budget < 0:
+            raise TemplateError("credential input inspection exceeds the workflow bound")
+        identity = (instance, step, source)
+        if identity in inspected:
+            return
+        inspected.add(identity)
+        trail = []
+
+        def visit(value):
+            nonlocal budget, count
+            budget -= 1
+            if budget < 0:
+                raise TemplateError("credential input inspection exceeds the workflow bound")
+            if isinstance(value, dict) and set(value) == {"secret_id", "version_id"}:
+                count += 1
+                # Charge repeated output paths before allocating or escaping them.
+                budget -= len(source) + sum(2 * len(key) + 1 for key in trail)
+                if count > 1000 or budget < 0:
+                    raise TemplateError("too many template credential references")
+                path = source + "".join("/" + key.replace("~", "~0").replace("/", "~1") for key in trail)
+                requests.setdefault(instance, []).append({"step": step, "path": path, "ref": value})
+                return
+            if not isinstance(value, (dict, list)):
+                return
+            for key, child in (value.items() if isinstance(value, dict) else enumerate(value)):
+                trail.append(str(key))
+                visit(child)
+                trail.pop()
+
+        visit(data)
+
+    def read(data, parts):
+        for key in parts:
+            if not isinstance(data, dict) or key not in data:
+                raise TemplateError("referenced product is unavailable")
+            data = data[key]
+        return data
+
+    def fixed(path):
+        for prefix, value in products.items():
+            if value is not None and path[:len(prefix)] == prefix:
+                yield ".".join(path), read(value, path[len(prefix):])
+            elif value is not None and path == prefix[:1]:
+                yield ".".join(prefix), value
+
+    for step in steps:
+        instance, name = instances[step["plugin_instance"]], step["id"]
+        refs = sorted(set(_input_refs(step["input"])))
+        loop = step.get("for_each")
+        item_refs = [p[1:] for p in refs if p[0] == "item"]
+        if loop:
+            items = loop["items"]
+            if isinstance(items, list):
+                if not items:
+                    continue
+                # Literal containers preserve only explicitly referenced portions.
+                for item in items:
+                    for tail in item_refs:
+                        for path in _input_refs(item, tail):
+                            for source, value in fixed(path):
+                                scan(instance, name, source, value)
+            elif isinstance(items, dict) and "$ref" in items:
+                for source, values in fixed(tuple(items["$ref"].split("."))):
+                    if not isinstance(values, list) or len(values) > loop["max_items"]:
+                        raise TemplateError("invalid fixed credential expansion")
+                    for index, item in enumerate(values):
+                        for tail in item_refs:
+                            path = f"{source}/{index}" + "".join("/" + part for part in tail)
+                            scan(instance, name, path, read(item, tail))
+                    if not values:
+                        refs = []
+        for path in refs:
+            for source, value in fixed(path):
+                scan(instance, name, source, value)
+    return requests
+
+
 def authorize_job(uow, job):
     workflow = job["execution_snapshot"].get("workflow")
     if not isinstance(workflow, dict):
@@ -311,10 +417,14 @@ class BusinessService:
                 UPDATE control_plane.environments SET lifecycle='deleting',updated_at=clock_timestamp()
                 WHERE id=:env
             """), {"env": environment})
+        environment_context = {"id": str(environment), "name": request["name"] if kind == "create" else env.name,
+                               "create_results": {} if kind == "create" else env.create_results}
+        inherited = {} if kind == "create" else _template_credentials(flow["steps"], instances, environment_context, resource)
         captures = {}
         for instance_id in sorted(set(instances.values())):
             self.capacity.check_admission(instance_id)
-            captures[instance_id] = self.configuration.capture_in(uow, instance_id, self.secrets, environment)
+            captures[instance_id] = self.configuration.capture_in(
+                uow, instance_id, self.secrets, environment, template_credentials=inherited.get(instance_id, ()))
         for alias, revisions in request["selector_versions"].items():
             pin = captures[instances[alias]]
             if (pin["configuration_revision"], pin["namespace_revision"]) != tuple(revisions):
@@ -323,8 +433,7 @@ class BusinessService:
             "kind": kind if kind in ("create", "cleanup") else "action", "steps": flow["steps"],
             "params": params if kind == "create" else env.parameters,
             "action_params": params if kind.endswith("_action") else {}, "instances": instances,
-            "environment": {"id": str(environment), "name": request["name"] if kind == "create" else env.name,
-                            "create_results": {} if kind == "create" else env.create_results},
+            "environment": environment_context,
             "resource": resource, "evidence": evidence, "roles": flow.get("roles", []),
             "resources": definition["resources"] if kind == "create" else [],
             "readiness": definition["readiness"] if kind == "create" else {},

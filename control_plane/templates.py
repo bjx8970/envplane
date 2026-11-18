@@ -522,7 +522,9 @@ def validate_template(definition, lookup):
     create_scope = {**scope, 'steps': done}
     slots = set()
     max_resources = 0
-    for resource in _list(definition['resources']):
+    resources = _list(definition['resources'])
+    _check(done or not resources, 'resources require a producing create step')
+    for resource in resources:
         _fields(resource, ['key', 'name', 'type_label', 'data'],
                 ['display', 'for_each', 'actions', 'access', 'target_ref'])
         slot = _name(resource['key'])
@@ -547,8 +549,15 @@ def validate_template(definition, lookup):
         action = definition['actions'].get(key)
         _check(action and set(action['roles']) <= {'admin', 'teacher'},
                'revocation must use an administrative environment action')
-        _check(all(not spec.get('required') or 'default' in spec or 'fixed' in spec
-                   for spec in action['parameters'].values()), 'revocation must run without user inputs')
+        # Automatic dispatch submits an empty parameter object. Check every
+        # consumed path against exactly the values available on that path.
+        defaults = {name: spec.get('fixed', spec.get('default'))
+                    for name, spec in action['parameters'].items() if 'fixed' in spec or 'default' in spec}
+        _check(all(not spec.get('required') or name in defaults for name, spec in action['parameters'].items()),
+               'revocation must run without user inputs')
+        for path in _references([action['steps'], action.get('state_mapping')]):
+            if path[0] == 'action_params':
+                resolve({'$ref': '.'.join(path)}, {'action_params': defaults})
     _access(definition['access'], scope, lookup)
     ready = definition['readiness']
     _fields(ready, ['require_steps'], ['require_resources', 'conditions', 'credential_confirmation'])

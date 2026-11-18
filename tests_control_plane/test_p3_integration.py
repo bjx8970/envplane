@@ -24,6 +24,7 @@ from control_plane.plugins.sdk import AuthorizationDenied
 from control_plane.quota import QuotaExceeded
 from control_plane.runtime import ControlPlaneRuntime
 from control_plane.templates import TemplateError
+from control_plane.workflows import lock_evidence_environment, verify_cleanup_evidence
 from tests_control_plane.p1_harness import runtime_database
 from tests_control_plane.test_p2_services import deployment
 from tests_control_plane.test_p2_ssh import _server
@@ -264,3 +265,84 @@ class BusinessIntegrationTests(unittest.TestCase):
         self.finish(action_id, expected="blocked")
         self.assertEqual(self.one("""SELECT count(*) FROM control_plane.operation_call_attempts a
             JOIN control_plane.operations o ON o.id=a.operation_id WHERE o.job_id=:job""", job=action_id)[0], 0)
+
+    def create_with_call(self):
+        with self.endpoint():
+            job, _ = self.create()
+            env = self.finish(job)
+        source = self.one("""SELECT c.id FROM control_plane.operation_call_attempts c
+            JOIN control_plane.operations o ON o.id=c.operation_id WHERE o.job_id=:job AND c.method='execute'""",
+                          job=job)
+        return env, source.id
+
+    def test_cleanup_snapshot_holds_environment_lock_against_independent_late_writer(self):
+        env, call = self.create_with_call()
+        cleanup, _ = self.business.cleanup(self.teacher, environment_id=env, request_key="cleanup")
+        job = self.one("SELECT * FROM control_plane.jobs WHERE id=:id", id=cleanup)._mapping
+        # Independent connection runs the same final snapshot check. Bypass the
+        # process write gate *for the reader* to exercise the PostgreSQL fence.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with self.runtime._engine.begin() as checking:
+                verify_cleanup_evidence(checking, job, job["execution_snapshot"]["workflow"])
+                future = pool.submit(self.services.driver.repository.append_evidence, call, "external_ref",
+                                     "late", {"id": "remote"}, event_id="independent-late-ref")
+                self.wait_for_blocked_reader(checking, future)
+            self.assertIsNotNone(future.result(5))
+        # The fresh finishing transaction sees the committed fact and fails
+        # closed. Neither conflicts nor quota may be released using the old view.
+        self.finish(cleanup, expected="blocked")
+        self.assertEqual(self.one("""SELECT q.state,(SELECT count(*) FROM control_plane.conflict_protections
+            WHERE scope_key=:scope AND released_at IS NULL) AS held FROM control_plane.quota_reservations q
+            WHERE q.environment_id=:env""", scope="environment:"+str(env), env=env), ("quarantined", 1))
+
+    def test_finishing_cleanup_waits_for_new_source_fact_then_rejects_its_snapshot(self):
+        env, call = self.create_with_call()
+        cleanup, _ = self.business.cleanup(self.teacher, environment_id=env, request_key="cleanup")
+        # Separate database writer uses the same lock protocol as _append,
+        # without the coordinator's process-wide gate serializing the test.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with self.runtime._engine.begin() as writing:
+                source = writing.execute(text("""SELECT o.job_id,o.id FROM control_plane.operations o
+                    JOIN control_plane.operation_call_attempts c ON c.operation_id=o.id WHERE c.id=:id"""),
+                                         {"id": call}).one()
+                lock_evidence_environment(writing, source.job_id)
+                writing.execute(text("""INSERT INTO control_plane.operation_evidence
+                    (operation_id,kind,ref_key,revision,data) VALUES (:id,'checkpoint','delayed',1,'{}')"""),
+                                {"id": source.id})
+                future = pool.submit(self.finish, cleanup, expected="blocked")
+                self.wait_for_blocked_reader(writing, future)
+            self.assertEqual(future.result(10), env)
+        self.assertEqual(self.one("""SELECT q.state,(SELECT count(*) FROM control_plane.conflict_protections
+            WHERE scope_key=:scope AND released_at IS NULL) FROM control_plane.quota_reservations q
+            WHERE q.environment_id=:env""", scope="environment:" + str(env), env=env), ("quarantined", 1))
+
+    def wait_for_blocked_reader(self, connection, future):
+        # pg_blocking_pids provides an observed lock wait rather than a sleep
+        # used as evidence that two transactions actually overlapped.
+        pid = connection.scalar(text("SELECT pg_backend_pid()"))
+        end = time.monotonic() + 5
+        while not connection.scalar(text("""SELECT EXISTS(SELECT FROM pg_stat_activity
+                WHERE :pid=ANY(pg_blocking_pids(pid)))"""), {"pid": pid}):
+            self.assertFalse(future.done(), "database operation bypassed the evidence lock")
+            self.assertLess(time.monotonic(), end, "concurrent transaction did not wait for the evidence lock")
+            time.sleep(.02)
+
+    def test_late_fact_after_cleanup_commit_only_appends_deduplicated_evidence(self):
+        env, call = self.create_with_call()
+        repo = self.services.driver.repository
+        original = repo.append_evidence(call, "checkpoint", "seen", {"n": 1}, event_id="seen")
+        cleanup, _ = self.business.cleanup(self.teacher, environment_id=env, request_key="cleanup")
+        self.finish(cleanup)
+        self.assertEqual(repo.append_evidence(call, "checkpoint", "seen", {"n": 1}, event_id="seen"), original)
+        new = repo.append_evidence(call, "external_ref", "remote", {"id": "late-id"}, event_id="unseen")
+        self.assertEqual(repo.append_evidence(call, "external_ref", "remote", {"id": "late-id"},
+                                              event_id="unseen"), new)
+        self.assertEqual(self.one("""SELECT data,trusted_for_derivation FROM control_plane.operation_evidence
+            WHERE id=:id""", id=new), ({"id": "late-id"}, False))
+        self.assertEqual(self.one("""SELECT e.lifecycle,e.deleted_at IS NOT NULL,q.state,j.state,
+                (SELECT count(*) FROM control_plane.conflict_protections
+                   WHERE scope_key=:scope AND released_at IS NULL)
+            FROM control_plane.environments e JOIN control_plane.quota_reservations q ON q.environment_id=e.id
+            JOIN control_plane.jobs j ON j.environment_id=e.id AND j.id=:job WHERE e.id=:env""",
+                                  env=env, job=cleanup, scope="environment:" + str(env)),
+                         ("deleted", True, "released", "succeeded", 0))

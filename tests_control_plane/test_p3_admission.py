@@ -126,3 +126,111 @@ class AdmissionTests(TestCase):
             self.assertEqual(uow.scalar(text("SELECT count(*) FROM control_plane.quota_reservations")), 1)
             self.assertEqual(uow.scalar(text("SELECT state FROM control_plane.quota_reservations")), "reserved")
             self.assertEqual(uow.scalar(text("SELECT count(*) FROM control_plane.environments")), 1)
+
+    def test_new_action_and_cleanup_pin_consumed_derived_output_without_install_confirmation(self):
+        from time import monotonic, sleep
+        from control_plane.plugins.fake import FAKE_MANIFEST, FakePlugin
+        from control_plane.plugins.sdk import ExecutionResult
+
+        class EnvironmentPlugin(FakePlugin):
+            def execute(self, call, ctx):
+                if call.resolved_input.get("install"):
+                    ref = ctx.secrets.derive("login")
+                    return ExecutionResult("succeeded", output={"credential": ref.to_dict()})
+                if call.secret_refs:
+                    with ctx.secrets.get(call.secret_refs[0]) as handle:
+                        if not handle.reveal():
+                            raise RuntimeError("missing environment credential")
+                return ExecutionResult("succeeded", output={"completed": True})
+
+        def settled(job):
+            until = monotonic() + 10
+            while monotonic() < until:
+                self.runtime.poll()
+                with self.runtime.fenced_transaction() as uow:
+                    row = uow.execute(text("""
+                        SELECT environment_id,state,execution_snapshot FROM control_plane.jobs WHERE id=:id
+                    """), {"id": job}).one()
+                if row.state not in ("queued", "running"):
+                    self.assertEqual(row.state, "succeeded")
+                    return row
+                sleep(0.01)
+            self.fail("credential workflow did not finish")
+
+        services = self.runtime.services
+        services.registry.register(EnvironmentPlugin(), FAKE_MANIFEST, code_digest="credential-test")
+        with self.runtime.fenced_transaction() as uow:
+            ids = {alias: uow.scalar(text("""
+                INSERT INTO control_plane.plugin_instances(plugin_key,instance_alias) VALUES ('fake',:alias) RETURNING id
+            """), {"alias": alias}) for alias in ("issuer", "other")}
+        for instance in ids.values():
+            services.configuration.put(instance, {"data": {}, "allowed_secret_refs": []}, expected_revision=0)
+
+        created_ref = {"$ref": "environment.create_results.install.credential"}
+        resource_ref = {"$ref": "resource.data.credential"}
+
+        def step(name, args, instance="issuer"):
+            return {"id": name, "plugin_instance": instance, "action": "echo", "input": args, "timeout_seconds": 5}
+
+        def action(ref, instance="issuer", parameters=None):
+            return {"roles": ["teacher"], "label": "use", "parameters": parameters or {},
+                    "steps": [step("use", {"secret_refs": [ref]}, instance)]}
+
+        env_action = action(created_ref)
+        definition = {"schema_version": 1, "metadata": {"name": "credential"}, "parameters": {},
+                      "quota": self.cost, "create": {"steps": [step("install", {"install": True})]},
+                      "actions": {"use": env_action, "other": action(created_ref, "other")},
+                      "resources": [{"key": "entry", "name": "entry", "type_label": "example",
+                                     "data": {"credential": {"$ref": "steps.install.output.credential"}},
+                                     "actions": {"use": action(resource_ref)}}],
+                      "access": {}, "cleanup": {"steps": env_action["steps"], "completion": {"require_steps": ["use"]}},
+                      "readiness": {"require_steps": ["install"]}}
+        _, version = services.templates.create_draft(self.admin, definition)
+        services.templates.publish(self.admin, version)
+        job, _ = self.business.create_environment(self.teacher, course_id=self.course, template_version_id=version,
+            request_key="create-derived", parameters={}, name="derived")
+        env = settled(job).environment_id
+        with self.runtime.fenced_transaction() as uow:
+            resource = uow.scalar(text("SELECT id FROM control_plane.experiment_resources WHERE environment_id=:env"),
+                                  {"env": env})
+            source = uow.execute(text("""
+                SELECT v.secret_id,v.id AS version_id,g.source_operation_id AS operation_id
+                FROM control_plane.job_secret_refs g JOIN control_plane.secret_versions v ON v.id=g.secret_version_id
+                WHERE g.job_id=:job AND g.derived
+            """), {"job": job}).one()
+            self.assertEqual(uow.scalar(text("""
+                SELECT count(*) FROM control_plane.environment_credential_confirmations WHERE environment_id=:env
+            """), {"env": env}), 0)
+        with self.assertRaises(AuthorizationDenied):
+            self.business.run_action(self.teacher, environment_id=env, action_key="other",
+                                     parameters={}, request_key="wrong-instance")
+        unproven = services.secrets.create(b"fixture", purpose="environment", environment_id=env)
+        for forged_env, forged_ref in ((env, unproven.to_dict()), (uuid4(), {
+                "secret_id": str(source.secret_id), "version_id": str(source.version_id)})):
+            with self.assertRaises(AuthorizationDenied), self.runtime.fenced_transaction() as uow:
+                services.configuration.capture_in(uow, ids["issuer"], services.secrets, forged_env,
+                    template_credentials=[{"step": "use", "path": "resource.data.credential", "ref": forged_ref}])
+        for kind, resource_id in (("environment", None), ("resource", resource)):
+            action_job, _ = self.business.run_action(self.teacher, environment_id=env, action_key="use",
+                                      parameters={}, request_key=kind, resource_id=resource_id)
+            pin = settled(action_job).execution_snapshot["plugins"][str(ids["issuer"])]
+            self.assertEqual(pin["secret_refs"], [{"secret_id": str(source.secret_id), "version_id": str(source.version_id)}])
+            self.assertEqual(pin["template_credentials"][0]["source_operation_id"], str(source.operation_id))
+            with self.assertRaises(AuthorizationDenied):
+                services.secrets.bind(action_job, ids["issuer"], env).resolve({"secret_id": str(source.secret_id)})
+        cleanup, _ = self.business.cleanup(self.teacher, environment_id=env, request_key="cleanup-derived")
+        pin = settled(cleanup).execution_snapshot["plugins"][str(ids["issuer"])]
+        self.assertEqual(pin["template_credentials"][0]["source_job_id"], str(job))
+
+    def test_credential_inheritance_inspects_only_the_selected_stored_value(self):
+        from control_plane.business import _template_credentials
+        ref = {"secret_id": str(uuid4()), "version_id": str(uuid4())}
+        step = {"id": "use", "plugin_instance": "issuer", "input": {
+            "from_caller": {"$ref": "action_params.ref"}, "literal": ref, "count": {"$expr": {"length": [{"$ref": "resource.data.unused"}]}}, "whole": {"$ref": "resource.data.unspecific"}}}
+        requests = _template_credentials([step], {"issuer": "instance"}, {"create_results": {}}, {"data": {"unspecific": {"nested": ref}, "unused": ref}})
+        self.assertEqual(requests, {"instance": [{"step": "use", "path": "resource.data.unspecific/nested", "ref": ref}]})
+        step["for_each"] = {"items": [{"boxed": {"$ref": "resource.data.fixed"}}] * 2, "max_items": 2}
+        step["input"] = {"$ref": "item.boxed.credential"}
+        requests = _template_credentials([step], {"issuer": "instance"}, {"create_results": {}},
+                                        {"data": {"fixed": {"credential": ref}}})
+        self.assertEqual(requests, {"instance": [{"step": "use", "path": "resource.data.fixed.credential", "ref": ref}]})

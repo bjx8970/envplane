@@ -8,7 +8,7 @@ import base64
 import json
 import os
 import secrets as random_secrets
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidTag
@@ -222,6 +222,76 @@ class SecretService:
         return [{'secret_id': secret, 'version_id': version}
                 for secret, version in sorted({(ref['secret_id'], ref['version_id']) for ref in refs})]
 
+    @staticmethod
+    def _created_credential_source(uow, environment_id, instance_id, key):
+        """P2 publishes a derived grant only after validating the creating invocation.
+
+        A successful create output can feed a later template even when it has no
+        remote-install confirmation for credential viewing or interactive sessions.
+        """
+        row = uow.execute(text("""
+            SELECT o.id,o.job_id,o.output,s.derived_key,j.logical_invocation_id,step.step_path,step.item_key
+            FROM control_plane.job_secret_refs g
+            JOIN control_plane.operations o ON o.id=g.source_operation_id AND o.job_id=g.job_id
+            JOIN control_plane.jobs j ON j.id=o.job_id
+            JOIN control_plane.job_steps step ON step.id=o.step_id AND step.job_id=j.id
+            JOIN control_plane.secret_versions v ON v.id=g.secret_version_id
+            JOIN control_plane.secrets s ON s.id=v.secret_id AND s.environment_id=j.environment_id
+            WHERE g.derived AND g.plugin_instance_id=:instance AND o.plugin_instance_id=:instance
+              AND j.kind='create' AND j.environment_id=:env AND o.state='succeeded' AND o.protocol_error IS NULL
+              AND s.purpose='environment' AND s.id=:secret AND v.id=:version AND v.version=1
+              AND v.revoked_at IS NULL AND v.invalidated_at IS NULL AND s.derived_key IS NOT NULL
+            FOR SHARE OF v
+        """), {"env": environment_id, "instance": instance_id, "secret": key[0], "version": key[1]}).first()
+        if row is not None:
+            identity = [str(environment_id), str(row.logical_invocation_id), row.step_path, row.item_key]
+            ref = {"secret_id": key[0], "version_id": key[1]}
+            if json.loads(row.derived_key)[:4] == identity and ref in find_refs(row.output, "secret"):
+                return {"source_job_id": str(row.job_id), "source_operation_id": str(row.id)}
+        raise AuthorizationDenied()
+
+    def confirmed_template_refs_in(self, uow, environment_id, instance_id, requests, configured_refs):
+        """Pin exact environment credentials from verified outputs to an independent Job.
+
+        Template evaluation supplies the declared step, reference path and version.
+        A confirmed source Operation and its instance-scoped grant supply authority.
+        The proof is signed into the immutable capture alongside the selected version.
+        """
+        require_fenced_connection(uow)
+        finite_json(requests)
+        configured = {(ref["secret_id"], ref["version_id"]) for ref in configured_refs}
+        proofs, checked = [], {}
+        for request in requests:
+            ref = request["ref"]
+            try:
+                key = tuple(str(UUID(ref[name])) for name in ("secret_id", "version_id"))
+            except (ValueError, TypeError, AttributeError, KeyError):
+                raise AuthorizationDenied() from None
+            if key in configured:
+                continue
+            if key not in checked:
+                row = uow.execute(text("""
+                    SELECT c.job_id,c.operation_id FROM control_plane.environment_credential_confirmations c
+                    JOIN control_plane.jobs producer ON producer.id=c.job_id AND producer.environment_id=c.environment_id
+                    JOIN control_plane.operations o ON o.id=c.operation_id AND o.job_id=producer.id
+                    JOIN control_plane.job_secret_refs grant_ref ON grant_ref.job_id=producer.id
+                      AND grant_ref.plugin_instance_id=o.plugin_instance_id AND grant_ref.secret_version_id=c.version_id
+                    JOIN control_plane.secret_versions v ON v.id=c.version_id AND v.secret_id=c.secret_id
+                    JOIN control_plane.secrets s ON s.id=c.secret_id AND s.environment_id=c.environment_id
+                    WHERE c.environment_id=:env AND c.secret_id=:secret AND c.version_id=:version
+                      AND o.plugin_instance_id=:instance AND o.state='succeeded' AND s.purpose='environment'
+                      AND v.revoked_at IS NULL AND v.invalidated_at IS NULL
+                      AND o.output->'confirmed_environment_credential' =
+                          jsonb_build_object('secret_id',s.id::text,'version_id',v.id::text)
+                    FOR SHARE OF v
+                """), {"env": environment_id, "instance": instance_id, "secret": key[0], "version": key[1]}).first()
+                if row is None:
+                    checked[key] = self._created_credential_source(uow, environment_id, instance_id, key)
+                else:
+                    checked[key] = {"source_job_id": str(row.job_id), "source_operation_id": str(row.operation_id)}
+            proofs.append({**request, "ref": {"secret_id": key[0], "version_id": key[1]}, **checked[key]})
+        return proofs
+
     def bind_captured_refs_in(self, uow, job_id, instance_id, environment_id, refs):
         """Bind exact captured versions, never query latest or Storage claims."""
         require_fenced_connection(uow)
@@ -405,8 +475,12 @@ class BoundSecrets:
             if not ref.get('version_id'):
                 rows = connection.execute(text('''SELECT v.id FROM control_plane.job_secret_refs r
                     JOIN control_plane.secret_versions v ON v.id=r.secret_version_id
+                    JOIN control_plane.jobs j ON j.id=r.job_id
                     WHERE r.job_id=:job AND r.plugin_instance_id=:instance AND v.secret_id=:secret
-                      AND NOT r.derived'''),
+                      AND NOT r.derived AND NOT EXISTS (
+                          SELECT FROM jsonb_array_elements(COALESCE(j.execution_snapshot->'plugins'
+                              ->CAST(r.plugin_instance_id AS text)->'template_credentials','[]'::jsonb)) proof
+                          WHERE proof->'ref'->>'version_id'=CAST(v.id AS text))'''),
                     {'job': self.__job, 'instance': self.__instance, 'secret': ref['secret_id']}).all()
                 if len(rows) != 1:
                     raise AuthorizationDenied()

@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from threading import Event
+from time import monotonic, sleep
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -190,6 +191,61 @@ class IdentityTests(unittest.TestCase):
         for reader, obj in readers:
             with self.assertRaises(AuthorizationDenied):
                 reader(self.other, obj)
+
+    def test_teacher_deletion_waits_for_course_and_student_responsibilities_to_end(self):
+        teacher = self.identity.create_user(self.admin, uuid4().hex, uuid4().hex, role="teacher")
+        course = self.identity.create_course(self.admin, teacher, "retiring course")
+        with self.assertRaisesRegex(ValueError, "owns courses"):
+            self.identity.delete_user(self.admin, teacher)
+        self.identity.delete_course(self.admin, course)
+        student = self.identity.create_user(teacher, uuid4().hex, "fixture password")
+        self.identity.set_active(self.admin, student, False)
+        with self.assertRaisesRegex(ValueError, "exclusively manages students"):
+            self.identity.delete_user(self.admin, teacher)
+        with self.assertRaisesRegex(ValueError, "exclusively manages students"):
+            self.identity.set_role(self.admin, teacher, "student")
+        self.assertTrue(self.identity.get_user(self.admin, teacher)["active"])
+        self.identity.set_active(self.admin, student, True)
+        self.identity.enroll(self.admin, self.foreign_course, student)
+        self.identity.delete_user(self.admin, teacher)
+        history = self.identity.get_user(self.admin, student)
+        self.assertEqual(history["created_by"], teacher)
+        self.assertFalse(history["exclusive_management"])
+        with self.db.connect() as db:
+            self.assertIsNotNone(db.scalar(text("SELECT deleted_at FROM control_plane.users WHERE id=:id"),
+                                           {"id": teacher}))
+
+    def test_losing_creation_race_cannot_attach_student_to_retired_teacher(self):
+        teacher = self.identity.create_user(self.admin, uuid4().hex, uuid4().hex, role="teacher")
+        checking_owner = Event()
+
+        def before_select(conn, cursor, statement, params, context, executemany):
+            if "SELECT role FROM control_plane.users" in statement:
+                checking_owner.set()
+        event.listen(self.runtime._engine, "before_cursor_execute", before_select)
+        self.addCleanup(event.remove, self.runtime._engine, "before_cursor_execute", before_select)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with self.db.begin() as db:
+                db.execute(text("""
+                    UPDATE control_plane.users SET active=false,deleted_at=clock_timestamp() WHERE id=:id
+                """), {"id": teacher})
+                creating = pool.submit(self.identity.create_user, teacher, uuid4().hex, "student fixture")
+                self.assertTrue(checking_owner.wait(5))
+                # Release the retiring account only after PostgreSQL reports the
+                # competing transaction waiting on this connection's row lock.
+                deadline = monotonic() + 0.8
+                while not db.scalar(text("""
+                    SELECT EXISTS(SELECT FROM pg_stat_activity WHERE datname=current_database()
+                                  AND pg_backend_pid()=ANY(pg_blocking_pids(pid)))
+                """)):
+                    self.assertFalse(creating.done(), "creation skipped the owner lock")
+                    self.assertLess(monotonic(), deadline, "creation did not lock the teacher")
+                    sleep(0.005)
+            with self.assertRaises(AuthorizationDenied):
+                creating.result(timeout=5)
+        with self.db.connect() as db:
+            self.assertFalse(db.scalar(text("SELECT EXISTS(SELECT FROM control_plane.users WHERE created_by=:id)"),
+                                       {"id": teacher}))
 
     def test_role_changes_are_admin_only_and_preserve_active_domain_relationships(self):
         with self.assertRaises(AuthorizationDenied):

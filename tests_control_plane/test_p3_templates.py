@@ -88,6 +88,46 @@ class TemplateContractTests(unittest.TestCase):
                 with self.assertRaises(TemplateError):
                     validate_template(template, self.lookup)
 
+    def test_resource_slots_require_a_create_operation(self):
+        template = example()
+        template['create']['steps'] = []
+        template['readiness']['require_steps'] = []
+        template['resources'][0]['data'] = {'host_id': {'$ref': 'params.target_host'}}
+        with self.assertRaisesRegex(TemplateError, 'producing create step'):
+            validate_template(template, self.lookup)
+        template['resources'] = []
+        validate_template(template, self.lookup)
+
+    def test_revocation_resolves_referenced_optional_parameters_without_caller_input(self):
+        template = example()
+        step = deepcopy(template['create']['steps'][0])
+        action = {'label': 'Revoke', 'roles': ['teacher'], 'steps': [step],
+                  'parameters': {'optional': {'type': 'object'}, 'unused': {'type': 'string'}}}
+        template['actions']['revoke'] = action
+        template['revocation_action'] = 'revoke'
+        ref = {'$ref': 'action_params.optional.host'}
+        for location in ('input', 'for_each', 'state_mapping'):
+            with self.subTest(location=location):
+                if location == 'input':
+                    step['input']['host_id'] = ref
+                elif location == 'for_each':
+                    step['for_each'] = {'items': [ref], 'item_key': {'$ref': 'item'}, 'max_items': 1}
+                else:
+                    action['state_mapping'] = {'value': ref, 'ttl_seconds': 1}
+                with self.assertRaisesRegex(TemplateError, 'unavailable reference'):
+                    validate_template(template, self.lookup)
+                action['parameters']['optional']['default'] = {}
+                with self.assertRaisesRegex(TemplateError, 'unavailable reference'):
+                    validate_template(template, self.lookup)
+                for key in ('default', 'fixed'):
+                    action['parameters']['optional'][key] = {'host': 'a'}
+                    validate_template(template, self.lookup)
+                    del action['parameters']['optional'][key]
+                step['input']['host_id'] = {'$ref': 'params.target_host'}
+                step.pop('for_each', None)
+                action.pop('state_mapping', None)
+        validate_template(template, self.lookup)
+
     def test_ordering_uses_dependencies_from_refs(self):
         tail = deepcopy(example()['create']['steps'][0])
         tail['id'] = 'finish'

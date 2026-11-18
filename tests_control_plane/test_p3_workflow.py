@@ -97,6 +97,31 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(c.scalar(text("SELECT state FROM control_plane.quota_reservations")), "allocated")
             self.assertEqual(c.scalar(text("SELECT lifecycle FROM control_plane.environments")), "ready")
 
+    def test_skipped_tail_can_complete_a_pending_resource_without_another_call(self):
+        self.start([
+            action("inspect"),
+            action("tail", depends_on=["inspect"], for_each={
+                "items": [], "item_key": {"$ref": "item"}, "max_items": 1}),
+        ], [{"key": "report", "name": "report", "type_label": "result", "data": {
+            "observed": {"$ref": "steps.inspect.output"}, "tail": {"$ref": "steps.tail.output"}}}],
+            {"require_steps": ["inspect", "tail"], "require_resources": ["report"]})
+        source = self.succeed(self.expand()[0], {"name": "confirmed"})
+        with self.engine.connect() as c:
+            pending = c.execute(text("SELECT id,state FROM control_plane.local_resource_items")).one()
+            self.assertEqual(pending.state, "pending")
+        tail = next(step for step in self.expand() if step["step_path"] == "tail")
+        self.assertEqual(tail["state"], "skipped")
+        self.repo.finish_workflow(self.lease, self.workflow)
+        with self.engine.connect() as c:
+            resource = c.execute(text("""SELECT data,local_resource_item_id,source_operation_id
+                                          FROM control_plane.experiment_resources""")).one()
+            self.assertEqual(resource.data, {"observed": {"name": "confirmed"}, "tail": {}})
+            self.assertEqual((resource.local_resource_item_id, resource.source_operation_id), (pending.id, source))
+            self.assertEqual(c.scalar(text("SELECT count(*) FROM control_plane.operation_call_attempts")), 1)
+            self.assertEqual(c.scalar(text("SELECT state FROM control_plane.jobs")), "succeeded")
+            self.assertEqual(c.scalar(text("SELECT lifecycle FROM control_plane.environments")), "ready")
+            self.assertEqual(c.scalar(text("SELECT state FROM control_plane.quota_reservations")), "allocated")
+
     def test_empty_workflow_with_unsatisfied_readiness_is_persisted_without_releasing_quota(self):
         self.start([], readiness={"require_steps": [], "conditions": [False]})
         self.repo.finish_workflow(self.lease, self.workflow)
@@ -157,3 +182,79 @@ class WorkflowTests(unittest.TestCase):
             status = resource_state(tx, resource)
         self.assertEqual(status["state"], "unknown")
         self.assertIsNotNone(status["observed_at"])
+
+    def start_action(self, steps):
+        """Submit another group against the same ready environment and confirmed occupancy."""
+        from control_plane.business import _group
+        from control_plane.persistence import admit_job
+        previous = self.job
+        with self.runtime.fenced_transaction() as uow:
+            self.group, _ = _group(uow, self.env, "environment_action")
+            self.job, _ = admit_job(
+                uow, actor_id=self.actor, request_key=uuid4().hex, request_digest="digest",
+                environment_id=self.env, execution_group_id=self.group, logical_invocation_id=uuid4(),
+                kind="environment_action", input={}, execution_snapshot={"workflow": {
+                    "kind": "action", "steps": steps, "instances": {"demo": str(self.instance)}}})
+            uow.execute(text("""
+                INSERT INTO control_plane.job_plugin_snapshots(job_id,instance_id,configuration_revision,
+                                                              storage_snapshot_id,plugin_version,code_digest)
+                SELECT :job,instance_id,configuration_revision,storage_snapshot_id,plugin_version,code_digest
+                FROM control_plane.job_plugin_snapshots WHERE job_id=:previous
+            """), {"previous": previous, "job": self.job})
+        self.lease = self.repo.claim("worker", 30)
+        self.assertEqual(self.lease.job_id, self.job)
+
+    def action_disposition(self):
+        with self.engine.connect() as c:
+            return c.execute(text("""
+                SELECT j.state,g.state,r.state,EXISTS(
+                    SELECT 1 FROM control_plane.conflict_protections p
+                    WHERE p.execution_group_id=g.id AND p.released_at IS NULL
+                ) FROM control_plane.jobs j JOIN control_plane.execution_groups g ON g.id=j.execution_group_id
+                JOIN control_plane.quota_reservations r ON r.environment_id=j.environment_id WHERE j.id=:job
+            """), {"job": self.job}).one()
+
+    def test_undispatched_actions_preserve_occupancy_and_allow_a_new_request(self):
+        self.start([action("create")])
+        self.succeed(self.expand()[0], {})
+        for interruption in ("failed", "cancelled", "blocked"):
+            with self.subTest(interruption=interruption):
+                self.start_action([action("update")])
+                step = self.expand()[0]
+                if interruption == "failed":
+                    self.repo.start_prepare(self.lease, step["id"], 20)
+                    self.repo.prepare_failed(self.lease, step["id"])
+                else:
+                    self.prepare(step)
+                    if interruption == "cancelled":
+                        self.repo.request_cancel(self.job)
+                        self.repo.cancel_undispatched(self.lease)
+                    else:
+                        self.repo.block_job(self.lease)
+                self.assertEqual(self.action_disposition(), (interruption, "released", "allocated", False))
+        self.start_action([action("update")])
+        self.succeed(self.expand()[0], {})
+        self.assertEqual(self.action_disposition(), ("succeeded", "released", "allocated", False))
+
+    def test_later_prepare_failure_retains_previous_action_effect_and_conflict(self):
+        from control_plane.execution.repository import ExecutionConflict
+        self.start([action("create")])
+        self.succeed(self.expand()[0], {})
+        self.start_action([action("first"), action("second", depends_on=["first"])])
+        self.succeed(self.expand()[0], {})
+        step = next(r for r in self.expand() if r["state"] == "pending")
+        self.repo.start_prepare(self.lease, step["id"], 20)
+        self.repo.prepare_failed(self.lease, step["id"])
+        self.assertEqual(self.action_disposition(), ("failed", "blocked", "allocated", True))
+        with self.assertRaises(ExecutionConflict):
+            self.start_action([action("update")])
+
+    def test_uncertain_dispatched_mutating_action_retains_conflict_and_quarantines_occupancy(self):
+        self.start([action("create")])
+        self.succeed(self.expand()[0], {})
+        self.start_action([action("update")])
+        op = self.prepare(self.expand()[0])
+        call = self.repo.begin_call(self.lease, op["id"], "execute", 20)
+        self.repo.record_result(self.lease, call.id, ExecutionResult("unknown"),
+                                projector=self.workflow, applicator=self.workflow)
+        self.assertEqual(self.action_disposition(), ("blocked", "blocked", "quarantined", True))

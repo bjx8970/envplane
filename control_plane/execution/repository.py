@@ -389,6 +389,10 @@ class Repository:
             if old.event_digest != digest or str(old.call_attempt_id) != str(call["id"]):
                 raise ExecutionConflict("evidence event identity has different content or call origin")
             return old.id
+        # Serialize a new fact with cleanup's final revision comparison. A
+        # duplicate above has no effect even if the environment was retired.
+        from ..workflows import lock_evidence_environment
+        lock_evidence_environment(uow, call["job_id"])
         evidence_id = uuid4()
         uow.execute(text("""
             INSERT INTO control_plane.operation_evidence
@@ -493,8 +497,7 @@ class Repository:
                     uow.execute(text("UPDATE control_plane.operations SET state='failed',error=CAST(:error AS jsonb),finished_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=:op"), {"op": op["id"], "error": _json(raw["error"])})
                     uow.execute(text("UPDATE control_plane.job_steps SET state='failed',error=CAST(:error AS jsonb),finished_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=:step"), {"step": op["step_id"], "error": _json(raw["error"])})
                     uow.execute(text("UPDATE control_plane.jobs SET state='failed',error=CAST(:error AS jsonb),finished_at=clock_timestamp() WHERE id=:job"), {"job": lease.job_id, "error": _json(raw["error"])})
-                    self._quarantine(uow, job["environment_id"])
-                    self._interrupted(uow, job)
+                    self._interrupted(uow, job, dispatched=True)
                 else:
                     # These two trusted local adapters MUST NOT perform external I/O.
                     projection = projector.project(op, result)
@@ -516,10 +519,13 @@ class Repository:
             raise
 
     @staticmethod
-    def _interrupted(uow, job, *, blocked=False, cancelled=False):
+    def _interrupted(uow, job, *, blocked=False, cancelled=False, dispatched=False):
         if isinstance(job["execution_snapshot"].get("workflow"), dict):
             from ..workflows import record_interruption
             record_interruption(uow, job, blocked=blocked, cancelled=cancelled)
+        elif blocked or dispatched:
+            # Legacy jobs have no template policy describing their effects.
+            Repository._quarantine(uow, job["environment_id"])
 
     @staticmethod
     def _quarantine(uow, environment_id):
@@ -532,7 +538,6 @@ class Repository:
         uow.execute(text("UPDATE control_plane.jobs SET state='blocked',error=CAST(:error AS jsonb),available_at=GREATEST(available_at,clock_timestamp()+interval '1 second'),updated_at=clock_timestamp() WHERE id=:job"), {"job": lease.job_id, "error": error})
         uow.execute(text("UPDATE control_plane.execution_groups SET state='blocked',reason=CAST(:error AS jsonb),updated_at=clock_timestamp() WHERE id=:group"), {"group": lease.group_id, "error": error})
         job = uow.execute(text("SELECT * FROM control_plane.jobs WHERE id=:job"), {"job": lease.job_id}).mappings().one()
-        self._quarantine(uow, job["environment_id"])
         self._interrupted(uow, job, blocked=True)
 
     def block_operation(self, lease, operation_id, code):
@@ -578,7 +583,6 @@ class Repository:
             uow.execute(text("UPDATE control_plane.job_steps SET state='blocked',error=CAST(:error AS jsonb) WHERE job_id=:job AND state IN ('pending','running','waiting_external')"), {"job": lease.job_id, "error": error})
             uow.execute(text("UPDATE control_plane.jobs SET state='blocked',error=CAST(:error AS jsonb) WHERE id=:job"), {"job": lease.job_id, "error": error})
             uow.execute(text("UPDATE control_plane.execution_groups SET state='blocked',reason=CAST(:error AS jsonb) WHERE id=:group"), {"group": lease.group_id, "error": error})
-            self._quarantine(uow, job["environment_id"])
             self._interrupted(uow, job, blocked=True)
             self._guard(uow, lease, terminal=True)
 
@@ -621,8 +625,7 @@ class Repository:
                 if not remaining:
                     uow.execute(text("UPDATE control_plane.jobs SET state='cancelled',finished_at=clock_timestamp() WHERE id=:job"), {"job": lease.job_id})
                 # Cancellation confirms execution stopped, not absence of resources.
-                self._quarantine(uow, job["environment_id"])
-                self._interrupted(uow, job, cancelled=True)
+                self._interrupted(uow, job, cancelled=True, dispatched=True)
             self._guard(uow, lease, terminal=True)
 
     def cancel_undispatched(self, lease):
@@ -688,9 +691,10 @@ class Repository:
             raise ValueError("recovery requires evidence, actor and reason")
         with self.runtime.fenced_transaction() as uow:
             require_fenced_connection(uow)
-            row = uow.execute(text("SELECT j.*,g.revision AS group_revision,g.current_job_id FROM control_plane.jobs j JOIN control_plane.execution_groups g ON g.id=j.execution_group_id WHERE j.id=:job FOR UPDATE OF j,g"), {"job": job_id}).one()
+            row = uow.execute(text("SELECT j.*,g.revision AS group_revision,g.current_job_id,g.state AS group_state FROM control_plane.jobs j JOIN control_plane.execution_groups g ON g.id=j.execution_group_id WHERE j.id=:job FOR UPDATE OF j,g"), {"job": job_id}).one()
             expired = uow.scalar(text("SELECT CAST(:expiry AS timestamptz) IS NULL OR CAST(:expiry AS timestamptz)<=clock_timestamp()"), {"expiry": row.lease_expires_at})
-            if row.state != "blocked" or row.group_revision != expected_revision or not expired or str(row.current_job_id) != str(job_id):
+            if (row.state != "blocked" or row.group_state != "blocked" or row.group_revision != expected_revision
+                    or not expired or str(row.current_job_id) != str(job_id)):
                 raise ExecutionConflict("recovery owner or revision changed")
             evidence = uow.execute(text("SELECT e.id,e.operation_id FROM control_plane.operation_evidence e JOIN control_plane.operations o ON o.id=e.operation_id WHERE e.id=:evidence AND o.job_id=:job"), {"evidence": evidence_id, "job": job_id}).first()
             if evidence is None:

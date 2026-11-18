@@ -126,6 +126,31 @@ class EnvironmentCredentialTests(ServicesFixture, unittest.TestCase):
             """), {"student": student, "env": self.environment}).one()
             self.assertEqual((row.status, row.reason), ("revocation_failed", "unsupported"))
 
+    def test_revocation_history_survives_cleanup_for_current_owners_and_admins(self):
+        student, assignment = self.student()
+        self.identities.revoke_assignment(self.teacher, assignment)
+        with self.lease.fenced_transaction() as uow:
+            rid = uow.scalar(text("""
+                SELECT id FROM control_plane.access_revocations WHERE student_id=:id AND environment_id=:env
+            """), {"id": student, "env": self.environment})
+            admin = uow.scalar(text("""
+                INSERT INTO control_plane.users(username,password_hash,role)
+                VALUES (:name,'test-only','admin') RETURNING id
+            """), {"name": uuid4().hex})
+            uow.execute(text("""
+                UPDATE control_plane.environments SET lifecycle='deleted',deleted_at=clock_timestamp() WHERE id=:env
+            """), {"env": self.environment})
+        other_teacher = self.identities.create_user(admin, uuid4().hex, uuid4().hex, role="teacher")
+        for actor in (admin, self.teacher):
+            status = self.credentials.revocation_status(actor, rid)
+            self.assertEqual((status["status"], status["environment_id"]), ("revocation_failed", self.environment))
+        for actor in (student, other_teacher):
+            with self.assertRaises(AuthorizationDenied):
+                self.credentials.revocation_status(actor, rid)
+        self.identities.set_active(admin, self.teacher, False)
+        with self.assertRaises(AuthorizationDenied):
+            self.credentials.revocation_status(self.teacher, rid)
+
     def test_confirmed_secret_cannot_be_read_through_another_owned_environment(self):
         ref = self.secrets.create(b"only-for-first-environment", purpose="environment", environment_id=self.environment)
         self.remote_result(ref)

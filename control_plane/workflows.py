@@ -37,6 +37,15 @@ def _context(flow, grouped, item_key=None):
                                             if r["state"] == "succeeded"}}
     context = {key: flow[key] for key in ("params", "action_params", "environment", "resource", "evidence")
                if flow.get(key) is not None}
+    if context.get("evidence"):
+        evidence = context["evidence"]
+        # Keep the durable empty item key. Project its operation array into a
+        # separate namespace so a real expanded item can use any stable name.
+        # References share the frozen facts, including for previously queued jobs.
+        context["evidence"] = {**evidence, "unexpanded": {
+            path: instances.get("", {"operations": []})
+            for path, instances in evidence.get("steps", {}).items()
+        }}
     context["steps"] = outputs
     return context
 
@@ -54,10 +63,21 @@ def _step_refs(value):
             yield from _step_refs(child)
 
 
+def lock_evidence_environment(uow, job_id):
+    """Serialize source evidence and cleanup on a stable row, including old jobs."""
+    uow.execute(text("""
+        SELECT e.id FROM control_plane.jobs j JOIN control_plane.environments e ON e.id=j.environment_id
+        WHERE j.id=:job FOR UPDATE OF e
+    """), {"job": job_id}).one()
+
+
 def verify_cleanup_evidence(uow, job, flow):
     # A late report can change the target even if its original Operation is
     # terminal. Compare every historical Operation, including new ones, while
     # the environment scope is held. Never use another environment's evidence.
+    # New evidence takes the same environment lock before insertion. Use two
+    # statements so READ COMMITTED sees facts committed while waiting.
+    lock_evidence_environment(uow, job["id"])
     rows = uow.execute(text("""
         SELECT o.id,o.state,count(e.id) AS revision
         FROM control_plane.jobs j JOIN control_plane.operations o ON o.job_id=j.id
@@ -159,7 +179,7 @@ class TemplateWorkflow:
         """), {"job": job_id})
         return _group_steps(rows.mappings())
 
-    def _map_resources(self, uow, job, flow, grouped, op):
+    def _map_resources(self, uow, job, flow, grouped, completing_operation_id):
         context = _context(flow, grouped)
         rows = uow.execute(text("""
             SELECT * FROM control_plane.local_resource_items
@@ -194,7 +214,9 @@ class TemplateWorkflow:
                 # Keep the original provenance even if a later success supplies the
                 # last argument. A new source Operation must never duplicate the slot.
                 source = (previous.source_operation_id if previous else
-                          producers[0]["current_operation_id"] if producers else op["id"])
+                          producers[0]["current_operation_id"] if producers else completing_operation_id)
+                if source is None:
+                    continue  # A skipped step cannot supply a source Operation.
                 local_id = previous.id if previous else uuid4()
                 facts = {"id": local_id, "resource_slot": spec["key"], "item_key": key,
                          "confirmed_input_refs": {"source_operation_id": str(source)},
@@ -207,14 +229,16 @@ class TemplateWorkflow:
                     facts["data"] = {"input_operations": [str(row["current_operation_id"]) for row in inputs],
                                      "resource_data": product["data"]}
                     resources = (product,)
-                LocalOutcomeApplicator.write_products(
-                    uow, dict(op, id=source), Projection(resources=resources, local_items=(facts,)))
+                provenance = {"id": source, "job_id": job["id"], "environment_id": job["environment_id"],
+                              "logical_invocation_id": job["logical_invocation_id"]}
+                LocalOutcomeApplicator.write_products(uow, provenance, Projection(resources=resources, local_items=(facts,)))
 
     def apply(self, uow, operation, output):
         job = uow.execute(text("SELECT * FROM control_plane.jobs WHERE id=:job"),
                           {"job": operation["job_id"]}).mappings().one()
         flow = job["execution_snapshot"]["workflow"]
         grouped = self._facts(uow, job["id"])
+        complete = all(_completed(grouped.get(step["id"])) for step in flow["steps"])
         if flow["kind"] == "create":
             context = _context(flow, grouped)
             step = next(r for rows in grouped.values() for r in rows if r["id"] == operation["step_id"])
@@ -229,11 +253,12 @@ class TemplateWorkflow:
                 if (not isinstance(output, dict) or output.get("confirmed_environment_credential") != expected
                         or not confirm_from_operation(uow, operation["id"])):
                     raise ValueError("environment credential setup was not confirmed")
-            self._map_resources(uow, job, flow, grouped, operation)
-        if all(_completed(grouped.get(s["id"])) for s in flow["steps"]):
-            self.finish(uow, job, grouped)
+            if not complete:
+                self._map_resources(uow, job, flow, grouped, operation["id"])
+        if complete:
+            self.finish(uow, job, grouped, completing_operation_id=operation["id"])
 
-    def finish(self, uow, job, grouped=None):
+    def finish(self, uow, job, grouped=None, *, completing_operation_id=None):
         from .quota import finish_quota
         flow = job["execution_snapshot"]["workflow"]
         grouped = self._facts(uow, job["id"]) if grouped is None else grouped
@@ -245,6 +270,9 @@ class TemplateWorkflow:
                   "actor": job["actor_id"], "lifecycle": None}
         success = True
         if kind == "create":
+            # A trailing empty expansion can resolve pending mappings without a
+            # plugin callback. Apply local products before evaluating readiness.
+            self._map_resources(uow, job, flow, grouped, completing_operation_id)
             rows = uow.execute(text("""
                 SELECT resource_slot,item_key,state FROM control_plane.local_resource_items
                 WHERE environment_id=:env AND logical_invocation_id=:invocation
@@ -316,28 +344,37 @@ def record_interruption(uow, job, *, blocked, cancelled=False):
     kind = flow["kind"]
     values = {"env": job["environment_id"], "group": job["execution_group_id"], "job": job["id"],
               "actor": job["actor_id"]}
-    # Only the initial creation may prove an environment was never touched.
-    no_effect = kind == "create" and not blocked and not uow.scalar(text("""
-        SELECT EXISTS(SELECT 1 FROM control_plane.operations o JOIN control_plane.jobs j ON j.id=o.job_id
-                      WHERE j.environment_id=:env AND o.dispatch_intent_at IS NOT NULL)
-    """), values)
+    # Creation owns the original reservation. A later action owns its
+    # execution group's scope; earlier environment creation is not its effect.
+    # Include every job in the group so a continuation cannot discard earlier
+    # dispatches merely because its own request was stopped before dispatch.
+    effects = uow.execute(text("""
+        SELECT count(*) > 0 AS dispatched,
+               count(*) FILTER (WHERE o.state IN ('running','pending_external','unknown','failed','cancelled')
+                   AND o.prepared_call #>> '{execution_policy,effect}' IS DISTINCT FROM 'read_only') > 0 AS uncertain
+        FROM control_plane.operations o JOIN control_plane.jobs j ON j.id=o.job_id
+        WHERE j.environment_id=:env AND (:creation OR j.execution_group_id=:group)
+          AND o.dispatch_intent_at IS NOT NULL
+    """), {**values, "creation": kind == "create"}).one()
+    release_creation = kind == "create" and not blocked and not effects.dispatched
+    release_scope = release_creation or (kind == "action" and not effects.dispatched)
     if kind in ("create", "cleanup"):
         values["state"] = "blocked" if blocked else {"create": "create_failed", "cleanup": "delete_failed"}[kind]
         uow.execute(text("""
             UPDATE control_plane.environments SET lifecycle=:state,updated_at=clock_timestamp() WHERE id=:env
         """), values)
-    if kind == "action" and flow.get("state_mapping"):
+    if kind == "action" and effects.dispatched and flow.get("state_mapping"):
         _observe_state(uow, job, "unknown", flow["state_mapping"]["ttl_seconds"])
-    if kind in ("create", "cleanup") or blocked:
-        finish_quota(uow, values["env"], disposition="released" if no_effect else "quarantined")
-    if no_effect:
+    if kind in ("create", "cleanup") or effects.uncertain:
+        finish_quota(uow, values["env"], disposition="released" if release_creation else "quarantined")
+    if release_scope:
         uow.execute(text("""
             UPDATE control_plane.conflict_protections SET released_at=clock_timestamp()
             WHERE execution_group_id=:group AND released_at IS NULL
         """), values)
     uow.execute(text("""
         UPDATE control_plane.execution_groups SET state=:group_state,updated_at=clock_timestamp() WHERE id=:group
-    """), {**values, "group_state": "released" if no_effect else "blocked"})
+    """), {**values, "group_state": "released" if release_scope else "blocked"})
     uow.execute(text("""
         INSERT INTO control_plane.audit_events(actor_id,environment_id,job_id,action,result)
         VALUES (:actor,:env,:job,'workflow.interrupted',:result)

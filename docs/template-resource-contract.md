@@ -71,6 +71,8 @@ Environment 的模板、创建结果和资源目标快照不等于所有以后�
 
 平台根据当前环境和执行处理组生成 evidence，业务用户不能提交其他 Job/Operation 作为证据来源。结构至少包括 snapshot_id、execution_group_id、source_job_ids，以及 steps 下按步骤定义 ID / 稳定 item_key 索引的执行事实。每个步骤项包含按尝试序号排列的 operations；每个 Operation 含 operation_id、state、target_ref、external_refs、checkpoints 及其版本和确认时间。未展开步骤或无引用时显式给空集合，不伪造成功 output。
 
+普通创建步骤的历次尝试可从 `evidence.unexpanded.<步骤 ID>.operations` 按顺序读取。清理步骤可设置 `for_each.items` 为 `{"$ref":"evidence.unexpanded.provision.operations"}`，设置 `item_key` 为 `{"$ref":"item.operation_id"}`，在输入中以 `{"$ref":"item.external_refs.vm.reference"}` 取回该次尝试的引用。没有匹配的执行尝试时，数组为空。显式展开的步骤仍使用 `evidence.steps.<步骤 ID>.<item_key>.operations`，包括名字恰好为 `unexpanded` 的项。两种引用都读取准入时已冻结的同一份 evidence，已排队的清理任务也适用。
+
 模板可以有界遍历这些集合，再用普通引用读取已知项，例如 `{ $ref: item.external_refs.vm.reference }`；evidence 中 external_refs 以稳定 ref_key 映射到 reference、revision、observed_at，checkpoints 同理。不以“最后一个 Operation”隐式替代明确尝试选择；同键跨尝试冲突时先恢复核对，不能自动合并外部对象。
 
 接续流程提交时固定证据快照，派发前在相同冲突保护下核对证据 revision，防止新结果改变目标。快照只能提供当前环境的安全信息及 SecretRef；不能读取其他环境秘密。evidence 是执行依据，不是解除 unknown 的授权：原操作未知且与清理冲突时，先查询或显式人工核对，不能仅因为存在一个外部引用就立即执行删除。
