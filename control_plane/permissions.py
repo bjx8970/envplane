@@ -16,14 +16,14 @@ class RuntimePermissionError(RuntimeError):
 _APPEND_ONLY = frozenset({
     "plugin_storage_versions", "plugin_storage_snapshots", "plugin_instance_versions",
     "audit_events", "operation_evidence", "job_logs", "job_plugin_snapshots", "job_secret_refs",
-    "operation_call_attempts",
+    "operation_call_attempts", "environment_credential_confirmations",
 })
 _MUTABLE = frozenset({
     "users", "courses", "groups", "course_members", "templates", "template_versions",
     "plugin_instances", "plugin_storage_heads", "teacher_quotas", "quota_reservations",
     "environments", "experiment_resources", "environment_assignments", "execution_groups",
     "conflict_protections", "jobs", "job_steps", "operations", "local_resource_items",
-    "secrets", "secret_versions", "interactive_sessions",
+    "secrets", "secret_versions", "interactive_sessions", "access_revocations",
 })
 _TABLE_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN")
 _COLUMN_PRIVILEGES = frozenset({"SELECT", "INSERT", "UPDATE", "REFERENCES"})

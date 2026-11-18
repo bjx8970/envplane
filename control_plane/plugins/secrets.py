@@ -132,6 +132,18 @@ class SecretService:
             raise ReferenceUnavailable('secret version is unavailable')
         return row
 
+    def _decrypt(self, row):
+        key = self.__keys.get(row.encryption_key_id)
+        if key is None:
+            raise ReferenceUnavailable('secret encryption key is unavailable')
+        ciphertext = bytes(row.ciphertext)
+        try:
+            value = AESGCM(key).decrypt(ciphertext[:12], ciphertext[12:], self._aad(row))
+        except (InvalidTag, ValueError):
+            raise ReferenceUnavailable('secret authentication failed') from None
+        self._remember(value)
+        return value
+
     def _encrypt_in(self, uow, secret_id, purpose, environment_id, plaintext, version):
         if not isinstance(plaintext, bytes) or not 1 <= len(plaintext) <= 1048500:
             raise ValueError('secret payload must be bounded nonempty bytes')
@@ -415,17 +427,9 @@ class BoundSecrets:
             if self.__guard is not None:
                 self.__guard(connection)
             row = self.__service._authorize(connection, self.__job, self.__instance, self.__environment, exact, self.__step, self.__operation if (exact.secret_id, exact.version_id) in self.__created else None)
-            key = self.__service._SecretService__keys.get(row.encryption_key_id)
-            if key is None:
-                raise ReferenceUnavailable('secret encryption key is unavailable')
-            ciphertext = bytes(row.ciphertext)
-            try:
-                plaintext = AESGCM(key).decrypt(ciphertext[:12], ciphertext[12:], self.__service._aad(row))
-            except (InvalidTag, ValueError):
-                raise ReferenceUnavailable('secret authentication failed') from None
+            plaintext = self.__service._decrypt(row)
             if self.__guard is not None:
                 self.__guard(connection)
-        self.__service._remember(plaintext)
         return SecretHandle(plaintext, check)
 
     def derive(self, slot, spec=None):

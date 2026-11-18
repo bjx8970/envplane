@@ -62,7 +62,8 @@ class LocalOutcomeApplicator:
         self.lifecycle_policy = lifecycle_policy
         self.quota_policy = quota_policy
 
-    def apply(self, uow, operation, projection):
+    @staticmethod
+    def write_products(uow, operation, projection):
         if len(projection.resources) > 1000 or len(projection.local_items) > 1000:
             raise ValueError("bounded local projection required")
         if projection.release_conflicts and not projection.job_complete:
@@ -128,6 +129,11 @@ class LocalOutcomeApplicator:
             if (str(existing.source_operation_id) != str(operation["id"])
                     or any(canonical_json(existing._mapping[key]) != canonical_json(value) for key, value in expected.items())):
                 raise ValueError("resource logical identity or target conflict")
+
+    def apply(self, uow, operation, projection):
+        from sqlalchemy import text
+        base = {"group": operation["execution_group_id"], "job": operation["job_id"]}
+        self.write_products(uow, operation, projection)
         self.lifecycle_policy.apply(uow, operation, projection)
         self.quota_policy.apply(uow, operation, projection.quota_facts)
         if projection.release_conflicts:

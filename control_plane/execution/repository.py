@@ -68,8 +68,9 @@ def _seconds(value):
 
 
 class Repository:
-    def __init__(self, runtime, *, reference_validator=UNAVAILABLE._unavailable, source_publisher=None, safe_json=None):
+    def __init__(self, runtime, *, reference_validator=UNAVAILABLE._unavailable, source_publisher=None, safe_json=None, authorize_job=None):
         self.runtime = runtime
+        self.authorize_job = authorize_job
         self.reference_validator = reference_validator
         self.source_publisher = source_publisher
         self.safe_json = safe_json or (lambda value: value)
@@ -112,6 +113,22 @@ class Repository:
                 or (not terminal and (row.state not in ("running", "cancel_requested") or row.group_state != "active"))):
             raise JobLeaseLost("job lease or execution-group revision is no longer valid")
         return _dict(row)
+
+    def _authorize(self, uow, job):
+        if self.authorize_job is not None and not self.authorize_job(uow, job):
+            from ..plugins.sdk import AuthorizationDenied
+            raise AuthorizationDenied()
+        workflow = job["execution_snapshot"].get("workflow")
+        if isinstance(workflow, dict) and workflow.get("kind") == "cleanup":
+            from ..workflows import verify_cleanup_evidence
+            verify_cleanup_evidence(uow, job, workflow)
+
+    def finish_workflow(self, lease, applicator):
+        with self.runtime.fenced_transaction() as uow:
+            job = self._guard(uow, lease)
+            self._authorize(uow, job)
+            applicator.finish(uow, job)
+            self._guard(uow, lease, terminal=True)
 
     def _lease(self, job, owner, token, group_revision):
         coordinator_owner, coordinator_revision = self._identity()
@@ -188,10 +205,12 @@ class Repository:
                 values = {"id": step.get("id", uuid4()), "job": lease.job_id,
                           "path": step["step_path"], "key": step.get("item_key", ""),
                           "input": canonical_json(step.get("input", {})),
-                          "expansion": _json(step.get("expansion"))}
+                          "expansion": _json(step.get("expansion")), "state": step.get("state", "pending")}
+                if values["state"] not in ("pending", "skipped"):
+                    raise ValueError("invalid initial step state")
                 uow.execute(text("""
-                    INSERT INTO control_plane.job_steps(id,job_id,step_path,item_key,input,expansion)
-                    VALUES (:id,:job,:path,:key,CAST(:input AS jsonb),CAST(:expansion AS jsonb))
+                    INSERT INTO control_plane.job_steps(id,job_id,step_path,item_key,input,expansion,state)
+                    VALUES (:id,:job,:path,:key,CAST(:input AS jsonb),CAST(:expansion AS jsonb),:state)
                     ON CONFLICT(job_id,step_path,item_key) DO NOTHING
                 """), values)
                 row = uow.execute(text("SELECT input,expansion FROM control_plane.job_steps WHERE job_id=:job AND step_path=:path AND item_key=:key"), values).one()
@@ -203,6 +222,7 @@ class Repository:
         _seconds(seconds)
         with self.runtime.fenced_transaction() as uow:
             job = self._guard(uow, lease)
+            self._authorize(uow, job)
             if job["cancel_requested_at"] is not None:
                 raise ExecutionConflict("job cancellation requested")
             row = uow.execute(text("SELECT * FROM control_plane.job_steps WHERE id=:step AND job_id=:job FOR UPDATE"), {"step": step_id, "job": lease.job_id}).one()
@@ -222,13 +242,14 @@ class Repository:
     def prepare_failed(self, lease, step_id, *, code="prepare_failed"):
         error = canonical_json({"code": code, "message": "preparation did not complete; no operation dispatched"})
         with self.runtime.fenced_transaction() as uow:
-            self._guard(uow, lease)
+            job = self._guard(uow, lease)
             uow.execute(text("""
                 UPDATE control_plane.job_steps SET state='failed',prepare_error=CAST(:error AS jsonb),
                   error=CAST(:error AS jsonb),finished_at=clock_timestamp(),updated_at=clock_timestamp()
                 WHERE id=:step AND job_id=:job AND state='pending'
             """), {"error": error, "step": step_id, "job": lease.job_id})
             uow.execute(text("UPDATE control_plane.jobs SET state='failed',error=CAST(:error AS jsonb),finished_at=clock_timestamp() WHERE id=:job"), {"job": lease.job_id, "error": error})
+            self._interrupted(uow, job)
             self._guard(uow, lease, terminal=True)
 
     def _acquire_scopes(self, uow, lease, scopes):
@@ -246,6 +267,7 @@ class Repository:
         encoded = canonical_json(self.safe_json(prepared.to_dict()))
         with self.runtime.fenced_transaction() as uow:
             job = self._guard(uow, lease)
+            self._authorize(uow, job)
             step = uow.execute(text("SELECT *,clock_timestamp() AS database_now FROM control_plane.job_steps WHERE id=:step AND job_id=:job FOR UPDATE"), {"step": step_id, "job": lease.job_id}).one()
             if step.current_operation_id is not None:
                 op = _dict(uow.execute(text("SELECT * FROM control_plane.operations WHERE id=:id"), {"id": step.current_operation_id}).one())
@@ -279,6 +301,7 @@ class Repository:
         _seconds(seconds)
         with self.runtime.fenced_transaction() as uow:
             job = self._guard(uow, lease)
+            self._authorize(uow, job)
             op = uow.execute(text("SELECT * FROM control_plane.operations WHERE id=:op AND job_id=:job FOR UPDATE"), {"op": operation_id, "job": lease.job_id}).one()
             prepared = PreparedCall.from_dict(op.prepared_call)
             policy = prepared.execution_policy
@@ -294,7 +317,13 @@ class Repository:
                 if op.state == "prepared":
                     if job["cancel_requested_at"] is not None:
                         raise ExecutionConflict("cancelled before dispatch")
-                    uow.execute(text("UPDATE control_plane.operations SET state='running',dispatch_intent_at=clock_timestamp(),deadline_at=clock_timestamp()+(:seconds*interval '1 second'),updated_at=clock_timestamp() WHERE id=:op"), {"op": operation_id, "seconds": seconds})
+                    uow.execute(text("""
+                        UPDATE control_plane.operations o SET state='running',dispatch_intent_at=clock_timestamp(),
+                            deadline_at=LEAST(clock_timestamp()+(:seconds*interval '1 second'),
+                                s.prepare_started_at + ((s.input->>'timeout_seconds')::double precision * interval '1 second')),
+                            updated_at=clock_timestamp()
+                        FROM control_plane.job_steps s WHERE o.id=:op AND s.id=o.step_id
+                    """), {"op": operation_id, "seconds": seconds})
                 elif not (op.state == "unknown" and retry_of_call_id is not None and
                           (policy.effect == "read_only" or policy.idempotency == "keyed")):
                     raise InvalidTransition("execute would repeat an unsafe or completed operation")
@@ -465,6 +494,7 @@ class Repository:
                     uow.execute(text("UPDATE control_plane.job_steps SET state='failed',error=CAST(:error AS jsonb),finished_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=:step"), {"step": op["step_id"], "error": _json(raw["error"])})
                     uow.execute(text("UPDATE control_plane.jobs SET state='failed',error=CAST(:error AS jsonb),finished_at=clock_timestamp() WHERE id=:job"), {"job": lease.job_id, "error": _json(raw["error"])})
                     self._quarantine(uow, job["environment_id"])
+                    self._interrupted(uow, job)
                 else:
                     # These two trusted local adapters MUST NOT perform external I/O.
                     projection = projector.project(op, result)
@@ -486,6 +516,12 @@ class Repository:
             raise
 
     @staticmethod
+    def _interrupted(uow, job, *, blocked=False, cancelled=False):
+        if isinstance(job["execution_snapshot"].get("workflow"), dict):
+            from ..workflows import record_interruption
+            record_interruption(uow, job, blocked=blocked, cancelled=cancelled)
+
+    @staticmethod
     def _quarantine(uow, environment_id):
         uow.execute(text("UPDATE control_plane.quota_reservations SET state='quarantined',updated_at=clock_timestamp() WHERE environment_id=:environment AND state IN ('reserved','allocated')"), {"environment": environment_id})
 
@@ -495,8 +531,9 @@ class Repository:
         uow.execute(text("UPDATE control_plane.job_steps SET state='blocked',error=CAST(:error AS jsonb),updated_at=clock_timestamp() WHERE id=:step AND state NOT IN ('succeeded','failed','cancelled','skipped')"), {"step": op["step_id"], "error": error})
         uow.execute(text("UPDATE control_plane.jobs SET state='blocked',error=CAST(:error AS jsonb),available_at=GREATEST(available_at,clock_timestamp()+interval '1 second'),updated_at=clock_timestamp() WHERE id=:job"), {"job": lease.job_id, "error": error})
         uow.execute(text("UPDATE control_plane.execution_groups SET state='blocked',reason=CAST(:error AS jsonb),updated_at=clock_timestamp() WHERE id=:group"), {"group": lease.group_id, "error": error})
-        environment = uow.scalar(text("SELECT environment_id FROM control_plane.jobs WHERE id=:job"), {"job": lease.job_id})
-        self._quarantine(uow, environment)
+        job = uow.execute(text("SELECT * FROM control_plane.jobs WHERE id=:job"), {"job": lease.job_id}).mappings().one()
+        self._quarantine(uow, job["environment_id"])
+        self._interrupted(uow, job, blocked=True)
 
     def block_operation(self, lease, operation_id, code):
         """Block an operation by identity under the *current* lease.
@@ -530,10 +567,19 @@ class Repository:
         with self.runtime.fenced_transaction() as uow:
             job = self._guard(uow, lease)
             error = canonical_json({"code": code, "message": "fixed execution dependency requires review"})
+            if isinstance(job["execution_snapshot"].get("workflow"), dict):
+                # A denied/revoked dispatch never touched the remote endpoint.
+                # Keep the evidence but avoid a permanently "prepared" operation
+                # preventing an administrator's explicit cleanup of earlier work.
+                uow.execute(text("""UPDATE control_plane.operations
+                    SET state='cancelled',finished_at=clock_timestamp()
+                    WHERE job_id=:job AND state='prepared' AND dispatch_intent_at IS NULL"""),
+                    {"job": lease.job_id})
             uow.execute(text("UPDATE control_plane.job_steps SET state='blocked',error=CAST(:error AS jsonb) WHERE job_id=:job AND state IN ('pending','running','waiting_external')"), {"job": lease.job_id, "error": error})
             uow.execute(text("UPDATE control_plane.jobs SET state='blocked',error=CAST(:error AS jsonb) WHERE id=:job"), {"job": lease.job_id, "error": error})
             uow.execute(text("UPDATE control_plane.execution_groups SET state='blocked',reason=CAST(:error AS jsonb) WHERE id=:group"), {"group": lease.group_id, "error": error})
             self._quarantine(uow, job["environment_id"])
+            self._interrupted(uow, job, blocked=True)
             self._guard(uow, lease, terminal=True)
 
     def saved_success(self, lease, operation_id):
@@ -562,7 +608,7 @@ class Repository:
                "error": result.error.to_dict() if hasattr(result.error, "to_dict") else result.error}
         self.append_evidence(call_id, "late_result", "cancel:" + str(call_id), raw, event_id="cancel:" + str(call_id))
         with self.runtime.fenced_transaction() as uow:
-            self._guard(uow, lease)
+            job = self._guard(uow, lease)
             call = self._call(uow, call_id)
             self._match_call(lease, call)
             if call["method"] != "cancel":
@@ -575,20 +621,20 @@ class Repository:
                 if not remaining:
                     uow.execute(text("UPDATE control_plane.jobs SET state='cancelled',finished_at=clock_timestamp() WHERE id=:job"), {"job": lease.job_id})
                 # Cancellation confirms execution stopped, not absence of resources.
-                self._quarantine(uow, uow.scalar(text("SELECT environment_id FROM control_plane.jobs WHERE id=:job"), {"job": lease.job_id}))
+                self._quarantine(uow, job["environment_id"])
+                self._interrupted(uow, job, cancelled=True)
             self._guard(uow, lease, terminal=True)
 
     def cancel_undispatched(self, lease):
         with self.runtime.fenced_transaction() as uow:
-            self._guard(uow, lease)
+            job = self._guard(uow, lease)
             if uow.scalar(text("SELECT count(*) FROM control_plane.operations WHERE job_id=:job AND dispatch_intent_at IS NOT NULL"), {"job": lease.job_id}):
                 raise ExecutionConflict("dispatched operations require cancellation evidence")
             uow.execute(text("UPDATE control_plane.operations SET state='cancelled',finished_at=clock_timestamp() WHERE job_id=:job AND state='prepared'"), {"job": lease.job_id})
             uow.execute(text("UPDATE control_plane.job_steps SET state='cancelled',finished_at=clock_timestamp() WHERE job_id=:job AND state IN ('pending','running')"), {"job": lease.job_id})
             uow.execute(text("UPDATE control_plane.jobs SET state='cancel_requested' WHERE id=:job AND state='running'"), {"job": lease.job_id})
             uow.execute(text("UPDATE control_plane.jobs SET state='cancelled',finished_at=clock_timestamp() WHERE id=:job"), {"job": lease.job_id})
-            # Only a P3 quota policy can decide prior environment occupancy. Never
-            # release historical reservations simply because this job sent nothing.
+            self._interrupted(uow, job, cancelled=True)
             self._guard(uow, lease, terminal=True)
 
     def recover_expired(self, owner, lease_seconds=30, *, limit=32):
@@ -683,6 +729,7 @@ class Repository:
     def _adopt_result(self, lease, operation_id, source_call_id, evidence_id, result, projector, applicator):
         with self.runtime.fenced_transaction() as uow:
             job = self._guard(uow, lease)
+            self._authorize(uow, job)
             op = _dict(uow.execute(text("SELECT o.*,j.environment_id,j.logical_invocation_id,j.execution_group_id FROM control_plane.operations o JOIN control_plane.jobs j ON j.id=o.job_id WHERE o.id=:op AND o.job_id=:job FOR UPDATE OF o"), {"op": operation_id, "job": lease.job_id}).one())
             if result.outcome != "succeeded" or result.protocol_error or op["state"] not in ("running", "unknown", "pending_external"):
                 raise ExecutionConflict("saved result is not a confirmed applicable success")

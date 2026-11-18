@@ -1,6 +1,6 @@
 # Execution / Persistence Contract v1
 
-状态：目标契约，尚未实现。相关：[架构](architecture.md)、[插件](plugin-contract.md)、[模板](template-resource-contract.md)、[身份安全](identity-security-contract.md)。
+本文描述 v1 执行契约。P2 执行内核与 P3 模板、配额和结果应用已接入服务层。相关：[架构](architecture.md)、[插件](plugin-contract.md)、[模板](template-resource-contract.md)、[身份安全](identity-security-contract.md)。
 
 本规范替代旧进程内任务与手动重试说明，不描述现有 task_queue.py 的运行保证。PostgreSQL 负责持久事实，单体进程中的有界线程池负责领取和执行。
 

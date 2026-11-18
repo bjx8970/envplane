@@ -1,4 +1,4 @@
-"""Explicit P2 service composition; business adapters must be injected by P3.
+"""Explicit composition of trusted plugins, P3 business services, and execution.
 
 A deployment configuration enables loading trusted packages, never Python paths
 from the database. Without it the P0/P1 database/coordinator-only mode remains
@@ -57,6 +57,7 @@ class PluginServices:
         self.driver = None
         self.sessions = None
         self.admission = None
+        self.business = self.identity = self.templates = self.credentials = self.access = None
         self._state = 'stopped'
 
     def start(self):
@@ -86,12 +87,39 @@ class PluginServices:
         self.capacity.start()
         from .admission import AdmissionController
         self.admission = AdmissionController(self.runtime, self.capacity, max_pending_jobs=data['max_pending_jobs'])
+        from .access import AccessService
+        from .business import BusinessService, authorize_job
+        from .credentials import CredentialService
+        from .execution.driver import ExecutionDriver
+        from .execution.repository import Repository
+        from .identity import IdentityService
+        from .selectors import SelectorService
+        from .templates import TemplateService
+        from .workflows import TemplateWorkflow
+
+        self.identity = IdentityService(self.runtime)
+        self.access = AccessService(self.runtime, self.registry)
+        self.templates = TemplateService(self.runtime, registry=self.registry, safe_json=self.secrets.safe_json)
+        selectors = SelectorService(self.runtime, self.configuration, self.storage, self.registry, self.capacity)
+        self.business = BusinessService(self, selectors, max_pending_jobs=data['max_pending_jobs'])
+        self.credentials = CredentialService(self.runtime, self.secrets, run_action=self.business.run_action,
+                                             registry=self.registry)
         self._state = 'running'
         if self.driver_factory is not None:
             self.driver = self.driver_factory(self)
+        else:
+            # Unavailable optional packages only block dependent workflows.
+            workflow = TemplateWorkflow()
+            self.driver = ExecutionDriver(Repository(self.runtime, authorize_job=authorize_job), self.capacity,
+                                         self.registry, self.contexts, planner=workflow, projector=workflow,
+                                         applicator=workflow)
+        if self.driver is not None:
             self.driver.start()
         if self.session_factory is not None:
+            from .plugins.sessions import SessionService
             self.sessions = self.session_factory(self)
+            if isinstance(self.sessions, SessionService):
+                self.sessions.authorizer = self.credentials.session_authorizer
             self.sessions.start()
 
     def tick(self):
@@ -101,6 +129,7 @@ class PluginServices:
             self.driver.tick()
         if self.sessions is not None:
             self.sessions.poll()
+        self.credentials.poll_revocations()
 
     def health(self):
         capacity = self.capacity.snapshot() if self.capacity else None

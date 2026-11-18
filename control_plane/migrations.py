@@ -9,7 +9,8 @@ from .database import create_database_engine
 SCHEMA = "control_plane"
 BASELINE_REVISION = "0001_v1_foundation"
 P1_REVISION = "0002_p1_review_guards"
-HEAD_REVISION = "0003_p2_runtime_contracts"
+P2_REVISION = "0003_p2_runtime_contracts"
+HEAD_REVISION = "0004_p3_business_services"
 
 
 class SchemaMismatch(RuntimeError):
@@ -39,8 +40,10 @@ def check_schema(connection, *, compatible_revisions=(HEAD_REVISION,)) -> None:
         "job_plugin_snapshots", "job_secret_refs", "secrets", "secret_versions", "interactive_sessions",
         "audit_events", "coordinator_leases",
     }
-    if revisions[0] == HEAD_REVISION:
+    if revisions[0] in (P2_REVISION, HEAD_REVISION):
         required.add("operation_call_attempts")
+    if revisions[0] == HEAD_REVISION:
+        required.update({"environment_credential_confirmations", "access_revocations"})
     tables = set(connection.scalars(text("SELECT tablename FROM pg_tables WHERE schemaname='control_plane'")))
     if not required <= tables:
         raise SchemaMismatch("schema is incomplete; restore a validated database")
@@ -65,7 +68,7 @@ def _validate_database(connection) -> None:
 
 @contextmanager
 def migration_transaction(settings, target="head", *, upgrade=True):
-    if target not in ("head", "base", BASELINE_REVISION, P1_REVISION, HEAD_REVISION) or (upgrade and target == "base"):
+    if target not in ("head", "base", BASELINE_REVISION, P1_REVISION, P2_REVISION, HEAD_REVISION) or (upgrade and target == "base"):
         raise MigrationError("unsupported migration target")
     engine = create_database_engine(settings)
     try:
@@ -78,7 +81,7 @@ def migration_transaction(settings, target="head", *, upgrade=True):
             _validate_database(connection)
             connection.execute(text("CREATE SCHEMA IF NOT EXISTS control_plane"))
             if not upgrade:
-                check_schema(connection, compatible_revisions=(BASELINE_REVISION, P1_REVISION, HEAD_REVISION))
+                check_schema(connection, compatible_revisions=(BASELINE_REVISION, P1_REVISION, P2_REVISION, HEAD_REVISION))
                 tables = list(connection.scalars(text(
                     "SELECT tablename FROM pg_tables WHERE schemaname='control_plane' "
                     "AND tablename NOT IN ('alembic_version','coordinator_leases')"

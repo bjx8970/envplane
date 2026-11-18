@@ -9,7 +9,7 @@
 - [执行与持久化](docs/execution-persistence-contract.md)
 - [身份、授权与安全](docs/identity-security-contract.md)
 
-这些是已确认的 v1 目标设计，不是完整功能交付说明。独立 `control_plane/` 已实现 P0 启动骨架、P1 Alembic/领域表/持久协调租约与最小权限基座，以及 P2 插件运行时（Manifest/Storage/Secrets/会话协议）与 PostgreSQL Job/Operation 执行内核（服务层）；业务入口仍为旧 Flask/Jinja 单体，尚无新模板驱动 UI、HTTP API 或真实 P3 业务授权/配额。变更说明必须区分“设计”“实现”“实测”，不能把完整规范写成已交付功能。
+这些是已确认的 v1 目标设计，不是完整功能交付说明。独立 `control_plane/` 已实现 P0 启动骨架、P1 Alembic/领域表/持久协调租约与最小权限基座，以及 P2 插件运行时（Manifest/Storage/Secrets/会话协议）与 PostgreSQL Job/Operation 执行内核（服务层）；P3 已在同一控制面接入模板与环境、身份与课程、教师配额、凭据与撤权服务。当前 HTTP 入口仍为旧 Flask/Jinja 单体，P5 负责新 HTTP API、UI 与 WebSSH。变更说明必须区分“设计”“实现”“实测”，不能把完整规范写成已交付功能。
 
 ## 不得偏离的产品边界
 
@@ -62,7 +62,9 @@
 | `tests/` | 旧 unittest 安全/重试测试，确实存在 |
 | `control_plane/plugins/` | P2 插件运行时：SDK、Manifest 加载、Storage、Secrets、会话协议、容量与 Fake |
 | `control_plane/execution/` | P2 执行内核：状态机、claim/派发/证据/恢复、纯本地结果应用适配器 |
-| `control_plane/services.py` / `admission.py` | P2 显式服务组合与同事务准入边界，缺 P3 策略时 fail-closed |
+| `control_plane/services.py` / `admission.py` | 显式部署启用 P3 业务服务，准入与 P2 执行共享事务、快照和实时授权边界 |
+| `control_plane/templates.py` / `workflows.py` / `business.py` | P3 发布校验、持久展开、资源生成、环境动作与清理 |
+| `control_plane/identity.py` / `quota.py` / `credentials.py` / `access.py` | P3 课程授权、配额、凭据查看与撤权、会话入口解析 |
 | `plugins/ssh/` | 可部署 SSH 可信包（管理命令与主机选项，不是学生终端入口） |
 
 当前代码没有默认 SQLite 引擎；临时 SQLite 只用于隔离测试。不要恢复“支持 SQLite 在线切换”或“没有测试”的旧描述。
@@ -72,7 +74,7 @@
 ## 验证与操作约束
 
 - 旧测试入口：`python -B -m unittest discover -s tests -t .`；优先在默认 WSL 中运行开发和测试，先验证 Windows 路径映射。git/gh 留在当前 Windows worktree 执行。
-- 新控制面严格入口仍为 `bash scripts/run_p1_tests.sh`（名称沿用，已覆盖 P1+P2）；脚本在隔离 venv 安装 sqlalchemy/pg8000/alembic/jsonschema/PyYAML/cryptography/paramiko 并自建一次性 PostgreSQL 17。2026-11-15 实测 352 项通过，0 跳过。
+- 新控制面严格入口仍为 `bash scripts/run_p1_tests.sh`（名称沿用，已覆盖 P1、P2 与 P3）；脚本在隔离 venv 安装 sqlalchemy/pg8000/alembic/jsonschema/PyYAML/cryptography/paramiko 并自建一次性 PostgreSQL 17。2026-11-18 使用环境预置 Docker 的一次性 PostgreSQL 17 和同一 Python 严格入口，实测 416 项通过，0 跳过。
 - 新规范必须增加接口、状态机、数据库事务、崩溃、并发、权限和模板驱动 UI 验收；旧测试不能代替这些测试。
 - 文档更新通常无需运行真实设备、凭据迁移或生产部署；报告实际执行的检查，不复用历史测试次数。
 - 凭据、私钥、密文和加密密钥不写日志或提交。API 使用 Session/CSRF/精确 Origin 白名单，敏感查看和接管须审计。

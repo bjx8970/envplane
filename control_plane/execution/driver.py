@@ -247,17 +247,27 @@ class ExecutionDriver:
                 return
             self._submit_operation(lease, step, current, prepared, method)
             return
-        outputs = {s["step_path"] + ":" + s["item_key"]: s["output"] for s in steps if s["state"] == "succeeded"}
-        planned = self.planner.plan(job["execution_snapshot"], outputs)
+        if hasattr(self.planner, "plan_steps"):
+            planned = self.planner.plan_steps(job["execution_snapshot"], steps)
+        else:
+            outputs = {s["step_path"] + ":" + s["item_key"]: s["output"]
+                       for s in steps if s["state"] == "succeeded"}
+            planned = self.planner.plan(job["execution_snapshot"], outputs)
         if planned:
             self.repository.add_steps(lease, planned)
             job, steps, operations = self.repository.view(lease)
+        if planned and all(s.get("state") == "skipped" for s in planned):
+            return  # Empty expansion is durable; plan the next definition on the next tick.
         pending = next((s for s in steps if s["state"] == "pending" and
                         all(any(t["step_path"] == dep and t["state"] == "succeeded" for t in steps)
                             for dep in s["input"].get("depends_on", []))), None)
         if pending:
             self._submit_prepare(lease, pending)
         elif not steps or all(s["state"] in ("succeeded", "skipped") for s in steps):
+            if hasattr(self.applicator, "finish"):
+                self.repository.finish_workflow(lease, self.applicator)
+                self._leases.pop(key, None)
+                return
             # Readiness for zero-step flows must be an explicit business policy.
             self._leases.pop(key, None)
             raise AdapterUnavailable("workflow completion requires explicit lifecycle adapter")
@@ -268,7 +278,8 @@ class ExecutionDriver:
         binding = self._binding(lease, instance_id)
         loaded = self._loaded(binding)
         loaded.validate_input(action_key, args.get("input", {}))
-        deadline = Deadline.from_at(self.repository.start_prepare(lease, step["id"], self.settings.prepare_seconds))
+        seconds = min(self.settings.prepare_seconds, args.get("timeout_seconds", self.settings.prepare_seconds))
+        deadline = Deadline.from_at(self.repository.start_prepare(lease, step["id"], seconds))
         if deadline.expired:
             self.repository.prepare_failed(lease, step["id"], code="prepare_timeout")
             return
@@ -292,6 +303,7 @@ class ExecutionDriver:
         loaded = self._loaded(self._binding(lease, instance_id))
         self.context_builder.validate_prepared(lease.job_id, instance_id, prepared, step_instance_id=step["id"])
         seconds = getattr(self.settings, method + "_seconds")
+        seconds = min(seconds, step["input"].get("timeout_seconds", seconds))
         previous = self.repository.latest_call(operation["id"], method)
         retry = previous["id"] if method == "execute" and operation["state"] == "unknown" and previous else None
         attempt = self.repository.begin_call(lease, operation["id"], method, seconds, retry_of_call_id=retry)

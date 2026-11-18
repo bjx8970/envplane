@@ -64,18 +64,18 @@ def write_storage(connection, instance_id, key, value, *, expected_version=None,
 
 
 def admit_job(connection, *, actor_id, request_key, request_digest, environment_id,
-              execution_group_id, logical_invocation_id, kind, input, execution_snapshot):
+              execution_group_id, logical_invocation_id, kind, input, execution_snapshot, parent_job_id=None):
     require_fenced_connection(connection)
     job_id = uuid4()
     inserted = connection.scalar(text("""
         INSERT INTO control_plane.jobs
             (id,actor_id,request_key,request_digest,environment_id,execution_group_id,
-             logical_invocation_id,kind,input,execution_snapshot)
+             logical_invocation_id,kind,input,execution_snapshot,parent_job_id)
         VALUES (:id,:actor,:key,:digest,:environment,:group,:invocation,:kind,
-                CAST(:input AS jsonb),CAST(:snapshot AS jsonb))
+                CAST(:input AS jsonb),CAST(:snapshot AS jsonb),:parent)
         ON CONFLICT(actor_id,request_key) DO NOTHING RETURNING id
     """), {"id": job_id, "actor": actor_id, "key": request_key, "digest": request_digest,
-           "environment": environment_id, "group": execution_group_id,
+           "environment": environment_id, "group": execution_group_id, "parent": parent_job_id,
            "invocation": logical_invocation_id, "kind": kind,
            "input": json.dumps(input, allow_nan=False),
            "snapshot": json.dumps(execution_snapshot, allow_nan=False)})

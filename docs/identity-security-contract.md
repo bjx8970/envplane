@@ -1,6 +1,6 @@
 # Identity / Authorization / Security Contract v1
 
-状态：目标契约，尚未实现。相关：[架构](architecture.md)、[模板](template-resource-contract.md)、[插件](plugin-contract.md)、[执行](execution-persistence-contract.md)。
+本文描述 v1 身份与安全契约。P3 服务层实现账号、课程授权、配额、环境凭据与撤权记录；HTTP 会话与浏览器适配属于 P5。相关：[架构](architecture.md)、[模板](template-resource-contract.md)、[插件](plugin-contract.md)、[执行](execution-persistence-contract.md)。
 
 ## 1. 角色与账户
 
@@ -128,6 +128,26 @@ environment_assignments 包含 environment_id、course_id、group_id 或 student
 5. 未确认远端处置时显示 revocation_pending/revocation_failed，不报告完全撤权成功。
 
 共享凭据轮换可能影响其他仍有权学生，需更新其可见版本和连接状态。轮换、终止失败不撤销平台侧即时拒绝，但必须保留未完成事实。没有能力时明确标为不支持/未完成，不伪装已轮换。
+
+P3 在最后一条授权路径消失的事务内记录受影响的环境、学生和凭据版本，并断开该学生的平台会话。若原模板声明 `revocation_action`，控制面按撤权记录 ID 生成稳定请求键，通过普通动作准入派发到该环境。缺少能力时，记录状态为 `revocation_failed`，原因为 `unsupported`。
+
+模板配置的处置动作须以已成功 Operation 的输出提供远端证据。插件确认失效的版本列入 `remote_revocation.invalidated_versions`。只有能够确认该次撤权涉及的外部会话已经终止，才能设置 `remote_sessions_terminated`。两项证据均覆盖此次撤权后，控制面标记 `confirmed`。以下为共享账户同时轮换的输出形状，尖括号表示 UUID 占位符。
+
+```json
+{
+  "remote_revocation": {
+    "invalidated_versions": ["<旧版本 ID>"],
+    "remote_sessions_terminated": true,
+    "replacement_confirmed": true
+  },
+  "confirmed_environment_credential": {
+    "secret_id": "<环境凭据 ID>",
+    "version_id": "<远端已确认的新版本 ID>"
+  }
+}
+```
+
+首次开放凭据查看须由模板 `readiness.credential_confirmation` 指定的成功步骤确认对应精确版本。共享轮换时，替代版本须属于同一环境和同一凭据，版本号递增，且该 Job 已授权执行插件使用此版本。控制面持久保存旧版到新版的确认关系。仍有授权的学生可查看已确认的新版本，新建会话可沿该关系解析连接。既有 Job、Operation 和会话继续绑定原精确版本，失效后停止使用。
 
 Job/冲突保护只约束平台调度的调用，不能阻止外部 SSH 或交互终端命令并发修改同一系统。平台会话日志也无法覆盖外部直连行为。
 

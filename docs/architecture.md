@@ -1,6 +1,6 @@
 # v1 架构与产品边界
 
-状态：目标设计，尚未实现。更新日期：2026-10-22。本文件是正式设计规范，不是旧重构计划、实施排期或运行验证记录。
+本文描述 v1 目标设计。当前独立控制面实现 P0 至 P3 服务层，实施范围和实测记录见仓库 README。
 
 入口：[README](../readme.md)。专题：[插件](plugin-contract.md)、[模板与资源](template-resource-contract.md)、[执行持久化](execution-persistence-contract.md)、[身份安全](identity-security-contract.md)。
 
@@ -14,7 +14,7 @@
 
 ### 1.1 ADR-001：采用按需模板工作流，不以持续协调为 v1 基线
 
-状态：已确定的架构决策，尚未实现。日期：2026-10-22。
+此决策于 2026-10-22 确定。P3 模板工作流沿用此基线。
 
 背景：此前 control-plane v0.2 路线围绕 Resource/Binding/Operation 及 Scheduler/Controller，通过 Reconcile 持续收敛期望状态与观测状态。本轮产品要求已改变：管理员发布可信模板，核心按需执行插件动作，并管理模板声明的实验产出，而不是管理插件内部全部资产。历史路线不再是本轮实施基线，本决策不是对旧方案的普通重命名，也不表示历史实现已经具备这些能力。
 
