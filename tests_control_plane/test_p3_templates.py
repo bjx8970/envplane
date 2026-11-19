@@ -2,6 +2,7 @@
 from copy import deepcopy
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from uuid import uuid4
 
@@ -178,6 +179,25 @@ class TemplateContractTests(unittest.TestCase):
             validate_parameters(spec, {'hosts': ['b']})
         with self.assertRaises(TemplateError):
             resolve({'$ref': 'steps.failed.output.id'}, {'steps': {}})
+
+    def test_optional_access_label_is_validated_at_publication(self):
+        template = example()
+        plugin = SimpleNamespace(manifest={**self.ssh.manifest, "sessions": {
+            "terminal": {"input_schema": {"type": "object"}}}},
+            validators=self.ssh.validators, validate_input=self.ssh.validate_input)
+        entry = {"roles": ["student"], "plugin_instance": "ssh_lab", "session_type": "terminal",
+                 "target_ref": {"$ref": "environment.create_results.inspect.host"},
+                 "credential_ref": {"$ref": "environment.create_results.inspect.credential"},
+                 "input": {"$ref": "environment.create_results.inspect"}}
+        template["access"]["shell"] = entry
+        validate_template(template, lambda alias: plugin)
+        for label in (None, False, 42, [], "", "  ", "a" * 256):
+            with self.subTest(label=label):
+                entry["label"] = label
+                with self.assertRaisesRegex(TemplateError, "invalid label"):
+                    validate_template(template, lambda alias: plugin)
+        entry["label"] = "Lab shell"
+        validate_template(template, lambda alias: plugin)
 
     def test_access_resolution_requires_declared_role_capability_and_exact_ref(self):
         class SessionPlugin:

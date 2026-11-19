@@ -459,6 +459,8 @@ def _access(access, scope, lookup):
     for spec in _map(access).values():
         _fields(spec, ['roles', 'plugin_instance', 'session_type', 'target_ref', 'credential_ref'],
                 ['label', 'input'])
+        if 'label' in spec:
+            _label(spec['label'])
         _roles(spec['roles'])
         plugin, cap = _capability(lookup, spec, session=True)
         _validate_refs(spec['target_ref'], scope)

@@ -1,4 +1,9 @@
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
+from threading import Event
+from time import monotonic, sleep
 import unittest
+from unittest.mock import patch
 from uuid import uuid4
 
 from sqlalchemy import text
@@ -74,6 +79,53 @@ class EnvironmentCredentialTests(ServicesFixture, unittest.TestCase):
             uow.execute(text("UPDATE control_plane.environments SET lifecycle='ready' WHERE id=:env"),
                         {"env": self.environment})
         self.assertEqual(self.credentials.view(student, self.environment, ref.secret_id).value, b"confirmed-fixture")
+
+    def test_credential_read_serializes_with_last_assignment_revocation(self):
+        ref = self.secrets.create(b"concurrent-fixture", purpose="environment", environment_id=self.environment)
+        student, assignment = self.student()
+        self.remote_result(ref)
+        authorized = Event()
+        continue_read = Event()
+        writer_pid = Queue()
+        decrypt = self.secrets._decrypt
+
+        def pause_after_authorization(row):
+            authorized.set()
+            if not continue_read.wait(10):
+                raise RuntimeError("credential reader was not released")
+            return decrypt(row)
+
+        def revoke_in_independent_transaction():
+            # Use the production revocation lock order on an independent
+            # connection so the coordinator's write gate cannot mask a race.
+            with self.engine.begin() as tx:
+                writer_pid.put(tx.scalar(text("SELECT pg_backend_pid()")))
+                tx.execute(text("SELECT id FROM control_plane.courses WHERE id=:course FOR UPDATE"),
+                           {"course": self.course})
+                tx.execute(text("""UPDATE control_plane.environment_assignments
+                    SET revoked_at=clock_timestamp() WHERE id=:id"""), {"id": assignment})
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            with patch.object(self.secrets, "_decrypt", side_effect=pause_after_authorization):
+                reader = pool.submit(self.credentials.view, student, self.environment, ref.secret_id)
+                try:
+                    self.assertTrue(authorized.wait(5), "reader did not reach decryption")
+                    writer = pool.submit(revoke_in_independent_transaction)
+                    pid = writer_pid.get(timeout=5)
+                    deadline = monotonic() + 5
+                    with self.engine.connect() as observer:
+                        while not observer.scalar(text("SELECT cardinality(pg_blocking_pids(:pid)) > 0"),
+                                                  {"pid": pid}):
+                            self.assertFalse(writer.done(), "revocation committed before delivery")
+                            self.assertLess(monotonic(), deadline, "revocation did not wait for the course lock")
+                            sleep(.02)
+                finally:
+                    continue_read.set()
+                self.assertEqual(reader.result(5).value, b"concurrent-fixture")
+                writer.result(5)
+        with patch.object(self.secrets, "_decrypt", side_effect=AssertionError("revoked credential decrypted")):
+            with self.assertRaises(AuthorizationDenied):
+                self.credentials.view(student, self.environment, ref.secret_id)
 
     def test_management_credential_cannot_be_confirmed_or_viewed_even_by_owner(self):
         ref = self.secrets.create(b"fixture-management-connection")
@@ -221,6 +273,13 @@ class EnvironmentCredentialTests(ServicesFixture, unittest.TestCase):
                         session_id=sid, template_entry="entry", **extra)
 
         self.assertTrue(allowed(student, "input"))
+        replacement = self.secrets.rotate(ref.secret_id, b"terminal-rotated")
+        self.remote_result(replacement)
+        with self.lease.fenced_transaction() as uow:
+            self.assertFalse(is_ready_in(uow, self.environment, ref.to_dict()))
+            self.assertEqual(confirmed_session_ref_in(uow, self.environment, replacement.to_dict()),
+                             replacement.to_dict())
+        self.assertTrue(allowed(student, "output"))
         self.assertTrue(allowed(self.teacher, "observe"))
         self.assertFalse(allowed(peer, "output"))
         self.assertFalse(allowed(student, "takeover"))
@@ -238,3 +297,6 @@ class EnvironmentCredentialTests(ServicesFixture, unittest.TestCase):
         self.assertFalse(allowed(self.teacher, "output"))
         self.identities.assign(self.teacher, self.environment, student_id=student)
         self.assertFalse(allowed(student, "reconnect"))
+        self.secrets.revoke(ref)
+        with self.lease.fenced_transaction() as uow, self.assertRaises(AuthorizationDenied):
+            confirmed_session_ref_in(uow, self.environment, ref.to_dict(), pinned_version_id=ref.version_id)

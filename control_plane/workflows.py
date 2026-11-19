@@ -16,8 +16,9 @@ def _group_steps(steps):
     return grouped
 
 
-def _completed(rows):
-    return bool(rows) and all(s["state"] in ("succeeded", "skipped") for s in rows)
+def _completed(rows, *, allow_skipped=True):
+    accepted = {"succeeded", "skipped"} if allow_skipped else {"succeeded"}
+    return bool(rows) and all(s["state"] in accepted for s in rows)
 
 
 def _context(flow, grouped, item_key=None):
@@ -96,8 +97,9 @@ def verify_cleanup_evidence(uow, job, flow):
         raise ValueError("cleanup evidence changed after admission")
 
 
-def _requirements(requirements, context, grouped, slots):
-    if any(not _completed(grouped.get(key)) for key in requirements.get("require_steps", ())):
+def _requirements(requirements, context, grouped, slots, *, allow_skipped=True):
+    if any(not _completed(grouped.get(key), allow_skipped=allow_skipped)
+           for key in requirements.get("require_steps", ())):
         return False
     if not set(requirements.get("require_resources", ())).issubset(slots):
         return False
@@ -293,7 +295,8 @@ class TemplateWorkflow:
         elif kind == "cleanup":
             verify_cleanup_evidence(uow, job, flow)
             completion = flow["completion"]
-            success = bool(completion) and _requirements(completion, context, grouped, set())
+            # An empty expansion advances planning but proves no remote cleanup.
+            success = bool(completion) and _requirements(completion, context, grouped, set(), allow_skipped=False)
             if not flow["steps"]:
                 success = success and completion.get("no_external_cleanup_required") is True
             values["lifecycle"] = "deleted" if success else "delete_failed"

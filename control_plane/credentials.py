@@ -130,18 +130,21 @@ _CURRENT_VERSION = """
 """
 
 
-def confirmed_session_ref_in(uow, environment_id, declared_ref):
-    """Resolve a new connection within the explicit, remotely verified rotation chain."""
+def confirmed_session_ref_in(uow, environment_id, declared_ref, *, pinned_version_id=None):
+    """Resolve a new connection or validate a fixed version in the same confirmed chain."""
     if not isinstance(declared_ref, dict) or set(declared_ref) != {"secret_id", "version_id"}:
         raise AuthorizationDenied()
     version = uow.scalar(text(f"""
         SELECT now.version_id FROM control_plane.environment_credential_confirmations initial
         JOIN control_plane.environment_credential_confirmations now
           ON now.lineage_version_id=initial.lineage_version_id AND now.secret_id=initial.secret_id
+          AND now.environment_id=initial.environment_id
         JOIN control_plane.secret_versions v ON v.id=now.version_id
         WHERE initial.version_id=:version AND initial.environment_id=:env AND initial.secret_id=:secret
-          AND now.version_id=({_CURRENT_VERSION}) AND v.revoked_at IS NULL AND v.invalidated_at IS NULL
-    """), {"env": environment_id, "secret": declared_ref["secret_id"], "version": declared_ref["version_id"]})
+          AND now.version_id=COALESCE(CAST(:pinned AS uuid), ({_CURRENT_VERSION}))
+          AND v.revoked_at IS NULL AND v.invalidated_at IS NULL
+    """), {"env": environment_id, "secret": declared_ref["secret_id"], "version": declared_ref["version_id"],
+           "pinned": pinned_version_id})
     if version is None:
         raise AuthorizationDenied()
     return {"secret_id": declared_ref["secret_id"], "version_id": str(version)}
@@ -197,8 +200,13 @@ class CredentialService:
                 return False
             if action in {"session.input", "session.resize"} and str(row["controller_id"]) != str(actor_id):
                 return False
+            pinned_version = row["secret_version_id"]
+            if pinned_version is None:
+                return False
             try:
-                entry = resolve_session_entry_in(uow, self.registry, owner, environment_id, template_entry, resource_id)
+                entry = resolve_session_entry_in(
+                    uow, self.registry, owner, environment_id, template_entry, resource_id,
+                    pinned_version_id=None if action == "session.open" else pinned_version)
             except (AuthorizationDenied, ReferenceUnavailable, TemplateError, KeyError):
                 return False
             return (row["template_entry"] == template_entry and row["session_type"] == entry["session_type"]
@@ -213,8 +221,21 @@ class CredentialService:
         value = None
         data = {}
         with self.runtime.fenced_transaction() as uow:
+            # Membership, group and assignment changes take the course's write
+            # lock. Account changes and lifecycle transitions lock their own
+            # rows. Check the live paths in a fresh statement after any wait.
+            uow.execute(text("""
+                SELECT c.id FROM control_plane.courses c
+                JOIN control_plane.environments e ON e.course_id=c.id
+                WHERE e.id=:env FOR SHARE OF c
+            """), {"env": environment_id})
+            uow.execute(text("""
+                SELECT e.id FROM control_plane.environments e, control_plane.users u
+                WHERE e.id=:env AND u.id=:actor FOR SHARE OF e,u
+            """), {"env": environment_id, "actor": actor_id})
             if can_access_environment(uow, actor_id, environment_id, require_ready=True):
-                version = uow.scalar(text(_CURRENT_VERSION), {"env": environment_id, "secret": secret_id})
+                version = uow.scalar(text(_CURRENT_VERSION + " FOR SHARE OF v"),
+                                     {"env": environment_id, "secret": secret_id})
                 if version is not None:
                     try:
                         row = self.secrets._row(uow, SecretRef(str(secret_id), str(version)))

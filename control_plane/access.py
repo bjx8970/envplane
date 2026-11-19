@@ -8,7 +8,8 @@ from .plugins.sdk import AuthorizationDenied
 from .templates import load_version, resolve_access
 
 
-def resolve_session_entry_in(uow, registry, actor_id, environment_id, entry_key, resource_id=None, *, manage=False):
+def resolve_session_entry_in(uow, registry, actor_id, environment_id, entry_key, resource_id=None, *,
+                             manage=False, pinned_version_id=None):
     if not can_access_environment(uow, actor_id, environment_id, manage=manage):
         raise AuthorizationDenied()
     env = uow.execute(text("""
@@ -42,7 +43,7 @@ def resolve_session_entry_in(uow, registry, actor_id, environment_id, entry_key,
     identity, plugin_key = instance_binding(uow, entry['plugin_instance'])
     plugins = {entry['plugin_instance']: registry.get(plugin_key)}
     resolved = resolve_access(access, entry_key, context, role, plugins.__getitem__)
-    credential = confirmed_session_ref_in(uow, env.id, resolved['credential_ref'])
+    credential = confirmed_session_ref_in(uow, env.id, resolved['credential_ref'], pinned_version_id=pinned_version_id)
     return {**resolved, 'plugin_instance_id': identity, 'credential_ref': credential}
 
 

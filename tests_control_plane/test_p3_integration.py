@@ -208,6 +208,31 @@ class BusinessIntegrationTests(unittest.TestCase):
             WHERE owner_teacher_id=:teacher""", teacher=self.teacher)[0], 1)
         self.assertEqual(self.one("SELECT count(*) FROM control_plane.jobs")[0], 1)
 
+    def test_skipped_required_cleanup_does_not_retire_environment_or_release_quota(self):
+        definition = ssh_example()
+        cleanup_step = dict(definition["create"]["steps"][0], id="remove", for_each={
+            "items": [], "item_key": {"$ref": "item"}, "max_items": 2})
+        definition["cleanup"] = {"steps": [cleanup_step], "completion": {"require_steps": ["remove"]}}
+        _, version = self.services.templates.create_draft(self.admin, definition)
+        self.services.templates.publish(self.admin, version)
+        with self.endpoint():
+            creation, _ = self.create(template_version_id=version)
+            env = self.finish(creation)
+        self.assertEqual(self.one("""SELECT count(*) FROM control_plane.operations
+            WHERE job_id=:job AND state='succeeded' AND dispatch_intent_at IS NOT NULL""", job=creation), (1,))
+        cleanup, _ = self.business.cleanup(self.teacher, environment_id=env, request_key="skipped-cleanup")
+        self.finish(cleanup, expected="failed")
+        self.assertEqual(self.one("SELECT state FROM control_plane.job_steps WHERE job_id=:job", job=cleanup),
+                         ("skipped",))
+        self.assertEqual(self.one("SELECT count(*) FROM control_plane.operations WHERE job_id=:job", job=cleanup),
+                         (0,))
+        self.assertEqual(self.one("""SELECT e.lifecycle,e.deleted_at,q.state,
+                (SELECT count(*) FROM control_plane.conflict_protections
+                 WHERE scope_key=:scope AND released_at IS NULL)
+            FROM control_plane.environments e JOIN control_plane.quota_reservations q ON q.environment_id=e.id
+            WHERE e.id=:env""", env=env, scope="environment:" + str(env)),
+                         ("delete_failed", None, "quarantined", 1))
+
     def test_unknown_ssh_execution_keeps_quota_even_with_declared_empty_cleanup(self):
         with self.endpoint("disconnect"):
             job, _ = self.create()
