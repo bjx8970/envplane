@@ -82,17 +82,18 @@ _STUDENT_PATHS = """
 """
 
 
-def can_access_environment(uow, actor_id, environment_id, *, manage=False, roles=None):
+def can_access_environment(uow, actor_id, environment_id, *, manage=False, roles=None, require_ready=False):
     role = uow.scalar(text(f"""
         SELECT u.role FROM control_plane.users u, control_plane.environments e
         JOIN control_plane.courses c ON c.id=e.course_id
         WHERE u.id=:actor AND u.active AND u.deleted_at IS NULL AND e.id=:env
           AND e.deleted_at IS NULL AND e.lifecycle <> 'deleted' AND c.deleted_at IS NULL
+          AND (NOT :require_ready OR e.lifecycle='ready')
           AND (u.role='admin' OR (u.role='teacher' AND u.id=e.owner_teacher_id)
                OR (NOT :manage AND u.role='student' AND EXISTS
                    (SELECT FROM ({_STUDENT_PATHS}) p
                     WHERE p.student_id=u.id AND p.environment_id=e.id)))
-    """), {"actor": actor_id, "env": environment_id, "manage": manage})
+    """), {"actor": actor_id, "env": environment_id, "manage": manage, "require_ready": require_ready})
     return role is not None and (roles is None or (
         isinstance(roles, (tuple, list, set, frozenset)) and role in roles))
 

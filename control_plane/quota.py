@@ -76,5 +76,5 @@ def finish_quota(uow, environment_id, *, disposition):
         UPDATE control_plane.quota_reservations SET state=:state,updated_at=clock_timestamp(),
           released_at=CASE WHEN :state='released' THEN clock_timestamp() ELSE NULL END
         WHERE environment_id=:environment AND state <> 'released' AND state <> :state
-          AND (:state <> 'allocated' OR state='reserved')
+          AND (:state <> 'allocated' OR state IN ('reserved','quarantined'))
     """), {"environment": environment_id, "state": disposition})

@@ -136,9 +136,12 @@ class AdmissionTests(TestCase):
             def execute(self, call, ctx):
                 if call.resolved_input.get("install"):
                     ref = ctx.secrets.derive("login")
+                    cleanup_ref = ctx.secrets.derive("cleanup")
+                    ctx.report_external_ref("target", {"credential": ref.to_dict()})
+                    ctx.report_checkpoint("installed", {"credential": cleanup_ref.to_dict()})
                     return ExecutionResult("succeeded", output={"credential": ref.to_dict()})
-                if call.secret_refs:
-                    with ctx.secrets.get(call.secret_refs[0]) as handle:
+                for ref in call.secret_refs:
+                    with ctx.secrets.get(ref) as handle:
                         if not handle.reveal():
                             raise RuntimeError("missing environment credential")
                 return ExecutionResult("succeeded", output={"completed": True})
@@ -177,13 +180,19 @@ class AdmissionTests(TestCase):
                     "steps": [step("use", {"secret_refs": [ref]}, instance)]}
 
         env_action = action(created_ref)
+        cleanup_step = step("use", {"secret_refs": [
+            {"$ref": "item.external_refs.target.reference.credential"},
+            {"$ref": "item.checkpoints.installed.reference.credential"}]})
+        cleanup_step["for_each"] = {
+            "items": {"$ref": "evidence.unexpanded.install.operations"},
+            "item_key": {"$ref": "item.operation_id"}, "max_items": 1}
         definition = {"schema_version": 1, "metadata": {"name": "credential"}, "parameters": {},
                       "quota": self.cost, "create": {"steps": [step("install", {"install": True})]},
                       "actions": {"use": env_action, "other": action(created_ref, "other")},
                       "resources": [{"key": "entry", "name": "entry", "type_label": "example",
                                      "data": {"credential": {"$ref": "steps.install.output.credential"}},
                                      "actions": {"use": action(resource_ref)}}],
-                      "access": {}, "cleanup": {"steps": env_action["steps"], "completion": {"require_steps": ["use"]}},
+                      "access": {}, "cleanup": {"steps": [cleanup_step], "completion": {"require_steps": ["use"]}},
                       "readiness": {"require_steps": ["install"]}}
         _, version = services.templates.create_draft(self.admin, definition)
         services.templates.publish(self.admin, version)
@@ -196,7 +205,7 @@ class AdmissionTests(TestCase):
             source = uow.execute(text("""
                 SELECT v.secret_id,v.id AS version_id,g.source_operation_id AS operation_id
                 FROM control_plane.job_secret_refs g JOIN control_plane.secret_versions v ON v.id=g.secret_version_id
-                WHERE g.job_id=:job AND g.derived
+                WHERE g.job_id=:job AND g.derived AND g.source_evidence_id IS NULL
             """), {"job": job}).one()
             self.assertEqual(uow.scalar(text("""
                 SELECT count(*) FROM control_plane.environment_credential_confirmations WHERE environment_id=:env
@@ -220,7 +229,13 @@ class AdmissionTests(TestCase):
                 services.secrets.bind(action_job, ids["issuer"], env).resolve({"secret_id": str(source.secret_id)})
         cleanup, _ = self.business.cleanup(self.teacher, environment_id=env, request_key="cleanup-derived")
         pin = settled(cleanup).execution_snapshot["plugins"][str(ids["issuer"])]
-        self.assertEqual(pin["template_credentials"][0]["source_job_id"], str(job))
+        proofs = pin["template_credentials"]
+        self.assertEqual(len(pin["secret_refs"]), 2)
+        self.assertEqual(len(proofs), 2)
+        self.assertTrue(all(proof["source_job_id"] == str(job) for proof in proofs))
+        checkpoint_proof, = (proof for proof in proofs if "source_evidence_id" in proof)
+        self.assertTrue(checkpoint_proof["path"].startswith("evidence.unexpanded.install.operations/0/"))
+        self.assertEqual(checkpoint_proof["source_operation_id"], str(source.operation_id))
 
     def test_credential_inheritance_inspects_only_the_selected_stored_value(self):
         from control_plane.business import _template_credentials

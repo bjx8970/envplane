@@ -38,16 +38,18 @@ def _context(flow, grouped, item_key=None):
     context = {key: flow[key] for key in ("params", "action_params", "environment", "resource", "evidence")
                if flow.get(key) is not None}
     if context.get("evidence"):
-        evidence = context["evidence"]
-        # Keep the durable empty item key. Project its operation array into a
-        # separate namespace so a real expanded item can use any stable name.
-        # References share the frozen facts, including for previously queued jobs.
-        context["evidence"] = {**evidence, "unexpanded": {
-            path: instances.get("", {"operations": []})
-            for path, instances in evidence.get("steps", {}).items()
-        }}
+        context["evidence"] = cleanup_evidence_context(context["evidence"])
     context["steps"] = outputs
     return context
+
+
+def cleanup_evidence_context(evidence):
+    # Preserve the frozen shape and expose ordinary attempts without colliding
+    # with any expanded item key, including for previously queued jobs.
+    return {**evidence, "unexpanded": {
+        path: instances.get("", {"operations": []})
+        for path, instances in evidence.get("steps", {}).items()
+    }}
 
 
 def _step_refs(value):
@@ -356,7 +358,7 @@ def record_interruption(uow, job, *, blocked, cancelled=False):
         WHERE j.environment_id=:env AND (:creation OR j.execution_group_id=:group)
           AND o.dispatch_intent_at IS NOT NULL
     """), {**values, "creation": kind == "create"}).one()
-    release_creation = kind == "create" and not blocked and not effects.dispatched
+    release_creation = kind == "create" and not effects.dispatched
     release_scope = release_creation or (kind == "action" and not effects.dispatched)
     if kind in ("create", "cleanup"):
         values["state"] = "blocked" if blocked else {"create": "create_failed", "cleanup": "delete_failed"}[kind]

@@ -31,7 +31,7 @@ P3 已提供模板发布、参数校验与环境工作流的 Python 服务入口
 | cleanup | 教师/管理员显式触发的删除清理流程 |
 | readiness | 创建就绪条件 |
 | access | 环境交互入口映射，没有入口时填写空对象 |
-| revocation_action | 可选。撤权后调度的环境动作 key，角色限定为教师或管理员，所需参数须能从模板本身获得 |
+| revocation_action | 可选。撤权后调度的环境动作 key，须同时允许教师和管理员，所需参数须能从模板本身获得 |
 
 resources 中每项可声明 key、for_each、name、type_label、data、display、actions、access。平台生成 resource_id，教师不能传入底层插件调用配置替换它。
 

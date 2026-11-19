@@ -141,6 +141,40 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(c.scalar(text("SELECT count(*) FROM control_plane.operation_call_attempts")), 0)
             self.assertEqual(c.scalar(text("SELECT state FROM control_plane.quota_reservations")), "released")
 
+    def test_creation_blocked_before_dispatch_releases_its_reservation_and_scope(self):
+        self.start([action("first")])
+        op = self.prepare(self.expand()[0])
+        self.allowed = False
+        with self.assertRaises(AuthorizationDenied):
+            self.repo.begin_call(self.lease, op["id"], "execute", 10)
+        self.repo.block_job(self.lease, "dispatch_denied")
+        with self.engine.connect() as c:
+            self.assertEqual(c.scalar(text("SELECT count(*) FROM control_plane.operation_call_attempts")), 0)
+            self.assertEqual(c.scalar(text("SELECT state FROM control_plane.operations")), "cancelled")
+            self.assertEqual(c.scalar(text("SELECT state FROM control_plane.jobs")), "blocked")
+            self.assertEqual(c.scalar(text("SELECT state FROM control_plane.quota_reservations")), "released")
+            self.assertEqual(c.scalar(text("SELECT state FROM control_plane.execution_groups")), "released")
+
+    def test_replayed_creation_success_restores_quarantined_reservation(self):
+        self.start([action("first")])
+        op = self.prepare(self.expand()[0])
+        call = self.repo.begin_call(self.lease, op["id"], "execute", 20)
+        self.repo.record_result(self.lease, call.id, ExecutionResult("unknown"),
+                                projector=self.workflow, applicator=self.workflow)
+        evidence = self.repo.append_evidence(call.id, "late_result", "confirmed", {
+            "outcome": "succeeded", "output": {"confirmed": True}})
+        with self.engine.begin() as c:
+            self.assertEqual(c.scalar(text("SELECT state FROM control_plane.quota_reservations")), "quarantined")
+            c.execute(text("UPDATE control_plane.jobs SET lease_expires_at=clock_timestamp()-interval '1 second'"))
+        lease = self.repo.takeover_blocked(self.job, "recovery", expected_revision=self.lease.group_revision,
+                                          evidence_id=evidence, actor_id=self.actor, reason="verified success")
+        self.assertEqual(self.repo.replay_result(lease, evidence, projector=self.workflow, applicator=self.workflow),
+                         "applied")
+        with self.engine.connect() as c:
+            self.assertEqual(c.scalar(text("SELECT lifecycle FROM control_plane.environments")), "ready")
+            self.assertEqual(c.scalar(text("SELECT state FROM control_plane.quota_reservations")), "allocated")
+            self.assertEqual(c.scalar(text("SELECT count(*) FROM control_plane.operation_call_attempts")), 1)
+
     def test_resource_tied_only_to_later_step_identifies_that_operation(self):
         self.start([action("a"), action("b", depends_on=["a"])], [{
             "key": "report", "name": "report", "type_label": "result",

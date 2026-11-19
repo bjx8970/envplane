@@ -547,8 +547,8 @@ def validate_template(definition, lookup):
     if 'revocation_action' in definition:
         key = _name(definition['revocation_action'])
         action = definition['actions'].get(key)
-        _check(action and set(action['roles']) <= {'admin', 'teacher'},
-               'revocation must use an administrative environment action')
+        _check(action and set(action['roles']) == {'admin', 'teacher'},
+               'revocation action must allow both admin and teacher')
         # Automatic dispatch submits an empty parameter object. Check every
         # consumed path against exactly the values available on that path.
         defaults = {name: spec.get('fixed', spec.get('default'))

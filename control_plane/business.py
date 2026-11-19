@@ -10,6 +10,7 @@ from .persistence import RequestConflict, admit_job
 from .plugins.sdk import AuthorizationDenied, ReferenceUnavailable, canonical_json, json_digest
 from .quota import check_available, reserve, set_limits
 from .templates import TemplateError, load_version, quota_cost, validate_parameters
+from .workflows import cleanup_evidence_context
 
 
 def instance_binding(uow, alias):
@@ -153,10 +154,11 @@ def _input_refs(expression, tail=()):
             yield from _input_refs(child)
 
 
-def _template_credentials(steps, instances, environment, resource):
+def _template_credentials(steps, instances, environment, resource, evidence=None):
     """Read the template-selected parts of fixed products; data is never evaluated as a template."""
     products = {("environment", "create_results"): environment["create_results"],
-                ("resource", "data"): resource["data"] if resource else None}
+                ("resource", "data"): resource["data"] if resource else None,
+                ("evidence",): cleanup_evidence_context(evidence) if evidence else None}
     requests, inspected = {}, set()
     # The same fixed collection may appear in many step inputs or expanded items.
     budget = 1_048_576
@@ -419,7 +421,8 @@ class BusinessService:
             """), {"env": environment})
         environment_context = {"id": str(environment), "name": request["name"] if kind == "create" else env.name,
                                "create_results": {} if kind == "create" else env.create_results}
-        inherited = {} if kind == "create" else _template_credentials(flow["steps"], instances, environment_context, resource)
+        inherited = {} if kind == "create" else _template_credentials(
+            flow["steps"], instances, environment_context, resource, evidence)
         captures = {}
         for instance_id in sorted(set(instances.values())):
             self.capacity.check_admission(instance_id)

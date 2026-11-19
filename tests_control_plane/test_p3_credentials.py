@@ -15,6 +15,8 @@ class EnvironmentCredentialTests(ServicesFixture, unittest.TestCase):
         self.credentials = CredentialService(self.lease, self.secrets)
         self.identities = IdentityService(self.lease)
         with self.lease.fenced_transaction() as uow:
+            uow.execute(text("UPDATE control_plane.environments SET lifecycle='ready' WHERE id=:id"),
+                        {"id": self.environment})
             self.course = uow.scalar(text("SELECT course_id FROM control_plane.environments WHERE id=:id"),
                                      {"id": self.environment})
 
@@ -56,6 +58,22 @@ class EnvironmentCredentialTests(ServicesFixture, unittest.TestCase):
             self.assertEqual([e.result for e in events], ["denied", "delivered", "denied"])
             self.assertNotIn("known-secret-fixture", str(events))
             self.assertFalse(is_ready_in(uow, self.environment, ref.to_dict()))
+
+    def test_confirmed_credential_remains_hidden_outside_ready_lifecycle(self):
+        ref = self.secrets.create(b"confirmed-fixture", purpose="environment", environment_id=self.environment)
+        student, _ = self.student()
+        self.remote_result(ref)
+        for state in ("creating", "create_failed", "blocked", "deleting", "delete_failed"):
+            with self.subTest(lifecycle=state):
+                with self.lease.fenced_transaction() as uow:
+                    uow.execute(text("UPDATE control_plane.environments SET lifecycle=:state WHERE id=:env"),
+                                {"state": state, "env": self.environment})
+                with self.assertRaises(AuthorizationDenied):
+                    self.credentials.view(student, self.environment, ref.secret_id)
+        with self.lease.fenced_transaction() as uow:
+            uow.execute(text("UPDATE control_plane.environments SET lifecycle='ready' WHERE id=:env"),
+                        {"env": self.environment})
+        self.assertEqual(self.credentials.view(student, self.environment, ref.secret_id).value, b"confirmed-fixture")
 
     def test_management_credential_cannot_be_confirmed_or_viewed_even_by_owner(self):
         ref = self.secrets.create(b"fixture-management-connection")

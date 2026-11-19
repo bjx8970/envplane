@@ -213,7 +213,7 @@ class CredentialService:
         value = None
         data = {}
         with self.runtime.fenced_transaction() as uow:
-            if can_access_environment(uow, actor_id, environment_id):
+            if can_access_environment(uow, actor_id, environment_id, require_ready=True):
                 version = uow.scalar(text(_CURRENT_VERSION), {"env": environment_id, "secret": secret_id})
                 if version is not None:
                     try:

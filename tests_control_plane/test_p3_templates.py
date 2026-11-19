@@ -101,10 +101,16 @@ class TemplateContractTests(unittest.TestCase):
     def test_revocation_resolves_referenced_optional_parameters_without_caller_input(self):
         template = example()
         step = deepcopy(template['create']['steps'][0])
-        action = {'label': 'Revoke', 'roles': ['teacher'], 'steps': [step],
+        action = {'label': 'Revoke', 'roles': ['teacher', 'admin'], 'steps': [step],
                   'parameters': {'optional': {'type': 'object'}, 'unused': {'type': 'string'}}}
         template['actions']['revoke'] = action
         template['revocation_action'] = 'revoke'
+        for roles in (['admin'], ['teacher'], ['admin', 'teacher', 'student']):
+            with self.subTest(roles=roles):
+                action['roles'] = roles
+                with self.assertRaisesRegex(TemplateError, 'must allow both admin and teacher'):
+                    validate_template(template, self.lookup)
+        action['roles'] = ['admin', 'teacher']
         ref = {'$ref': 'action_params.optional.host'}
         for location in ('input', 'for_each', 'state_mapping'):
             with self.subTest(location=location):
