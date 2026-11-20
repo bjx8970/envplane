@@ -4,15 +4,15 @@
 
 ## 项目状态
 
-**新控制面已接入 P3 服务层。管理员可发布模板，教师可按课程创建和分配环境，获授权学生可运行模板动作。P2 执行器使用固定快照，教师配额、Job 与环境在同一 PostgreSQL 事务提交。HTTP、模板驱动 UI 与浏览器 WebSSH 属于 P5；现有 Flask/Jinja 入口仍运行旧业务。**
+**新控制面已接入 P5 HTTP API、模板驱动界面和 WebSSH。管理员发布模板，教师创建及分配环境，学生按实时授权运行模板动作、查看环境凭据并使用终端。环境创建沿用 P3 的配额事务，插件调用和会话建立沿用 P2 的持久化执行边界。浏览器验收环境与实测范围见 [P5 验收记录](tests_control_plane/browser/P5_ACCEPTANCE.md)。**
 
-当前代码仍是 Flask/Jinja 单体，直接调用 PVE、OpenWrt，使用进程内任务队列和旧 `clusters`、`vms` 等模型。目标是彻底重建运行结构，不要求旧 API、旧表或旧页面兼容；本文不提供旧系统到新系统的迁移承诺，也不授权清空真实数据库或外部资源。
+旧 Flask/Jinja 单体仍保留独立入口，直接调用 PVE、OpenWrt，使用进程内任务队列和旧 `clusters`、`vms` 等模型。部署切换须满足架构中的退役前置条件。
 
 ## 目标与角色
 
 | 角色 | 职责 |
 | --- | --- |
-| 管理员 | 管理用户、插件配置、模板、全部实验环境与资源、教师配额；插件 Web 管理为后续能力 |
+| 管理员 | 管理用户、已加载插件的实例配置、模板、实验环境及资源、教师配额 |
 | 教师 | 创建课程、小组和平台学生账号；选择已发布模板创建环境；在同一课程内分配给多个组和/或学生；管理自己的环境，旁观和接管学生 WebSSH |
 | 学生 | 管理本人允许修改的信息；仅访问直接分配或通过组分配获得的环境，执行模板向学生开放的动作，查看授权环境凭据和使用 WebSSH |
 
@@ -61,7 +61,7 @@
 | [执行与持久化规范](docs/execution-persistence-contract.md) | PostgreSQL 队列、原子性、Operation、部分引用、阻断互斥、恢复和配额 |
 | [身份、授权与安全规范](docs/identity-security-contract.md) | 学生唯一管理、课程分组、环境分配、密码展示、WebSSH 撤权和审计 |
 
-规范使用“必须/禁止”表示目标实现的验收约束，“建议”表示可调整实现选择。示例仅定义契约形状，不是当前可调用的接口或已实现配置文件。详细字段以各专题文档为准；不把尚未选择的 UI 框架、调度器或供应商行为当作既定要求。
+规范使用“必须/禁止”表示目标实现的验收约束，“建议”表示可调整实现选择。示例各自说明适用的契约形状。实现入口和实测范围见本 README 与对应验收记录，详细字段以各专题规范为准。
 
 ## 当前代码位置
 
@@ -76,7 +76,10 @@
 | `modules/authz.py` / `modules/security_service.py` | 旧系统的授权策略及服务边界检查 |
 | `modules/audit.py` / `modules/credential_store.py` | 旧审计脱敏和 Fernet 凭据处理 |
 | `templates/` / `static/` | 当前 Jinja 页面和静态资源，不是实验环境模板 |
-| `tests/` | 旧系统 unittest 测试，不能直接证明新规范已实现 |
+| `tests/` | 旧系统 unittest 测试 |
+| `control_plane/web/` | Starlette HTTP、浏览器界面和 WebSocket 适配 |
+| `control_plane/session_jobs.py` / `plugins/ssh_terminal/` | 会话建立 Job 与环境账户的 SSH PTY |
+| `tests_control_plane/browser/` | Chrome 闭环脚本、测试模板和验收记录 |
 
 当前数据库连接代码仅创建 PostgreSQL 引擎；测试中使用临时 SQLite 不表示支持 SQLite 部署。旧文档所述“默认 SQLite、在线切换数据库”不适用于当前代码。
 
@@ -123,7 +126,7 @@ P2 向 P3 提供插件能力、持久化执行、恢复与结果应用接口。�
 
 ## P3 服务层入口
 
-显式配置部署并启动控制面后，`PluginServices` 提供以下业务服务。服务调用的 `actor_id` 由可信调用方提供，后续 HTTP 适配器需要从已认证会话取得它。
+显式配置部署并启动控制面后，`PluginServices` 提供以下业务服务。Python 服务调用的 `actor_id` 由可信调用方提供。HTTP 适配器从已认证会话读取该身份。
 
 | 服务 | 用途 |
 | --- | --- |
@@ -138,9 +141,21 @@ P2 向 P3 提供插件能力、持久化执行、恢复与结果应用接口。�
 
 可从 [SSH 示例模板](docs/template-resource-contract.md) 和 [服务入口集成测试](tests_control_plane/test_p3_integration.py) 核对一次完整调用。
 
+## P5 HTTP、界面与 WebSSH
+
+沿用专用 PostgreSQL、低权限运行角色、部署插件配置和加密 keyring。空的控制面账号表可使用 `python -m control_plane bootstrap-admin 用户名` 初始化第一位管理员，命令在终端读取并确认密码。
+
+设置 `CONTROL_PLANE_HTTP_ORIGIN` 为浏览器访问的完整 origin，例如 `https://lab.example.com`，再运行 `python -m control_plane start`。HTTP、WebSocket、执行器和恢复扫描同进程启动。监听地址为回环，`CONTROL_PLANE_HTTP_PORT` 默认 8000。部署代理负责 HTTPS，并保留公开的 `Host`、`Origin` 和 WebSocket Upgrade。配置一个同源地址，路径、通配符和尾斜杠均不属于 origin。省略 HTTP origin 时可启动仅服务层的控制面。
+
+浏览器会话使用 HttpOnly、SameSite=Strict Cookie，HTTPS origin 启用 Secure。会话在控制面重启时失效。修改请求要求精确 Origin、JSON 和 `X-CSRF-Token`，其中登录前的 token 来自 `GET /api/session`。环境创建、动作、清理及终端建立返回 202 和 Job 状态地址，冲突返回 409，容量拒绝返回 503。Job 日志公开平台执行事件代码和时间。
+
+`plugins/ssh_terminal/` 提供独立的环境 SSH 会话能力。发布模板时在 `access` 指定该实例、允许角色、已确认目标和环境凭据引用。该 SSH 能力使用目标 IP、端口、用户名及固定 host key，并验证远端 host key 后使用已确认版本的环境密码进行认证。终端建立固定插件配置、连接目标和凭据版本。环境的创建流程负责设置并确认远端凭据。教师旁观或接管属于自己管理的环境。平台通道状态与远端撤权结果分别展示。
+
 ## 当前测试与验证
 
-2026-11-18 P3 实测使用 Python 3.12、一次性 PostgreSQL 17 和回环 SSH，运行 `python -B scripts/run_ci_tests.py`。416 项通过，0 跳过。套件覆盖最小权限升级、模板发布、配额并发、授权撤销、持久展开、清理证据和凭据轮换。HTTP/浏览器验证由 P5 跟踪。
+2026-11-20 P5 实测通过严格控制面套件 442 项，0 跳过。Chrome 完成发布、创建与分配、学生操作、回环 WebSSH、教师接管及显式清理。环境与复现步骤见 [P5 验收记录](tests_control_plane/browser/P5_ACCEPTANCE.md)。
+
+2026-11-18 P3 实测使用 Python 3.12、一次性 PostgreSQL 17 和回环 SSH，运行 `python -B scripts/run_ci_tests.py`。416 项通过，0 跳过。套件覆盖最小权限升级、模板发布、配额并发、授权撤销、持久展开、清理证据和凭据轮换。P5 实测见独立的浏览器验收记录。
 
 新控制面的严格测试入口（Linux/默认 WSL）：
 
@@ -148,7 +163,7 @@ P2 向 P3 提供插件能力、持久化执行、恢复与结果应用接口。�
 bash scripts/run_p1_tests.sh
 ```
 
-脚本在项目 `tmp/p1-venv` 安装最小依赖，创建仅回环开放、密码认证的一次性 PostgreSQL 17，退出时清理自身容器。CI 默认只发现 `tests_control_plane/`，拒绝 skip、零测试、未运行完或失败；不把新控制面通过解释为旧系统通过。`scripts/run_ci_tests.py --legacy` 才额外发现旧套件，并要求事先安装其依赖。
+脚本默认在项目 `tmp/p1-venv` 安装最小依赖，使用本地 Podman 或 Docker 创建仅回环开放、密码认证的一次性 PostgreSQL 17，退出时清理自身容器。CI 默认只发现 `tests_control_plane/`，拒绝 skip、零测试、未运行完或失败；不把新控制面通过解释为旧系统通过。`scripts/run_ci_tests.py --legacy` 才额外发现旧套件，并要求事先安装其依赖。
 
 P0 原始冻结文件及通过记录对应 `352437b`；P1 对空库拒启和显式迁移的演进见 `tests_control_plane/P0_ACCEPTANCE.md`，不重写历史冻结哈希。
 
@@ -161,7 +176,7 @@ P0 原始冻结文件及通过记录对应 `352437b`；P1 对空库拒启和显�
 
 2026-11-15 P2 实测：默认 WSL `RHEL-10.2`、项目隔离 Python 3.12、Podman 一次性 PostgreSQL 17，同一严格入口执行 `bash scripts/run_p1_tests.sh`，352 项全部通过，0 失败、0 错误、0 跳过（107.645 秒），测试容器由脚本退出清理。新增 P2 覆盖：迁移增量与旧 P1 数据升级前置拒绝、执行状态图与终态保护、claim/heartbeat/token/组 revision 双重 fencing、prepare 原子性与预算不刷新、派发意图与 call 来源先提交、同步/晚到证据去重与 `trusted_for_derivation` 边界、结果原子应用与本地重放、两恢复者 CAS、取消与真实成功竞态、未知/超时不重发、容量超期不返 slot 与饱和拒新、会话单控制者/接管/背压/撤权重启语义、Storage 快照与 CAS、Secrets 的实例级授权/轮换/吊销/派生幂等、准入同事务去重与回滚，以及最小 SSH 插件对隔离回环 Paramiko 服务的真实握手、严格 host key、命令与预算验证。
 
-首轮该套件曾以 342 通过 / 10 失败运行，10 个失败同源于受控 Unit of Work 结果缺少 `.mappings()` 读取能力；已在 `coordination.py` 补齐只读映射包装（不暴露连接句柄）后全绿，并非放宽断言。未运行旧 Flask 套件、真实 PVE/OpenWrt/SSH 设备、生产迁移、浏览器端到端或真实业务授权/配额流程；HTTP 202/409/503、模板 UI 与 WebSSH 入口属后续阶段。本地通过不代替托管 CI 或人工复审。
+P2 首轮的 10 个失败同源于受控 Unit of Work 结果缺少 `.mappings()`。补齐只读映射包装后通过全套断言。该历史结果的范围为 P2。
 
 旧系统的规范发现入口为：
 
@@ -169,8 +184,8 @@ P0 原始冻结文件及通过记录对应 `352437b`；P1 对空库拒启和显�
 python -B -m unittest discover -s tests -t .
 ```
 
-旧测试使用 unittest、模拟供应商和临时数据库。新控制面现有 Alembic 迁移、独立严格 CI、P2 执行内核与 P3 业务服务层，业务模板 UI 和 HTTP 入口留待 P5；旧测试不证明这些目标已实现。历史通过次数也不作为当前回归结果，不证明真实 PVE/OpenWrt/SSH 设备或浏览器端到端验收已经完成。
+旧测试使用 unittest、模拟供应商和临时数据库。新控制面的验证范围由独立严格套件与浏览器验收记录说明。
 
 新旧部署按[架构中的退役前置条件](docs/architecture.md#91-旧部署退役与硬切换前置条件)硬切换：先确认旧外部对象、未决任务、责任人和管理通道，验证旧库、凭据密文及独立密钥的备份恢复路径；新旧系统不得无协调同时修改同一对象。不要求自动迁移或兼容，不等于授权销毁真实资源、旧库、唯一管理凭据或故障证据。
 
-本轮文档更新不执行旧凭据迁移、真实资源清理或生产部署。真实连接配置、会话密钥、凭据密文与加密密钥均不可提交到仓库。
+真实连接配置、会话密钥、凭据密文与加密密钥均不可提交到仓库。

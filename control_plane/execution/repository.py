@@ -176,6 +176,7 @@ class Repository:
                   lease_token=:token,lease_expires_at=clock_timestamp()+(:seconds*interval '1 second'),
                   heartbeat_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=:job
             """), {"job": row.id, "owner": owner, "token": token, "seconds": lease_seconds})
+            self._log_in(uow, row.id, "claimed")
             return self._lease(_dict(row), owner, token, revision)
 
     def heartbeat(self, lease, lease_seconds=30):
@@ -362,6 +363,7 @@ class Repository:
             if method == "cancel":
                 uow.execute(text("UPDATE control_plane.operations SET cancel_requested_at=COALESCE(cancel_requested_at,clock_timestamp()),cancellation_result='requested' WHERE id=:op"), {"op": operation_id})
             self._guard(uow, lease)
+            self._log_in(uow, lease.job_id, "dispatch_" + method)
             attempt = CallAttempt(call_id, operation_id, method, deadline, lease.owner, lease.token, owner, revision)
         return attempt
 
@@ -506,6 +508,7 @@ class Repository:
                     if self.source_publisher is not None:
                         self.source_publisher(uow, lease.job_id, op["plugin_instance_id"], op["id"])
                     applicator.apply(uow, op, projection)
+                self._log_in(uow, lease.job_id, "result_" + result.outcome)
                 self._guard(uow, lease, terminal=True)
             return "applied"
         except JobLeaseLost:
@@ -598,14 +601,38 @@ class Repository:
                 ORDER BY e.created_at DESC,e.id DESC LIMIT 1
             """), {"op": operation_id, "job": lease.job_id})
 
-    def request_cancel(self, job_id):
-        """Core caller must authorize this request before invoking the repository."""
+    @staticmethod
+    def _log_in(uow, job_id, code):
+        # The caller holds the Job lock. Append only platform-defined event
+        # codes, so this public history never includes provider output.
+        uow.execute(text("""
+            INSERT INTO control_plane.job_logs(job_id,sequence,data)
+            SELECT :job,COALESCE(MAX(sequence),-1)+1,jsonb_build_object('code',CAST(:code AS text))
+            FROM control_plane.job_logs WHERE job_id=:job
+        """), {"job": job_id, "code": code})
+
+    def request_cancel(self, job_id, *, actor_id=None):
+        """Authorize browser cancellation in its write transaction."""
         with self.runtime.fenced_transaction() as uow:
-            return uow.scalar(text("""
+            if actor_id is not None:
+                from ..identity import can_read_environment_status
+                from ..plugins.sdk import AuthorizationDenied
+                row = uow.execute(text("""
+                    SELECT * FROM control_plane.jobs WHERE id=:job AND actor_id=:actor FOR UPDATE
+                """), {"job": job_id, "actor": actor_id}).mappings().first()
+                if row is None or not can_read_environment_status(uow, actor_id, row["environment_id"]):
+                    raise AuthorizationDenied()
+                if row["state"] == "blocked":
+                    raise ExecutionConflict("blocked Job requires reconciliation")
+                self._authorize(uow, row)
+            result = uow.scalar(text("""
                 UPDATE control_plane.jobs SET cancel_requested_at=COALESCE(cancel_requested_at,clock_timestamp()),
                   state=CASE WHEN state='running' THEN 'cancel_requested' ELSE state END,
                   updated_at=clock_timestamp() WHERE id=:job AND state IN ('queued','running','cancel_requested','blocked') RETURNING id
             """), {"job": job_id})
+            if result is not None:
+                self._log_in(uow, result, "cancel_requested")
+            return result
 
     def record_cancel(self, lease, call_id, result):
         raw = {"cancellation_result": result.status,

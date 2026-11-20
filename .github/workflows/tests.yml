@@ -40,9 +40,85 @@ jobs:
           python -m pip install --disable-pip-version-check
           sqlalchemy==2.0.49 pg8000==1.31.5 alembic==1.17.2
           jsonschema==4.25.1 PyYAML==6.0.3 cryptography==48.0.0 paramiko==5.0.0
+          starlette==0.52.1 uvicorn==0.41.0 websockets==16.0 httpx==0.28.1
       - name: Run all new control-plane tests without skips
         env:
           CONTROL_PLANE_TEST_DATABASE_URL: postgresql+pg8000://postgres:disposable-ci-only@127.0.0.1:${{ job.services.postgres.ports[5432] }}/control_plane_test_ci
           CONTROL_PLANE_REQUIRE_TEST_DATABASE: "1"
           PYTHONDONTWRITEBYTECODE: "1"
         run: python -B scripts/run_ci_tests.py
+
+  browser-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: disposable-ci-only
+          POSTGRES_DB: control_plane_test_browser
+        ports:
+          - "127.0.0.1::5432"
+        options: >-
+          --health-cmd "pg_isready -U postgres -d control_plane_test_browser"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install browser fixture dependencies
+        run: >-
+          python -m pip install --disable-pip-version-check
+          sqlalchemy==2.0.49 pg8000==1.31.5 alembic==1.17.2
+          jsonschema==4.25.1 PyYAML==6.0.3 cryptography==48.0.0 paramiko==5.0.0
+          starlette==0.52.1 uvicorn==0.41.0 websockets==16.0
+      - name: Install Playwright and Chromium
+        shell: bash
+        run: |
+          npm install --prefix "$RUNNER_TEMP/p5-playwright" --no-audit --no-fund playwright-core@1.60.0
+          node "$RUNNER_TEMP/p5-playwright/node_modules/playwright-core/cli.js" install --with-deps --only-shell chromium
+      - name: Run P5 browser acceptance
+        shell: bash
+        env:
+          CONTROL_PLANE_TEST_DATABASE_URL: postgresql+pg8000://postgres:disposable-ci-only@127.0.0.1:${{ job.services.postgres.ports[5432] }}/control_plane_test_browser
+          CONTROL_PLANE_REQUIRE_TEST_DATABASE: "1"
+          PYTHONDONTWRITEBYTECODE: "1"
+          P5_BROWSER_ORIGIN: http://127.0.0.1:18742
+          P5_BROWSER_FIXTURE_PATH: ${{ runner.temp }}/p5-browser-fixture.json
+        run: |
+          fixture_log="$RUNNER_TEMP/p5-browser-fixture.log"
+          python -B -c 'from tests_control_plane.p5_fixture import browser_server; browser_server()' >"$fixture_log" 2>&1 &
+          fixture_pid=$!
+          cleanup() {
+            local status=$?
+            kill -TERM "$fixture_pid" 2>/dev/null || true
+            wait "$fixture_pid" || true
+            if (( status != 0 )); then cat "$fixture_log"; fi
+          }
+          trap cleanup EXIT
+
+          ready=0
+          for ((attempt=0; attempt<100; attempt++)); do
+            if ! kill -0 "$fixture_pid" 2>/dev/null; then break; fi
+            if [[ -s "$P5_BROWSER_FIXTURE_PATH" ]] &&
+                curl --fail --silent --max-time 1 "$P5_BROWSER_ORIGIN/health/ready" >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 0.2
+          done
+          if (( ready == 0 )); then
+            printf '%s\n' 'The disposable browser fixture did not become ready.' >&2
+            exit 1
+          fi
+
+          node tests_control_plane/browser/p5_acceptance.cjs "$P5_BROWSER_ORIGIN" \
+            "$P5_BROWSER_FIXTURE_PATH" "" "$RUNNER_TEMP/p5-playwright/node_modules/playwright-core"

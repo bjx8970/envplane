@@ -7,6 +7,7 @@ available, but is not represented as a functioning business execution service.
 from __future__ import annotations
 
 from dataclasses import asdict
+from functools import partial
 from pathlib import Path
 
 from .config import ConfigurationError
@@ -56,6 +57,7 @@ class PluginServices:
         self.configuration = None
         self.driver = None
         self.sessions = None
+        self.session_openings = None
         self.admission = None
         self.business = self.identity = self.templates = self.credentials = self.access = None
         self._state = 'stopped'
@@ -110,9 +112,16 @@ class PluginServices:
         else:
             # Unavailable optional packages only block dependent workflows.
             workflow = TemplateWorkflow()
-            self.driver = ExecutionDriver(Repository(self.runtime, authorize_job=authorize_job), self.capacity,
-                                         self.registry, self.contexts, planner=workflow, projector=workflow,
-                                         applicator=workflow)
+            repository = Repository(self.runtime, authorize_job=partial(authorize_job, registry=self.registry))
+            self.driver = ExecutionDriver(repository, self.capacity, self.registry, self.contexts,
+                                          planner=workflow, projector=workflow, applicator=workflow)
+            if self.session_factory is None:
+                from .session_jobs import SessionOpenJobs
+                self.session_openings = SessionOpenJobs(self, repository, workflow,
+                                                        max_pending_jobs=data["max_pending_jobs"])
+                self.driver.session_openings = self.session_openings
+                self.sessions = self.session_openings.sessions
+                self.sessions.start()
         if self.driver is not None:
             self.driver.start()
         if self.session_factory is not None:
@@ -125,6 +134,8 @@ class PluginServices:
     def tick(self):
         if self._state != 'running':
             return
+        if self.session_openings is not None:
+            self.session_openings.poll()
         if self.driver is not None:
             self.driver.tick()
         if self.sessions is not None:
