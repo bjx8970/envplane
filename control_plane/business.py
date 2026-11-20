@@ -244,10 +244,13 @@ def _template_credentials(steps, instances, environment, resource, evidence=None
     return requests
 
 
-def authorize_job(uow, job):
+def authorize_job(uow, job, *, registry=None):
     workflow = job["execution_snapshot"].get("workflow")
     if not isinstance(workflow, dict):
         return False
+    if job["kind"] == "session_open":
+        from .session_jobs import authorize_opening
+        return authorize_opening(uow, registry, job)
     if job["kind"] == "cleanup":
         # Owners can replay a successful cleanup after it retires the environment.
         return can_read_environment_status(uow, job["actor_id"], job["environment_id"], manage=True)
@@ -290,6 +293,23 @@ class BusinessService:
             load_version(uow, template_version_id, for_create=True)
         return self.secrets.safe_json({key: selector_options(specs[key], rows) for key, rows in candidates.items()})
 
+    def action_candidates(self, actor_id, environment_id, action_key, *, resource_id=None):
+        from .templates import selector_options
+
+        request = {"actor_id": actor_id, "environment_id": environment_id, "action_key": action_key,
+                   "resource_id": resource_id, "kind": "environment_action" if resource_id is None else "resource_action"}
+        with self.runtime.fenced_transaction() as uow:
+            if not can_access_environment(uow, actor_id, environment_id):
+                raise AuthorizationDenied()
+            _, _, specs, _, _ = self._context(uow, request)
+            instances = self._instances(uow, {"steps": []}, specs)
+        candidates, _ = self.selectors.prepare(specs, instances)
+        with self.runtime.fenced_transaction() as uow:
+            if not can_access_environment(uow, actor_id, environment_id):
+                raise AuthorizationDenied()
+            self._context(uow, request)
+        return self.secrets.safe_json({key: selector_options(specs[key], rows) for key, rows in candidates.items()})
+
     def create_environment(self, actor_id, *, course_id, template_version_id, name, parameters, request_key):
         if not isinstance(name, str) or not name.strip() or len(name) > 255:
             raise ValueError("environment name is required")
@@ -315,7 +335,7 @@ class BusinessService:
             WHERE actor_id=:actor_id AND request_key=:request_key
         """), request).mappings().first()
         if old is not None:
-            return authorize_job(uow, old)
+            return authorize_job(uow, old, registry=self.registry)
         if request["kind"] == "create":
             return can_manage_course(uow, actor, request["course_id"])
         return can_access_environment(uow, actor, request["environment_id"], manage=request["kind"] == "cleanup")

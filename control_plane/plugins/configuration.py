@@ -80,7 +80,7 @@ class ConfigurationService:
         with self._engine.connect() as connection:
             return self.get_in(connection, instance_id, revision)
 
-    def capture_in(self, uow, instance_id, secret_service, environment_id, *, template_credentials=()):
+    def capture_in(self, uow, instance_id, secret_service, environment_id, *, template_credentials=(), session_credential=None):
         """Core admission seam: capture before immutable Job INSERT, in the same UoW.
 
         Trusted policy authorizes the request/quota separately. Plugins never see
@@ -91,7 +91,11 @@ class ConfigurationService:
         config = self.get_in(uow, instance_id)
         plugin_key = uow.scalar(text('SELECT plugin_key FROM control_plane.plugin_instances WHERE id=:id'), {'id': instance_id})
         snapshot = self._storage.snapshot_in(uow, instance_id)
-        refs = secret_service.capture_refs_in(uow, config.id, instance_id, environment_id)
+        # A terminal receives only the exact, confirmed environment credential
+        # already authorized by template access. Configured management secrets
+        # are excluded even when the same plugin instance supports both uses.
+        refs = (secret_service.capture_refs_in(uow, config.id, instance_id, environment_id)
+                if session_credential is None else [session_credential])
         value = {'instance_id': str(instance_id), 'environment_id': str(environment_id),
                  'plugin_key': plugin_key, 'configuration_version_id': config.id,
                  'configuration_revision': config.revision, 'storage_snapshot_id': snapshot.id,

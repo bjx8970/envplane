@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import signal
 import sys
 import threading
@@ -126,6 +127,18 @@ def _run_start() -> int:
         print("configuration error", file=sys.stderr, flush=True)
         return EXIT_CONFIGURATION
 
+    origin = os.environ.get("CONTROL_PLANE_HTTP_ORIGIN")
+    if origin:
+        from .web.auth import BrowserOrigin
+        try:
+            BrowserOrigin.parse(origin)
+            port = int(os.environ.get("CONTROL_PLANE_HTTP_PORT", "8000"))
+            if not settings.deployment_path or not 1 <= port <= 65535:
+                raise ValueError()
+        except ValueError:
+            print("HTTP configuration error", file=sys.stderr, flush=True)
+            return EXIT_CONFIGURATION
+
     deadline = _StartupDeadline(settings.connect_timeout_seconds)
     deadline_ref[0] = deadline
     runtime = ControlPlaneRuntime(settings)
@@ -177,7 +190,11 @@ def _run_start() -> int:
                          coordinator_id=owner_id, coordinator_revision=revision, health=health)
             ready_announced = True
             was_degraded = health["degraded"]
-            while not stop_event.wait(settings.lock_poll_seconds):
+            if origin:
+                from .web.server import serve
+                if not serve(runtime, origin, port):
+                    exit_code = EXIT_RUNTIME_FAILURE
+            while not origin and not stop_event.wait(settings.lock_poll_seconds):
                 try:
                     runtime.poll()
                     health = runtime.health()
@@ -235,6 +252,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="control_plane")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("start", help="start the control plane runtime")
+    bootstrap = subparsers.add_parser("bootstrap-admin", help="initialize the first platform administrator")
+    bootstrap.add_argument("username")
     database = subparsers.add_parser("db", help="explicit database migrations")
     commands = database.add_subparsers(dest="db_command", required=True)
     upgrade = commands.add_parser("upgrade", help="upgrade database schema")
@@ -246,4 +265,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if args.command == "db":
         return _run_database(args)
+    if args.command == "bootstrap-admin":
+        from .web.server import bootstrap_admin
+        return EXIT_OK if bootstrap_admin(args.username) else EXIT_RUNTIME_FAILURE
     return _run_start()

@@ -132,7 +132,7 @@ def resource_state(uow, resource_id):
         ORDER BY created_at DESC,id DESC LIMIT 1
     """), {"resource": resource_id}).first()
     return {"state": row.data["state"] if row and row.fresh else "unknown",
-            "observed_at": row.created_at if row else None}
+            "observed_at": row.created_at if row else None, "fresh": bool(row and row.fresh)}
 
 
 class TemplateWorkflow:
@@ -307,7 +307,7 @@ class TemplateWorkflow:
             if not isinstance(state, str) or not state:
                 raise ValueError("invalid observed state")
             _observe_state(uow, job, state, mapping["ttl_seconds"])
-        elif kind != "action":
+        elif kind not in {"action", "session_open"}:
             raise ValueError("unknown workflow kind")
         if values["lifecycle"]:
             uow.execute(text("""
@@ -362,7 +362,8 @@ def record_interruption(uow, job, *, blocked, cancelled=False):
           AND o.dispatch_intent_at IS NOT NULL
     """), {**values, "creation": kind == "create"}).one()
     release_creation = kind == "create" and not effects.dispatched
-    release_scope = release_creation or (kind == "action" and not effects.dispatched)
+    release_scope = (release_creation or (kind == "action" and not effects.dispatched)
+                     or (kind == "session_open" and not blocked))
     if kind in ("create", "cleanup"):
         values["state"] = "blocked" if blocked else {"create": "create_failed", "cleanup": "delete_failed"}[kind]
         uow.execute(text("""
@@ -370,7 +371,7 @@ def record_interruption(uow, job, *, blocked, cancelled=False):
         """), values)
     if kind == "action" and effects.dispatched and flow.get("state_mapping"):
         _observe_state(uow, job, "unknown", flow["state_mapping"]["ttl_seconds"])
-    if kind in ("create", "cleanup") or effects.uncertain:
+    if kind in ("create", "cleanup") or (kind != "session_open" and effects.uncertain):
         finish_quota(uow, values["env"], disposition="released" if release_creation else "quarantined")
     if release_scope:
         uow.execute(text("""

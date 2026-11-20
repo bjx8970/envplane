@@ -69,6 +69,7 @@ class ExecutionDriver:
         self._last_heartbeat = 0
         self._last_scan = 0
         self._next_poll = {}
+        self.session_openings = None
         self._accepting = False
 
     def start(self):
@@ -190,6 +191,11 @@ class ExecutionDriver:
         if job["cancel_requested_at"] is not None and not any(o["dispatch_intent_at"] for o in operations):
             self.repository.cancel_undispatched(lease)
             self._leases.pop(key, None)
+            return
+        if job.get("kind") == "session_open":
+            if self.session_openings is None:
+                raise AdapterUnavailable("interactive opening adapter is unavailable")
+            self.session_openings.advance(lease, job, steps, operations)
             return
         current = next((op for op in operations if op["state"] in ("prepared", "pending_external", "unknown", "running")), None)
         if current:

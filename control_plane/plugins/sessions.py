@@ -19,7 +19,7 @@ from uuid import uuid4
 
 from sqlalchemy import text
 
-from .sdk import (Deadline, PluginError, PreparedCall, SessionOpenResult,
+from .sdk import (BudgetExceeded, Deadline, PluginError, PreparedCall, SessionOpenResult,
                   finite_json, require_authorized)
 
 
@@ -107,9 +107,14 @@ class RepositoryOpeningAdapter:
         attempt = self.repository.begin_call(lease, plan.operation_id, "execute", plan.context.deadline.check())
         deadline = Deadline.from_at(attempt.deadline_at)
         parent = self
+        handoff_lock = threading.Lock()
+        handoff = {"abandoned": False, "result": None}
 
         class ApplyOpening:
             def apply(self, uow, operation, projection):
+                job = uow.execute(text("SELECT * FROM control_plane.jobs WHERE id=:job"),
+                                  {"job": plan.job_id}).mappings().one()
+                parent.repository._authorize(uow, job)
                 changed = uow.scalar(text("""
                     UPDATE control_plane.interactive_sessions
                     SET state='active',opened_at=clock_timestamp(),last_activity_at=clock_timestamp()
@@ -134,6 +139,10 @@ class RepositoryOpeningAdapter:
                     projector=self.projector, applicator=ApplyOpening())
                 if status != "applied":
                     raise PluginError("unavailable", "opening completion lost execution authority")
+                with handoff_lock:
+                    if handoff["abandoned"]:
+                        raise BudgetExceeded()
+                    handoff["result"] = result
                 return result
             except OpeningNotEstablished as exc:
                 from .sdk import SafeError
@@ -153,6 +162,22 @@ class RepositoryOpeningAdapter:
                                         deadline_at=attempt.deadline_at, call_id=str(attempt.id))
             return call.result(timeout=deadline.check())
         except Exception:
+            with handoff_lock:
+                handoff["abandoned"] = True
+                abandoned = handoff.pop("result", None)
+            if abandoned is not None:
+                try:
+                    closing = Deadline.after(1)
+                    self.capacity.submit(str(plan.plugin_instance_id),
+                        lambda: plan.plugin.close_session(abandoned.session_handle, "opening_unattached", deadline=closing),
+                        lane="control", deadline_at=closing.expires_at)
+                except PluginError:
+                    # The opening worker has already returned. Discard the
+                    # handle only after making a bounded synchronous close.
+                    try:
+                        plan.plugin.close_session(abandoned.session_handle, "opening_unattached", deadline=Deadline.after(1))
+                    except Exception:
+                        pass
             # Current live invocation can block under its own lease. Restart
             # recovery below uses repository fencing, never an old lease.
             try:
@@ -242,8 +267,10 @@ class SessionStore:
     @staticmethod
     def _audit(connection, row, actor_id, action, data=None):
         connection.execute(text("""
-            INSERT INTO control_plane.audit_events(actor_id,environment_id,resource_id,job_id,operation_id,action,result,data)
-            VALUES (:actor,:environment,:resource,:job,:operation,:action,'confirmed',CAST(:data AS jsonb))
+            INSERT INTO control_plane.audit_events(actor_id,environment_id,resource_id,job_id,operation_id,
+                template_version_id,action,result,data)
+            SELECT :actor,id,:resource,:job,:operation,template_version_id,:action,'confirmed',CAST(:data AS jsonb)
+            FROM control_plane.environments WHERE id=:environment
         """), {"actor": actor_id, "environment": row["environment_id"], "resource": row["resource_id"],
                "job": row["job_id"], "operation": row["open_operation_id"], "action": action,
                "data": json.dumps(data or {})})
@@ -334,7 +361,7 @@ class SessionService:
                  store=None, max_frame_bytes=16384, input_bytes=65536, output_bytes=262144,
                  replay_bytes=262144, max_clients=16, max_sessions=64, receive_wait=0.25, idle_seconds=900,
                  close_seconds=2, lifetime_seconds=86400, startup_seconds=5,
-                 recovery_seconds=.25, recovery_batch=100):
+                 recovery_seconds=.25, recovery_batch=100, output_guard=None):
         limits = (max_frame_bytes, input_bytes, output_bytes, replay_bytes, max_clients, max_sessions,
                   receive_wait, idle_seconds, close_seconds, lifetime_seconds, startup_seconds,
                   recovery_seconds, recovery_batch)
@@ -353,6 +380,7 @@ class SessionService:
                 raise ValueError("session limit exceeds maximum: " + name)
         self.store = store or SessionStore(engine, lease)
         self.capacity, self.authorizer, self.opening = capacity, authorizer, opening_adapter
+        self.output_guard = output_guard
         self.max_frame, self.input_limit, self.output_limit = max_frame_bytes, input_bytes, output_bytes
         for value in (max_frame_bytes, input_bytes, output_bytes, replay_bytes, max_clients, max_sessions, recovery_batch):
             if not isinstance(value, int):
@@ -645,7 +673,6 @@ class SessionService:
             if client_id in live.clients and live.clients[client_id].actor_id != str(actor_id):
                 raise SessionConflict()
             client = _Client(str(actor_id))
-            live.clients[client_id] = client
             if after_seq is not None:
                 first = live.replay[0][0]["seq"] if live.replay else live.seq + 1
                 if after_seq < first - 1:
@@ -654,7 +681,17 @@ class SessionService:
                     if frame["seq"] > after_seq:
                         self._enqueue(client, frame, size)
             self.store.audit(row, actor_id, "reconnect" if reconnect else "observe")
+            live.clients[client_id] = client
         return client_id
+
+    def detach(self, actor_id, session_id, client_id):
+        live = self._live.get(str(session_id))
+        if live is None:
+            return
+        with self._live_guard(live):
+            client = live.clients.get(client_id)
+            if client is not None and client.actor_id == str(actor_id):
+                del live.clients[client_id]
 
     def poll_output(self, actor_id, session_id, client_id, *, limit=100):
         if not self._started:
@@ -680,7 +717,7 @@ class SessionService:
                 result.append(dict(frame))
             return result
 
-    def frame(self, actor_id, session_id, frame):
+    def frame(self, actor_id, session_id, frame, *, connection_valid=None):
         validate_client_frame(frame, max_bytes=self.max_frame)
         if frame["type"] == "close":
             return self.close(actor_id, session_id, frame["reason"])
@@ -698,7 +735,7 @@ class SessionService:
                 raise SessionConflict()
             if live.input_bytes + size > self.input_limit:
                 raise PluginError("backpressure", "session input queue is full")
-            live.inputs.append((str(actor_id), dict(frame), size))
+            live.inputs.append((str(actor_id), dict(frame), size, connection_valid))
             live.input_bytes += size
             live.last_activity = monotonic()
         return {"queued": True, "epoch": frame["epoch"]}
@@ -785,7 +822,10 @@ class SessionService:
         with self._live_guard(live):
             if not live.inputs or live.stop.is_set():
                 return
-            actor_id, frame, size = live.inputs.popleft()
+            actor_id, frame, size, connection_valid = live.inputs.popleft()
+            if connection_valid is not None and not connection_valid():
+                live.input_bytes -= size
+                return
             live.input_bytes -= size
             row = self.store.get(session_id)
             if row["state"] != "active" or str(row["controller_id"]) != actor_id or row["controller_revision"] != frame["epoch"]:
@@ -833,6 +873,8 @@ class SessionService:
                 if not isinstance(event, dict) or set(event) != {"type", "data"} or event["type"] != "output" or not isinstance(event["data"], str):
                     raise PluginError("protocol_error", "invalid transport output")
                 self._authorize(row["actor_id"], self.store.get(session_id), "output")
+                if self.output_guard is not None:
+                    self.output_guard(event)
                 self._publish(session_id, live, event)
                 # Remote output is not client activity: a noisy process must not
                 # keep an unattended session alive indefinitely.

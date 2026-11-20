@@ -206,7 +206,7 @@ class CredentialService:
             try:
                 entry = resolve_session_entry_in(
                     uow, self.registry, owner, environment_id, template_entry, resource_id,
-                    pinned_version_id=None if action == "session.open" else pinned_version)
+                    pinned_version_id=pinned_version)
             except (AuthorizationDenied, ReferenceUnavailable, TemplateError, KeyError):
                 return False
             return (row["template_entry"] == template_entry and row["session_type"] == entry["session_type"]

@@ -2,12 +2,16 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV="$ROOT/tmp/p1-venv"
+VENV="${CONTROL_PLANE_TEST_VENV:-$ROOT/tmp/p1-venv}"
 PY="$VENV/bin/python"
 CONTAINER_ID=""
 
-if ! command -v podman >/dev/null 2>&1; then
-  printf '%s\n' 'Local Podman is required for disposable PostgreSQL 17 tests.' >&2
+if command -v podman >/dev/null 2>&1; then
+  ENGINE=(podman --remote=false)
+elif command -v docker >/dev/null 2>&1 && [ -S /var/run/docker.sock ]; then
+  ENGINE=(docker --host unix:///var/run/docker.sock)
+else
+  printf '%s\n' 'Local Podman or Docker is required for disposable PostgreSQL 17 tests.' >&2
   exit 2
 fi
 if ! command -v python3 >/dev/null 2>&1; then
@@ -23,7 +27,8 @@ fi
 # Install exactly the minimal control-plane dependencies, not legacy requirements.
 "$PY" -m pip install --disable-pip-version-check \
   'sqlalchemy==2.0.49' 'pg8000==1.31.5' 'alembic==1.17.2' \
-  'jsonschema==4.25.1' 'PyYAML==6.0.3' 'cryptography==48.0.0' 'paramiko==5.0.0'
+  'jsonschema==4.25.1' 'PyYAML==6.0.3' 'cryptography==48.0.0' 'paramiko==5.0.0' \
+  'starlette==0.52.1' 'uvicorn==0.41.0' 'websockets==16.0' 'httpx==0.28.1'
 
 TOKEN="$("$PY" -c 'import secrets; print(secrets.token_hex(12))')"
 CONTAINER="k8s-lab-p1-pg-$TOKEN"
@@ -33,7 +38,7 @@ PASSWORD="$("$PY" -c 'import secrets; print(secrets.token_hex(24))')"
 cleanup() {
   # Only a successfully created container ID belongs to this invocation.
   if [ -n "$CONTAINER_ID" ]; then
-    podman --remote=false rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true
+    "${ENGINE[@]}" rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -41,7 +46,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # No persistent volume, no remote Podman connection, and no public port binding.
-CONTAINER_ID="$(podman --remote=false run -d --rm --name "$CONTAINER" \
+CONTAINER_ID="$("${ENGINE[@]}" run -d --rm --name "$CONTAINER" \
   -e POSTGRES_USER=postgres \
   -e POSTGRES_PASSWORD="$PASSWORD" \
   -e POSTGRES_DB="$DATABASE" \
@@ -50,7 +55,7 @@ CONTAINER_ID="$(podman --remote=false run -d --rm --name "$CONTAINER" \
 
 ready=0
 for ((attempt = 0; attempt < 120; attempt++)); do
-  if podman --remote=false exec "$CONTAINER_ID" \
+  if "${ENGINE[@]}" exec "$CONTAINER_ID" \
     pg_isready -U postgres -d "$DATABASE" >/dev/null 2>&1; then
     ready=1
     break
@@ -62,7 +67,7 @@ if [ "$ready" -ne 1 ]; then
   exit 2
 fi
 
-BINDING="$(podman --remote=false port "$CONTAINER_ID" 5432/tcp)"
+BINDING="$("${ENGINE[@]}" port "$CONTAINER_ID" 5432/tcp)"
 PORT="${BINDING##*:}"
 if [[ "$BINDING" != 127.0.0.1:* || ! "$PORT" =~ ^[0-9]+$ ]]; then
   printf '%s\n' 'Disposable PostgreSQL must have one loopback port binding.' >&2
@@ -73,4 +78,9 @@ export CONTROL_PLANE_REQUIRE_TEST_DATABASE=1
 export PYTHONDONTWRITEBYTECODE=1
 
 cd "$ROOT"
-"$PY" -B "$ROOT/scripts/run_ci_tests.py" "$@"
+if [[ "$#" == 1 && "$1" == --browser-fixture ]]; then
+  export P5_BROWSER_FIXTURE_PATH="${P5_BROWSER_FIXTURE_PATH:-$ROOT/tmp/p5-browser-fixture.json}"
+  "$PY" -B -c 'from tests_control_plane.p5_fixture import browser_server; browser_server()'
+else
+  "$PY" -B "$ROOT/scripts/run_ci_tests.py" "$@"
+fi
