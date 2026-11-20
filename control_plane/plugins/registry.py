@@ -298,6 +298,12 @@ class PluginRegistry:
                         validators[(key, 'input')] = schemas.compile(action['input_schema'])
                         continue
                     raise ManifestError('invalid capability')
+                fixed = action.get('template_fixed_inputs', [])
+                if (not isinstance(fixed, list) or not all(isinstance(name, str) for name in fixed)
+                        or len(set(fixed)) != len(fixed)
+                        or fixed and not (isinstance(action['input_schema'], dict)
+                            and set(fixed) <= action['input_schema'].get('properties', {}).keys())):
+                    raise ManifestError('template-fixed inputs must name declared input fields')
                 if set(action['execution']) != {'effect', 'idempotency', 'recovery', 'cancellation'}:
                     raise ManifestError('incomplete execution policy')
                 ExecutionPolicy.from_dict(action['execution'])

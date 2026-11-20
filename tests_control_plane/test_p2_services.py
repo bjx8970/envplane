@@ -122,7 +122,8 @@ class ServiceLifecycleTests(unittest.TestCase):
             runtime.start()
             self.assertTrue(runtime.health()['degraded'])
             self.assertIn('missing', runtime.health()['services']['optional_plugins'])
-            self.assertFalse(runtime.health()['services']['execution_enabled'])
+            self.assertTrue(runtime.health()['services']['execution_enabled'])
+            runtime.poll()
 
     def test_no_keyring_fails_closed_without_starting_threads(self):
         with tempfile.TemporaryDirectory() as directory:

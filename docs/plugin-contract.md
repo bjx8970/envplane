@@ -1,8 +1,8 @@
 # Plugin API v1
 
-状态：目标契约，尚未实现。入口：[架构](architecture.md)。相关：[模板](template-resource-contract.md)、[执行](execution-persistence-contract.md)、[安全](identity-security-contract.md)。
+P2 已实现启动加载、Manifest 校验、Storage、Secrets、执行与会话协议。P3 使用这些接口发布模板并运行环境工作流。入口：[架构](architecture.md)。相关：[模板](template-resource-contract.md)、[执行](execution-persistence-contract.md)、[安全](identity-security-contract.md)。
 
-本文中的方法、Manifest 和帧是拟定的 v1 结构，不是现有 Python SDK。必须/禁止表示验收约束；传输实现与具体 Python 类型在实现时固化。
+本文定义 v1 契约。Python SDK、加载器与会话协议实现位于 `control_plane/plugins/`，SSH 示例包位于 `plugins/ssh/`。浏览器会话入口属于 P5。
 
 ## 1. 加载与信任
 
@@ -29,7 +29,7 @@ v1 不支持热更新、在线安装、多版本并存或数据库中的可执�
 | actions | 普通动作映射 |
 | sessions | 可选交互会话类型映射 |
 
-普通动作包含 display_name、input_schema、output_schema 和 execution。Schema 使用 JSON Schema 2020-12，发布及加载时校验 Schema 自身；引用只在已加载包内或当前文档中解析，不在执行时请求任意远程 Schema。
+普通动作包含 display_name、input_schema、output_schema 和 execution。可选的 `template_fixed_inputs` 列出必须由管理员在模板中固定的输入字段，这些字段须出现在动作的 input_schema.properties 中。Schema 使用 JSON Schema 2020-12，发布及加载时校验 Schema 自身；引用只在已加载包内或当前文档中解析，不在执行时请求任意远程 Schema。
 
 以下 JSON 也是合法 YAML，便于使用标准库直接解析；不改变模板和 Manifest 可用 YAML 编写的约定。它与模板规范中的完整示例配套，示例实例 ssh_lab 对应本 Manifest 的 ssh 插件。
 
@@ -70,6 +70,7 @@ v1 不支持热更新、在线安装、多版本并存或数据库中的可执�
     },
     "execute_command": {
       "display_name": "执行命令",
+      "template_fixed_inputs": ["command"],
       "input_schema": {
         "type": "object",
         "additionalProperties": false,

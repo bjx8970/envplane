@@ -381,10 +381,13 @@ class SessionService:
             live.lock.release()
 
     def _authorize(self, actor_id, row, action):
+        # A plan has no durable session row before store.create(). Pass its
+        # fixed binding only for this initial check; later checks read the row.
+        binding = {"opening_binding": row} if row.get("provisional") else {}
         require_authorized(self.authorizer, str(actor_id), str(row["environment_id"]),
                            "session." + action, session_id=str(row["id"]),
                            resource_id=str(row["resource_id"]) if row["resource_id"] else None,
-                           template_entry=row["template_entry"])
+                           template_entry=row["template_entry"], **binding)
 
     def start(self):
         if self._started:
@@ -548,7 +551,11 @@ class SessionService:
         plan = self.opening.prepare(request)
         session_id = str(uuid4())
         provisional = {"id": session_id, "environment_id": plan.environment_id,
-                       "resource_id": plan.resource_id, "template_entry": plan.template_entry}
+                       "resource_id": plan.resource_id, "template_entry": plan.template_entry,
+                       "provisional": True, "state": "opening", "actor_id": plan.actor_id,
+                       "controller_id": plan.actor_id, "plugin_instance_id": plan.plugin_instance_id,
+                       "target_ref": plan.prepared_call.target_ref, "secret_version_id": plan.secret_version_id,
+                       "session_type": plan.session_type}
         self._authorize(plan.actor_id, provisional, "open")
         plan.context.deadline.check()
         plan = replace(plan, session_id=session_id)
@@ -703,7 +710,9 @@ class SessionService:
         row, _ = self._active(session_id)
         if str(row["controller_id"]) != str(actor_id):
             raise SessionConflict()
-        self._authorize(row["actor_id"], row, "input")
+        # Verify the original owner can receive control again before the CAS.
+        # Actual input always requires the current controller and epoch.
+        self._authorize(row["actor_id"], row, "resume_input")
         return self._controller(actor_id, session_id, expected_revision, row["actor_id"], "release")
 
     def _controller(self, actor_id, session_id, expected_revision, controller_id, action):

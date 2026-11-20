@@ -80,7 +80,7 @@ class ConfigurationService:
         with self._engine.connect() as connection:
             return self.get_in(connection, instance_id, revision)
 
-    def capture_in(self, uow, instance_id, secret_service, environment_id):
+    def capture_in(self, uow, instance_id, secret_service, environment_id, *, template_credentials=()):
         """Core admission seam: capture before immutable Job INSERT, in the same UoW.
 
         Trusted policy authorizes the request/quota separately. Plugins never see
@@ -98,6 +98,13 @@ class ConfigurationService:
                  'namespace_revision': snapshot.namespace_revision, 'plugin_version': config.plugin_version,
                  'code_digest': config.code_digest, 'secret_refs': refs,
                  'capture_transaction_id': str(uow.scalar(text('SELECT pg_current_xact_id()::text')))}
+        if template_credentials:
+            proofs = secret_service.confirmed_template_refs_in(uow, environment_id, instance_id, template_credentials, refs)
+            if proofs:
+                value['template_credentials'] = proofs
+                pinned = {(ref['secret_id'], ref['version_id']) for ref in refs}
+                pinned.update((p['ref']['secret_id'], p['ref']['version_id']) for p in proofs)
+                value['secret_refs'] = [{'secret_id': secret, 'version_id': version} for secret, version in sorted(pinned)]
         value['capture_digest'] = hmac.new(self.__capture_key, canonical_json(value).encode(), hashlib.sha256).hexdigest()
         return value
 
@@ -108,6 +115,8 @@ class ConfigurationService:
         expected_keys = {'instance_id', 'environment_id', 'plugin_key', 'configuration_version_id',
                          'configuration_revision', 'storage_snapshot_id', 'namespace_revision', 'plugin_version',
                          'code_digest', 'secret_refs', 'capture_transaction_id', 'capture_digest'}
+        if 'template_credentials' in capture:
+            expected_keys.add('template_credentials')
         if set(capture) != expected_keys or capture['instance_id'] != str(instance_id):
             raise ReferenceUnavailable('invalid plugin snapshot capture')
         digest = capture.pop('capture_digest')

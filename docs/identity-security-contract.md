@@ -1,6 +1,6 @@
 # Identity / Authorization / Security Contract v1
 
-状态：目标契约，尚未实现。相关：[架构](architecture.md)、[模板](template-resource-contract.md)、[插件](plugin-contract.md)、[执行](execution-persistence-contract.md)。
+本文描述 v1 身份与安全契约。P3 服务层实现账号、课程授权、配额、环境凭据与撤权记录；HTTP 会话与浏览器适配属于 P5。相关：[架构](architecture.md)、[模板](template-resource-contract.md)、[插件](plugin-contract.md)、[执行](execution-persistence-contract.md)。
 
 ## 1. 角色与账户
 
@@ -91,10 +91,11 @@ environment_assignments 包含 environment_id、course_id、group_id 或 student
 - 平台不实现学生与环境 OS 用户一一绑定，允许同一环境使用共享账户；不能据此宣称远端用户级隔离。
 - v1 不实现私有 CA、证书签发或 AuthorizedPrincipalsCommand。
 
-授权查看范围：管理员可查看全部可用环境凭据；教师查看自己环境；学生查看自己当前获权环境。管理连接凭据不因同一教师拥有环境而展示给学生。凭据查看独立鉴权、审计、禁止缓存，不包含在普通列表、事件或 Job 结果中。
+授权查看范围：管理员可查看全部可用环境凭据；教师查看自己环境；学生查看自己当前获权环境。环境处于 ready 才能交付凭据。管理连接凭据不因同一教师拥有环境而展示给学生。凭据查看独立鉴权、审计、禁止缓存，不包含在普通列表、事件或 Job 结果中。
 
 ### 5.1 版本快照、普通轮换与紧急吊销
 
+- 动作或清理 Job 可以使用固定模板从创建结果或资源数据传给同一插件实例的精确环境凭据。准入事务核对环境、实例、版本和来源 Operation，将依据写入新 Job 的快照。清理也可以从冻结的 evidence 选择精确版本，依据须来自同环境、同实例已授权的确认结果或可信检查点。学生查看凭据和建立会话仍需远端设置确认及实时授权。
 - 每个 Job 固定允许秘密的版本映射，Operation 固定具体使用版本；Step A 后更新当前版本不会自动让 Step B 获取新秘密。没有版本的 SecretRef 也按原 Job 映射解析。
 - 普通轮换保留历史密文。已固定 Job 仅在旧版本仍获授权且远端仍接受时可以继续；不能把历史仍存在、配置 revision 未变或一次旧验证当作永远有效的证明。实际认证失败或已知失效时阻断，不回退更旧版本、不静默改用当前密码。
 - 紧急吊销优先于快照。在派发、取得新 SecretHandle 及允许明文查看时检查可用/吊销状态；吊销后不再提供对应版本，阻断未派发步骤并触发需要的会话/远端处置。
@@ -128,6 +129,26 @@ environment_assignments 包含 environment_id、course_id、group_id 或 student
 5. 未确认远端处置时显示 revocation_pending/revocation_failed，不报告完全撤权成功。
 
 共享凭据轮换可能影响其他仍有权学生，需更新其可见版本和连接状态。轮换、终止失败不撤销平台侧即时拒绝，但必须保留未完成事实。没有能力时明确标为不支持/未完成，不伪装已轮换。
+
+P3 在最后一条授权路径消失的事务内记录受影响的环境、学生和凭据版本，并断开该学生的平台会话。若原模板声明 `revocation_action`，控制面按撤权记录 ID 生成稳定请求键，通过普通动作准入派发到该环境。缺少能力时，记录状态为 `revocation_failed`，原因为 `unsupported`。
+
+模板配置的处置动作须以已成功 Operation 的输出提供远端证据。插件确认失效的版本列入 `remote_revocation.invalidated_versions`。只有能够确认该次撤权涉及的外部会话已经终止，才能设置 `remote_sessions_terminated`。两项证据均覆盖此次撤权后，控制面标记 `confirmed`。以下为共享账户同时轮换的输出形状，尖括号表示 UUID 占位符。
+
+```json
+{
+  "remote_revocation": {
+    "invalidated_versions": ["<旧版本 ID>"],
+    "remote_sessions_terminated": true,
+    "replacement_confirmed": true
+  },
+  "confirmed_environment_credential": {
+    "secret_id": "<环境凭据 ID>",
+    "version_id": "<远端已确认的新版本 ID>"
+  }
+}
+```
+
+首次开放凭据查看须由模板 `readiness.credential_confirmation` 指定的成功步骤确认对应精确版本。共享轮换时，替代版本须属于同一环境和同一凭据，版本号递增，且该 Job 已授权执行插件使用此版本。控制面持久保存旧版到新版的确认关系。仍有授权的学生可查看已确认的新版本，新建会话可沿该关系解析连接。既有 Job、Operation 和会话继续绑定原精确版本，失效后停止使用。
 
 Job/冲突保护只约束平台调度的调用，不能阻止外部 SSH 或交互终端命令并发修改同一系统。平台会话日志也无法覆盖外部直连行为。
 

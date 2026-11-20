@@ -1,8 +1,8 @@
 # Template / Resource Contract v1
 
-状态：目标契约，尚未实现。相关：[架构](architecture.md)、[插件](plugin-contract.md)、[执行](execution-persistence-contract.md)、[安全](identity-security-contract.md)。
+P3 已提供模板发布、参数校验与环境工作流的 Python 服务入口。HTTP 和浏览器入口属于 P5。相关：[架构](architecture.md)、[插件](plugin-contract.md)、[执行](execution-persistence-contract.md)、[安全](identity-security-contract.md)。
 
-模板是管理员定义的业务执行边界。平台根据模板调用插件、生成实验资源、绑定动作；不存在插件主动注册资源的接口。本文示例定义结构，不代表当前已有解析器或 Schema 文件。
+模板是管理员定义的业务执行边界。平台根据模板调用插件、生成实验资源、绑定动作；不存在插件主动注册资源的接口。下方 SSH 示例可直接解析成 JSON 对象，交给 `runtime.services.templates` 创建草稿并发布。
 
 ## 1. 模板身份和发布
 
@@ -14,6 +14,8 @@
 - 被环境或执行事实引用的版本不得硬删除。
 - 发布不是外部执行，也不表示插件将一直可用；每次调用仍检查插件和执行引用。
 - v1 不实现模板相互引用，不加入一个看似可用但无语义的 template_ref。
+
+管理员调用 `create_draft(actor_id, definition)` 获取模板和草稿版本 ID。可传入已有 `template_id` 为该模板创建新版本。调用 `edit_draft` 更新草稿，`publish` 在当前插件实例绑定下校验并发布，`disable` 停用已发布版本。版本变化和审计事件在同一个受保护事务中持久化。
 
 ## 2. 顶层字段
 
@@ -28,7 +30,8 @@
 | actions | 环境级普通动作 |
 | cleanup | 教师/管理员显式触发的删除清理流程 |
 | readiness | 创建就绪条件 |
-| access | 可选环境交互入口 |
+| access | 环境交互入口映射，没有入口时填写空对象 |
+| revocation_action | 可选。撤权后调度的环境动作 key，须同时允许教师和管理员，所需参数须能从模板本身获得 |
 
 resources 中每项可声明 key、for_each、name、type_label、data、display、actions、access。平台生成 resource_id，教师不能传入底层插件调用配置替换它。
 
@@ -39,6 +42,8 @@ resources 中每项可声明 key、for_each、name、type_label、data、display
 参数声明 key、类型、必填、默认值、约束及展示信息。使用有限 JSON 类型，明确字符串长度、数值范围、数组长度和唯一性。未知用户字段默认拒绝；前端表单不替代后端校验。
 
 需要插件候选项时，参数可提供 selector：plugin_instance、action、value_field、label_field。选择器动作必须声明 read_only，由后台按模板调用，不能成为用户任意插件动作入口。v1 选择器返回候选项数组，value_field/label_field 从每个数组项读取，键必填且值唯一；未配置 input 时传空对象，不能调用需要未提供必填输入的动作。
+
+参数定义是以业务参数名为键的对象。`fixed` 指定管理员固定的值，提交同名字段会被拒绝。`default` 在省略可输入参数时生效。约束支持 `enum`、字符串长度、数值范围、数组长度与唯一性、嵌套 `items` 和对象 `properties` / `additionalProperties`。平台还限制 JSON 总大小、嵌套深度和集合大小。
 
 候选项由插件解释，平台只验证稳定键和模板许可。提交时在即将固定的 Job 配置/Storage 视图中重新校验所选项合法，并将实际清单/配置版本固定到 Job；界面早先展示的候选快照不自动视为提交依据。管理员也可直接在模板中固定选择项，不允许教师修改。
 
@@ -66,6 +71,8 @@ Environment 的模板、创建结果和资源目标快照不等于所有以后�
 
 平台根据当前环境和执行处理组生成 evidence，业务用户不能提交其他 Job/Operation 作为证据来源。结构至少包括 snapshot_id、execution_group_id、source_job_ids，以及 steps 下按步骤定义 ID / 稳定 item_key 索引的执行事实。每个步骤项包含按尝试序号排列的 operations；每个 Operation 含 operation_id、state、target_ref、external_refs、checkpoints 及其版本和确认时间。未展开步骤或无引用时显式给空集合，不伪造成功 output。
 
+普通创建步骤的历次尝试可从 `evidence.unexpanded.<步骤 ID>.operations` 按顺序读取。清理步骤可设置 `for_each.items` 为 `{"$ref":"evidence.unexpanded.provision.operations"}`，设置 `item_key` 为 `{"$ref":"item.operation_id"}`，在输入中以 `{"$ref":"item.external_refs.vm.reference"}` 取回该次尝试的引用。没有匹配的执行尝试时，数组为空。显式展开的步骤仍使用 `evidence.steps.<步骤 ID>.<item_key>.operations`，包括名字恰好为 `unexpanded` 的项。两种引用都读取准入时已冻结的同一份 evidence，已排队的清理任务也适用。
+
 模板可以有界遍历这些集合，再用普通引用读取已知项，例如 `{ $ref: item.external_refs.vm.reference }`；evidence 中 external_refs 以稳定 ref_key 映射到 reference、revision、observed_at，checkpoints 同理。不以“最后一个 Operation”隐式替代明确尝试选择；同键跨尝试冲突时先恢复核对，不能自动合并外部对象。
 
 接续流程提交时固定证据快照，派发前在相同冲突保护下核对证据 revision，防止新结果改变目标。快照只能提供当前环境的安全信息及 SecretRef；不能读取其他环境秘密。evidence 是执行依据，不是解除 unknown 的授权：原操作未知且与清理冲突时，先查询或显式人工核对，不能仅因为存在一个外部引用就立即执行删除。
@@ -84,7 +91,9 @@ vcpu:
       - {$ref: params.cpu_per_vm}
 ```
 
-v1 仅需要参数引用、长度及有限算术等明确实现的算子，不执行 Python eval、动态属性/函数调用或本地 Shell。输入、结果、运算深度和最大展开数量有界；检查非负、单位、整数溢出、除零和类型错误。不支持的表达式在发布时拒绝。
+当前实现的算子为 `length`、`add`、`subtract`、`multiply` 和 `divide`，每个算子的值都是操作数数组。长度算子取一个操作数，其他算子取两个。配额及其中间算术结果须为非负 64 位有符号整数，除法须整除。
+
+v1 仅使用参数引用、长度及有限算术等明确实现的算子，不执行 Python eval、动态属性/函数调用或本地 Shell。输入、结果、运算深度和最大展开数量有界；检查非负、单位、整数溢出、除零和类型错误。不支持的表达式在发布时拒绝。
 
 SSH 命令正文由管理员发布。业务用户不能覆盖正文。带用户参数的命令应使用插件明确提供的参数化传递或上下文对应的转义方式，不能把类型校验等同于 Shell 安全；核心也不能对所有命令做一次字符串替换便承诺无注入。
 
@@ -225,9 +234,13 @@ VM 模板可将创建结果的 vm_ref 放入 resource.data，并将启动、停�
 
 readiness 显式指定必需步骤、结果条件和可选必需资源。不能把“有资源记录”或“Job 已完成”直接等同环境 Ready；无资源模板也能就绪。
 
-动作成功不自动表示 VM 已运行。资源展示状态由模板对已确认输出或只读查询结果映射，并附 observed_at/有效期；过期或不可确认时显示 unknown。
+`readiness.require_steps` 指向创建步骤，`require_resources` 指向资源槽位。`conditions` 中每项可以是布尔值、指向布尔值的引用，或 `{"equals": [左值, 右值]}`。需要公布环境凭据时，`credential_confirmation` 包含执行远端设置的 `step` 与指向确切凭据版本的 `credential` 引用，确认事实由执行服务记录。
+
+动作可以提供 `state_mapping`，其中 `value` 解析已确认的状态，`ttl_seconds` 指定观察有效期。动作成功不自动表示 VM 已运行。资源展示状态由模板对已确认输出或只读查询结果映射，并附 observed_at/有效期；过期或不可确认时显示 unknown。
 
 access 显式声明交互入口、允许角色、会话类型、插件实例、固定连接引用及凭据引用，参数按 session Schema 校验。只有经过模板验证的入口与凭据才能开放。管理主机清单、SSH 执行连接或 SecretRef 不自动变成学生入口。
+
+每个 `access` 条目由入口 key 索引，定义 `roles`、`plugin_instance`、`session_type`、`target_ref` 和 `credential_ref`，还可指定 `label` 与 `input`。凭据从已确认的 `environment.create_results` 或 `resource.data` 引用中取得。访问服务重新核对角色、课程与分配、会话输入 Schema、凭据归属和确认状态，再返回固定的目标和凭据版本引用。
 
 会话建立及每帧授权、教师旁观接管和远端直连限制按插件/安全规范执行。
 
@@ -237,6 +250,7 @@ access 显式声明交互入口、允许角色、会话类型、插件实例、�
 - 教师/管理员显式触发环境 cleanup Job，使用原模板版本、参数、已确认输出、部分引用和检查点。
 - 只有外部未决事实已核对且前置条件满足时，清理变更才能执行，不能与未知原命令并发。
 - cleanup 显式定义目标、步骤和完成条件，核心不推断外部删除方式。
+- cleanup 的 `completion.require_steps` 要求所列步骤至少运行一项且全部成功。空展开只完成流程规划，不能证明清理成功。可选展开不应列为必需步骤。
 - cleanup 失败或未知保留环境/引用/冲突和对应配额；只有确认已释放才改变占用。
 - 无 cleanup 的模板不得悄悄当成“已清理”。明确空 cleanup 的声明也不能自动解决未知副作用。
 

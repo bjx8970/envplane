@@ -1,6 +1,6 @@
 # Execution / Persistence Contract v1
 
-状态：目标契约，尚未实现。相关：[架构](architecture.md)、[插件](plugin-contract.md)、[模板](template-resource-contract.md)、[身份安全](identity-security-contract.md)。
+本文描述 v1 执行契约。P2 执行内核与 P3 模板、配额和结果应用已接入服务层。相关：[架构](architecture.md)、[插件](plugin-contract.md)、[模板](template-resource-contract.md)、[身份安全](identity-security-contract.md)。
 
 本规范替代旧进程内任务与手动重试说明，不描述现有 task_queue.py 的运行保证。PostgreSQL 负责持久事实，单体进程中的有界线程池负责领取和执行。
 
@@ -207,6 +207,8 @@ v1 默认变更范围为 environment:{environment_id}。同一环境的资源变
 - 普通启停重启不改变环境生命周期；执行状态与观测电源状态分离。普通动作 Job blocked 时保留环境原生命周期，单独展示阻断原因及冲突保护；环境 lifecycle=blocked 用于创建/清理等生命周期流程的阻断。
 - 创建失败默认 create_failed，保留部分引用和占用，不自动补偿。
 - cleanup 由教师/管理员显式发起，锁定相同环境冲突范围，使用原模板快照和确认的故障事实。
+- 清理完成前，校验证据和追加新证据的事务锁定同一环境行。先提交的新证据会使旧快照失效，清理保留冲突保护与配额。清理先提交时，后到的证据按原调用身份追加，已提交的清理结果保持有效。
+- 对已就绪环境的普通动作，若执行组尚无已提交的派发意图，准备失败、取消或撤权后应释放该组的冲突保护，保留环境已有的配额状态。
 - 清理确认成功后才 deleted；失败为 delete_failed，未知为 blocked。
 - 删除资源记录不证明外部资源删除，空 cleanup 也不能消除 unknown。
 - 不因删除学生、移出组或删除课程请求而隐式销毁未知外部对象。删除仍有环境的课程或有未决事实的环境记录应阻断硬删除，先执行显式处理。

@@ -8,7 +8,7 @@ import base64
 import json
 import os
 import secrets as random_secrets
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidTag
@@ -132,6 +132,18 @@ class SecretService:
             raise ReferenceUnavailable('secret version is unavailable')
         return row
 
+    def _decrypt(self, row):
+        key = self.__keys.get(row.encryption_key_id)
+        if key is None:
+            raise ReferenceUnavailable('secret encryption key is unavailable')
+        ciphertext = bytes(row.ciphertext)
+        try:
+            value = AESGCM(key).decrypt(ciphertext[:12], ciphertext[12:], self._aad(row))
+        except (InvalidTag, ValueError):
+            raise ReferenceUnavailable('secret authentication failed') from None
+        self._remember(value)
+        return value
+
     def _encrypt_in(self, uow, secret_id, purpose, environment_id, plaintext, version):
         if not isinstance(plaintext, bytes) or not 1 <= len(plaintext) <= 1048500:
             raise ValueError('secret payload must be bounded nonempty bytes')
@@ -209,6 +221,88 @@ class SecretService:
             refs.append(SecretRef(str(row.secret_id), str(row.id)).to_dict())
         return [{'secret_id': secret, 'version_id': version}
                 for secret, version in sorted({(ref['secret_id'], ref['version_id']) for ref in refs})]
+
+    @staticmethod
+    def _derived_credential_source(uow, environment_id, instance_id, key, *, cleanup_evidence):
+        """Find an independently authorized version from its creating invocation."""
+        rows = uow.execute(text("""
+            SELECT o.id,o.job_id,o.output,s.derived_key,j.logical_invocation_id,step.step_path,step.item_key,
+                   (o.state='succeeded' AND o.protocol_error IS NULL) AS confirmed_output,
+                   e.id AS evidence_id,e.data AS evidence_data
+            FROM control_plane.job_secret_refs g
+            JOIN control_plane.operations o ON o.id=g.source_operation_id AND o.job_id=g.job_id
+            JOIN control_plane.jobs j ON j.id=o.job_id
+            JOIN control_plane.job_steps step ON step.id=o.step_id AND step.job_id=j.id
+            JOIN control_plane.secret_versions v ON v.id=g.secret_version_id
+            JOIN control_plane.secrets s ON s.id=v.secret_id AND s.environment_id=j.environment_id
+            LEFT JOIN control_plane.operation_evidence e ON e.id=g.source_evidence_id AND e.operation_id=o.id
+              AND e.kind='checkpoint' AND e.trusted_for_derivation
+            WHERE g.derived AND g.plugin_instance_id=:instance AND o.plugin_instance_id=:instance
+              AND j.environment_id=:env
+              AND ((o.state='succeeded' AND o.protocol_error IS NULL AND (j.kind='create' OR :cleanup))
+                   OR (:cleanup AND e.id IS NOT NULL AND o.state IN ('succeeded','failed','cancelled')))
+              AND s.purpose='environment' AND s.id=:secret AND v.id=:version AND v.version=1
+              AND v.revoked_at IS NULL AND v.invalidated_at IS NULL AND s.derived_key IS NOT NULL
+            FOR SHARE OF v
+        """), {"env": environment_id, "instance": instance_id, "secret": key[0], "version": key[1],
+               "cleanup": cleanup_evidence})
+        ref = {"secret_id": key[0], "version_id": key[1]}
+        for row in rows:
+            identity = [str(environment_id), str(row.logical_invocation_id), row.step_path, row.item_key]
+            if json.loads(row.derived_key)[:4] != identity:
+                continue
+            proof = {"source_job_id": str(row.job_id), "source_operation_id": str(row.id)}
+            if row.confirmed_output and ref in find_refs(row.output, "secret"):
+                return proof
+            if cleanup_evidence and row.evidence_id is not None and ref in find_refs(row.evidence_data, "secret"):
+                return {**proof, "source_evidence_id": str(row.evidence_id)}
+        raise AuthorizationDenied()
+
+    def confirmed_template_refs_in(self, uow, environment_id, instance_id, requests, configured_refs):
+        """Pin exact environment credentials from verified outputs or cleanup evidence.
+
+        Template evaluation supplies the declared step, reference path and version.
+        A confirmed source Operation and its instance-scoped grant supply authority.
+        The proof is signed into the immutable capture alongside the selected version.
+        """
+        require_fenced_connection(uow)
+        finite_json(requests)
+        configured = {(ref["secret_id"], ref["version_id"]) for ref in configured_refs}
+        proofs, checked = [], {}
+        for request in requests:
+            ref = request["ref"]
+            try:
+                key = tuple(str(UUID(ref[name])) for name in ("secret_id", "version_id"))
+            except (ValueError, TypeError, AttributeError, KeyError):
+                raise AuthorizationDenied() from None
+            if key in configured:
+                continue
+            path = request["path"]
+            cleanup_evidence = path == "evidence" or path.startswith(("evidence.", "evidence/"))
+            check = (key, cleanup_evidence)
+            if check not in checked:
+                row = uow.execute(text("""
+                    SELECT c.job_id,c.operation_id FROM control_plane.environment_credential_confirmations c
+                    JOIN control_plane.jobs producer ON producer.id=c.job_id AND producer.environment_id=c.environment_id
+                    JOIN control_plane.operations o ON o.id=c.operation_id AND o.job_id=producer.id
+                    JOIN control_plane.job_secret_refs grant_ref ON grant_ref.job_id=producer.id
+                      AND grant_ref.plugin_instance_id=o.plugin_instance_id AND grant_ref.secret_version_id=c.version_id
+                    JOIN control_plane.secret_versions v ON v.id=c.version_id AND v.secret_id=c.secret_id
+                    JOIN control_plane.secrets s ON s.id=c.secret_id AND s.environment_id=c.environment_id
+                    WHERE c.environment_id=:env AND c.secret_id=:secret AND c.version_id=:version
+                      AND o.plugin_instance_id=:instance AND o.state='succeeded' AND s.purpose='environment'
+                      AND v.revoked_at IS NULL AND v.invalidated_at IS NULL
+                      AND o.output->'confirmed_environment_credential' =
+                          jsonb_build_object('secret_id',s.id::text,'version_id',v.id::text)
+                    FOR SHARE OF v
+                """), {"env": environment_id, "instance": instance_id, "secret": key[0], "version": key[1]}).first()
+                if row is None:
+                    checked[check] = self._derived_credential_source(
+                        uow, environment_id, instance_id, key, cleanup_evidence=cleanup_evidence)
+                else:
+                    checked[check] = {"source_job_id": str(row.job_id), "source_operation_id": str(row.operation_id)}
+            proofs.append({**request, "ref": {"secret_id": key[0], "version_id": key[1]}, **checked[check]})
+        return proofs
 
     def bind_captured_refs_in(self, uow, job_id, instance_id, environment_id, refs):
         """Bind exact captured versions, never query latest or Storage claims."""
@@ -393,8 +487,12 @@ class BoundSecrets:
             if not ref.get('version_id'):
                 rows = connection.execute(text('''SELECT v.id FROM control_plane.job_secret_refs r
                     JOIN control_plane.secret_versions v ON v.id=r.secret_version_id
+                    JOIN control_plane.jobs j ON j.id=r.job_id
                     WHERE r.job_id=:job AND r.plugin_instance_id=:instance AND v.secret_id=:secret
-                      AND NOT r.derived'''),
+                      AND NOT r.derived AND NOT EXISTS (
+                          SELECT FROM jsonb_array_elements(COALESCE(j.execution_snapshot->'plugins'
+                              ->CAST(r.plugin_instance_id AS text)->'template_credentials','[]'::jsonb)) proof
+                          WHERE proof->'ref'->>'version_id'=CAST(v.id AS text))'''),
                     {'job': self.__job, 'instance': self.__instance, 'secret': ref['secret_id']}).all()
                 if len(rows) != 1:
                     raise AuthorizationDenied()
@@ -415,17 +513,9 @@ class BoundSecrets:
             if self.__guard is not None:
                 self.__guard(connection)
             row = self.__service._authorize(connection, self.__job, self.__instance, self.__environment, exact, self.__step, self.__operation if (exact.secret_id, exact.version_id) in self.__created else None)
-            key = self.__service._SecretService__keys.get(row.encryption_key_id)
-            if key is None:
-                raise ReferenceUnavailable('secret encryption key is unavailable')
-            ciphertext = bytes(row.ciphertext)
-            try:
-                plaintext = AESGCM(key).decrypt(ciphertext[:12], ciphertext[12:], self.__service._aad(row))
-            except (InvalidTag, ValueError):
-                raise ReferenceUnavailable('secret authentication failed') from None
+            plaintext = self.__service._decrypt(row)
             if self.__guard is not None:
                 self.__guard(connection)
-        self.__service._remember(plaintext)
         return SecretHandle(plaintext, check)
 
     def derive(self, slot, spec=None):

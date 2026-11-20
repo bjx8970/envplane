@@ -21,6 +21,7 @@
     },
     "execute_command": {
       "display_name": "Execute administrator template command",
+      "template_fixed_inputs": ["command"],
       "input_schema": {
         "type": "object", "additionalProperties": false,
         "properties": {"host_id": {"type": "string", "minLength": 1, "maxLength": 240, "pattern": "^[^/]+$"}, "command": {"type": "string", "minLength": 1, "maxLength": 65536}},

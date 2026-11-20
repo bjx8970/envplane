@@ -23,6 +23,9 @@ class AdmissionController:
         if self.authorize is None:
             raise AuthorizationDenied()
         with self.runtime.fenced_transaction() as uow:
+            # Serialize first-use and replay before authorizing the stored operation.
+            uow.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key,0))"),
+                        {"key": str(request["actor_id"]) + ":" + request["request_key"]})
             if not self.authorize(uow, request):
                 raise AuthorizationDenied()
             old = uow.execute(text('''SELECT id,request_digest FROM control_plane.jobs
