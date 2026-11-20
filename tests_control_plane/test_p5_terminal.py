@@ -1,17 +1,21 @@
 """P5 transport contracts over PostgreSQL and actual loopback SSH PTY channels."""
-from contextlib import ExitStack
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, Event
 from time import monotonic, sleep
 from unittest import TestCase
+from unittest.mock import patch
 
 import paramiko
 from sqlalchemy import text
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from control_plane.plugins.sdk import Deadline
 from control_plane.plugins.sessions import SessionConflict
 from control_plane.runtime import ControlPlaneRuntime
+from control_plane.session_jobs import SESSION_CAPACITY_LOCK
 from control_plane.web import create_app
-from tests_control_plane.p5_fixture import PASSWORD, environment, template
+from tests_control_plane.p5_fixture import COST, PASSWORD, environment, template
 
 ORIGIN = "https://terminal.test"
 
@@ -35,27 +39,30 @@ class TerminalTests(TestCase):
             self.assertEqual(result.status_code, 200, result.text)
         draft = self.admin.post("/api/templates", json={"definition": template()})
         self.assertEqual(draft.status_code, 201, draft.text)
-        version = draft.json()["version_id"]
-        published = self.admin.post(f"/api/templates/{version}/publish", json={})
+        self.version = draft.json()["version_id"]
+        published = self.admin.post(f"/api/templates/{self.version}/publish", json={})
         self.assertEqual(published.status_code, 200, published.text)
         course = self.teacher.post("/api/courses", json={"owner_teacher_id": self.users["teacher"], "name": "Course"})
         self.assertEqual(course.status_code, 200, course.text)
-        course_url = "/api/courses/" + course.json()["id"]
+        self.course = course.json()["id"]
+        course_url = "/api/courses/" + self.course
         self.assertEqual(self.teacher.post(course_url + "/members/" + self.users["student"], json={}).status_code, 200)
-        candidates = self.teacher.get(course_url + "/templates/" + version + "/candidates")
+        candidates = self.teacher.get(course_url + "/templates/" + self.version + "/candidates")
         self.assertEqual(candidates.json(), {"endpoint": [{"value": "echo", "label": "Loopback echo"}]})
-        job = self.teacher.post("/api/environments", json={
-            "course_id": course.json()["id"], "template_version_id": version, "name": "Test lab",
-            "request_key": "create", "parameters": {"endpoint": "echo", "note": "A lab only"},
-        })
-        record = self.wait_job(self.teacher, job)
-        self.env = record["environment_id"]
+        self.env = self.create_environment("Test lab", "create")
         self.env_url = "/api/environments/" + self.env
         self.access_url = self.env_url + "/access/shell"
         self.assertEqual(self.student.post(self.access_url, json={"request_key": "denied"}).status_code, 403)
         assignment = self.teacher.post(self.env_url + "/assignments", json={"student_id": self.users["student"]})
         self.assertEqual(assignment.status_code, 200, assignment.text)
         self.assignment = "/api/assignments/" + assignment.json()["id"]
+
+    def create_environment(self, name, request_key):
+        job = self.teacher.post("/api/environments", json={
+            "course_id": self.course, "template_version_id": self.version, "name": name,
+            "request_key": request_key, "parameters": {"endpoint": "echo", "note": "A lab only"},
+        })
+        return self.wait_job(self.teacher, job)["environment_id"]
 
     def client(self, username, app=None):
         client = self.enterContext(TestClient(app or self.app, base_url=ORIGIN))
@@ -177,6 +184,98 @@ class TerminalTests(TestCase):
         self.wait_job(self.teacher, cleanup)
         self.assertEqual(self.teacher.get(self.env_url).json()["lifecycle"], "deleted")
         self.assertIsNone(self.ssh.password)
+
+    def test_expired_queued_open_fails_without_stopping_runtime_or_dispatching(self):
+        services = self.runtime.services
+        release = Event()
+        occupied = [Event() for _ in range(services.capacity.settings.control_workers)]
+
+        def occupy_worker(entered):
+            entered.set()
+            release.wait(8)
+
+        try:
+            for index, entered in enumerate(occupied):
+                services.capacity.submit(f"p5-control-fixture-{index}", lambda entered=entered: occupy_worker(entered),
+                                         lane="control", deadline_at=Deadline.after(10).expires_at)
+            for entered in occupied:
+                self.assertTrue(entered.wait(2))
+
+            response = self.student.post(self.access_url, json={"request_key": "expire"})
+            self.assertEqual(response.status_code, 202, response.text)
+            job_id = response.json()["job_id"]
+            with patch("control_plane.session_jobs.CONTROL_QUEUE_SECONDS", .4):
+                self.runtime.poll()
+            call, _, _ = services.session_openings.calls[job_id]
+            self.assertFalse(call.running)
+            self.assertFalse(call.done())
+            end = monotonic() + 3
+            while not call.expired and monotonic() < end:
+                sleep(.02)
+            self.assertTrue(call.expired)
+        finally:
+            release.set()
+
+        job = self.wait_job(self.student, response, expected="failed")
+        self.assertIsNone(job["session_id"])
+        with self.runtime.fenced_transaction() as db:
+            result = db.execute(text("""
+                SELECT j.error->>'code' AS code, s.state AS step_state, s.prepare_started_at,
+                       g.state AS group_state,
+                       EXISTS (SELECT FROM control_plane.operations WHERE job_id=j.id) AS has_operation,
+                       EXISTS (SELECT FROM control_plane.conflict_protections
+                               WHERE execution_group_id=g.id AND released_at IS NULL) AS holds_scope
+                FROM control_plane.jobs j
+                JOIN control_plane.job_steps s ON s.job_id=j.id
+                JOIN control_plane.execution_groups g ON g.id=j.execution_group_id
+                WHERE j.id=:job
+            """), {"job": job_id}).one()
+        self.assertEqual(tuple(result), ("session_control_queue_timeout", "failed", None, "released", False, False))
+        self.assertIsNotNone(self.open())
+
+    def test_two_environments_serialize_admission_of_the_last_receiver_slot(self):
+        self.runtime.services.business.set_quota(self.users["admin"], self.users["teacher"],
+                                                  limits={**COST, "environments": 2})
+        second_env = self.create_environment("Test lab 2", "create-second")
+        second_url = f"/api/environments/{second_env}"
+        assignment = self.teacher.post(second_url + "/assignments", json={"student_id": self.users["student"]})
+        self.assertEqual(assignment.status_code, 200, assignment.text)
+        second_client = self.client("student")
+        start = Barrier(3, timeout=5)
+
+        def request(client, url, key):
+            start.wait()
+            return client.post(url, json={"request_key": key})
+
+        engine = self.runtime._engine
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            # A separate DB session holds the same lock. Observe the wait to
+            # distinguish a transaction-level guard from in-process serialization.
+            with engine.begin() as blocker, engine.connect() as observer:
+                blocker_pid = blocker.scalar(text("SELECT pg_backend_pid()"))
+                blocker.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:scope,0))"),
+                                {"scope": SESSION_CAPACITY_LOCK})
+                submissions = (
+                    pool.submit(request, self.student, self.access_url, "first-slot"),
+                    pool.submit(request, second_client, second_url + "/access/shell", "second-slot"),
+                )
+                start.wait()
+                end = monotonic() + 5
+                while not observer.scalar(text("""
+                    SELECT EXISTS (SELECT FROM pg_locks
+                                   WHERE locktype='advisory' AND NOT granted
+                                     AND :pid=ANY(pg_blocking_pids(pid)))
+                """), {"pid": blocker_pid}):
+                    self.assertFalse(any(result.done() for result in submissions))
+                    self.assertLess(monotonic(), end, "neither opening waited for the database capacity lock")
+                    sleep(.02)
+            responses = [result.result(timeout=5) for result in submissions]
+
+        self.assertEqual(sorted(response.status_code for response in responses), [202, 503])
+        admitted = next(response.json()["job_id"] for response in responses if response.status_code == 202)
+        with self.runtime.fenced_transaction() as db:
+            jobs = db.scalars(text("SELECT id::text FROM control_plane.jobs WHERE kind='session_open'")).all()
+        self.assertEqual(jobs, [admitted])
 
     def test_receiver_capacity_bounded_replay_and_restart_disconnect(self):
         session = self.open()

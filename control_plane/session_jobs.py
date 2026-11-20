@@ -9,11 +9,14 @@ from .business import _group
 from .execution.repository import InvalidTransition, JobLeaseLost
 from .persistence import admit_job
 from .plugins.capacity import CapacityRejected
-from .plugins.sdk import AuthorizationDenied, Deadline, ExecutionPolicy, PreparedCall, PluginError, json_digest
+from .plugins.sdk import (AuthorizationDenied, BudgetExceeded, Deadline, ExecutionPolicy,
+                          PreparedCall, PluginError, json_digest)
 from .plugins.sessions import OpeningPlan, RepositoryOpeningAdapter, SessionService
 from .templates import TemplateError
 
 OPEN_SECONDS = 12
+CONTROL_QUEUE_SECONDS = 2 * OPEN_SECONDS
+SESSION_CAPACITY_LOCK = "control_plane.session_open_capacity"
 
 
 def authorize_opening(uow, registry, job):
@@ -57,6 +60,10 @@ class SessionOpenJobs:
         """), request).mappings().first()
         if job is not None:
             return self.repository.authorize_job(db, job)
+        # Take the common lock before resolving access, which locks environment
+        # rows. Admission keeps it through the capacity check and Job commit.
+        db.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:scope,0))"),
+                   {"scope": SESSION_CAPACITY_LOCK})
         self._resolve(db, request)
         return True
 
@@ -117,13 +124,23 @@ class SessionOpenJobs:
         return job
 
     def poll(self):
-        for key, call in list(self.calls.items()):
+        for key, (call, lease, step_id) in list(self.calls.items()):
             if call.done():
                 del self.calls[key]
                 try:
                     call.result(timeout=0)
+                except BudgetExceeded:
+                    # The control worker checks this deadline before entering
+                    # _run. No preparation or dispatch took place.
+                    self._expire_queued_opening(lease, step_id)
                 except (CapacityRejected, JobLeaseLost):
                     pass
+
+    def _expire_queued_opening(self, lease, step_id):
+        try:
+            self.repository.prepare_failed(lease, step_id, code="session_control_queue_timeout")
+        except JobLeaseLost:
+            pass  # Cancellation or lease recovery already owns the Job.
 
     def advance(self, lease, job, steps, operations):
         key = str(lease.job_id)
@@ -149,10 +166,14 @@ class SessionOpenJobs:
         flow = job["execution_snapshot"]["workflow"]
         instance = flow["entry"]["plugin_instance_id"]
         try:
-            self.calls[key] = self.capacity.submit(instance, lambda: self._run(lease, job, step),
-                lane="control", deadline_at=Deadline.after(2 * OPEN_SECONDS).expires_at)
+            call = self.capacity.submit(instance, lambda: self._run(lease, job, step),
+                lane="control", deadline_at=Deadline.after(CONTROL_QUEUE_SECONDS).expires_at)
         except CapacityRejected:
             return  # The durable running job can wait for control capacity.
+        except BudgetExceeded:
+            self._expire_queued_opening(lease, step["id"])
+        else:
+            self.calls[key] = (call, lease, step["id"])
 
     def _run(self, lease, job, step):
         try:

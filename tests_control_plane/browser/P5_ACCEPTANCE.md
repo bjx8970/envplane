@@ -20,7 +20,13 @@
 
 ## 严格控制面套件
 
-通过 `CONTROL_PLANE_TEST_VENV=/tmp/k8s-p5-venv bash scripts/run_p1_tests.sh` 使用本地 Docker 创建并清理回环 PostgreSQL 17。最终严格套件 442 项全部通过，0 失败、0 错误、0 跳过，用时 171.876 秒。HTTP 回归覆盖 HTTPS 配置下的 Cookie 属性、CSRF、精确 Origin、401/403、202、幂等重放及 409、503、安全错误和 Job 归属。实时回归覆盖异源握手、非所属教师、只读旁观、接管与释放、帧和缓冲约束、撤权及重启断连。
+通过 `CONTROL_PLANE_TEST_VENV=/tmp/k8s-p5-venv bash scripts/run_p1_tests.sh` 使用本地 Docker 创建并清理回环 PostgreSQL 17。P5 初版 `43d1e0b` 的严格套件 442 项全部通过，0 失败、0 错误、0 跳过，用时 171.876 秒。HTTP 回归覆盖 HTTPS 配置下的 Cookie 属性、CSRF、精确 Origin、401/403、202、幂等重放及 409、503、安全错误和 Job 归属。实时回归覆盖异源握手、非所属教师、只读旁观、接管与释放、帧和缓冲约束、撤权及重启断连。
+
+## PR #34 审查修复
+
+新增两项 PostgreSQL 回归。控制池排队超时将未派发的 Step 和 Job 持久化为失败并释放执行冲突保护，下一次会话仍可打开。两个环境争用最后一个接收槽位时，测试观察到 PostgreSQL 事务锁等待，并验证只有一个 Job 入队。
+
+同一浏览器脚本已在回环 SSH 和 Windows Chrome 上重新通过。GitHub Actions 新增独立的 `browser-e2e` job，在一次性 PostgreSQL 17 中使用 Playwright 和无头 Chromium 运行该脚本。
 
 ## 复现浏览器验收
 
@@ -43,4 +49,4 @@ node tests_control_plane/browser/p5_acceptance.cjs \
 
 ## 实测范围边界
 
-浏览器使用 HTTP/WS 回环地址。HTTPS Secure Cookie 在 HTTPS 基址的 HTTP 契约测试中检查，生产 TLS 代理链路未实测。远端撤权在浏览器中覆盖缺少远端能力的处置路径。测试服务运行合成回显，没有验证真实设备上的命令、外部直连终止或生产迁移。旧 Flask 套件及托管 CI 不在本次本地执行范围内。
+浏览器使用 HTTP/WS 回环地址。HTTPS Secure Cookie 在 HTTPS 基址的 HTTP 契约测试中检查，生产 TLS 代理链路未实测。远端撤权在浏览器中覆盖缺少远端能力的处置路径。测试服务运行合成回显，没有验证真实设备上的命令、外部直连终止或生产迁移。旧 Flask 套件不在本次验证范围内。
