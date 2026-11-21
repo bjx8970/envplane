@@ -5,6 +5,7 @@ notifications, commit/rollback/close APIs are used: no pool checkout is held, no
 private socket/protocol fields are touched and no execution UoW is shared.
 """
 from threading import Event, Thread
+from time import monotonic
 
 
 class Wakeup:
@@ -14,12 +15,17 @@ class Wakeup:
     def notify(self):
         self._event.set()
 
-    def wait(self, seconds):
+    def wait(self, seconds, stop_event=None):
         if not 0 < seconds <= 60:
             raise ValueError("finite scan interval required")
-        signalled = self._event.wait(seconds)
-        self._event.clear()
-        return signalled
+        deadline = monotonic() + seconds
+        remaining = seconds
+        while remaining > 0 and (stop_event is None or not stop_event.is_set()):
+            if self._event.wait(remaining if stop_event is None else min(remaining, 0.1)):
+                self._event.clear()
+                return True
+            remaining = deadline - monotonic()
+        return False
 
 
 class PostgresWakeupListener:
@@ -38,7 +44,7 @@ class PostgresWakeupListener:
         if self._thread is not None:
             raise RuntimeError("listener already started")
         self._stop.clear()
-        self._thread = Thread(target=self._run, name="execution-pg-listener", daemon=False)
+        self._thread = Thread(target=self._run, name="execution-pg-listener", daemon=True)
         self._thread.start()
 
     def _run(self):
@@ -49,7 +55,7 @@ class PostgresWakeupListener:
             connection.autocommit = True
             cursor = connection.cursor()
             try:
-                cursor.execute("LISTEN control_plane_jobs")
+                cursor.execute(f"LISTEN {self.CHANNEL}")
                 self.wakeup.notify()  # Startup scan closes the LISTEN race.
                 while not self._stop.wait(self.poll_seconds):
                     # pg8000 processes asynchronous protocol messages during a

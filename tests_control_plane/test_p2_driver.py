@@ -12,7 +12,7 @@ from sqlalchemy import text
 
 from control_plane.config import RuntimeSettings
 from control_plane.execution import (Repository, ExecutionDriver, DriverSettings,
-    Projection, LocalOutcomeApplicator, admit_request)
+    JobLeaseLost, Projection, LocalOutcomeApplicator, admit_request)
 from control_plane.persistence import admit_job, RequestConflict
 from control_plane.plugins.capacity import CapacitySupervisor, CapacitySettings
 from control_plane.plugins.configuration import ConfigurationService
@@ -230,6 +230,37 @@ class DriverIntegrationTests(unittest.TestCase):
             self.assertEqual(capture["configuration_revision"], pin.configuration_revision)
             self.assertEqual(str(capture["storage_snapshot_id"]), str(pin.storage_snapshot_id))
             self.assertEqual(str(c.scalar(text("SELECT secret_version_id FROM control_plane.job_secret_refs WHERE job_id=:job AND NOT derived"), {"job": self.job})), str(self.secret.version_id))
+
+    def test_plugin_events_keep_call_provenance_and_reject_secrets_and_stale_writes(self):
+        original = self.fake.execute
+        contexts = []
+
+        def execute(prepared, context):
+            result = original(prepared, context)
+            contexts.append(context)
+            context.logger.info("checked host", attempts=1)
+            context.progress({"percent": 50})
+            with self.assertRaises(ValueError):
+                context.logger.info("driver-original-password")
+            return result
+
+        self.fake.execute = execute
+        self.admit()
+        self.start_driver()
+        self.ticks_until(lambda: self.state() == "succeeded")
+        with self.assertRaises(JobLeaseLost):
+            contexts[0].logger.info("late")
+        with self.engine.connect() as connection:
+            events = connection.execute(text("""
+                SELECT data FROM control_plane.job_logs WHERE job_id=:job
+                  AND data->>'code' LIKE 'plugin_%' ORDER BY sequence
+            """), {"job": self.job}).scalars().all()
+        provenance = {"step_id": contexts[0].step_instance_id, "operation_id": contexts[0].operation_id}
+        self.assertEqual(events, [
+            {**provenance, "code": "plugin_log",
+             "details": {"level": "info", "message": "checked host", "details": {"attempts": 1}}},
+            {**provenance, "code": "plugin_progress", "details": {"percent": 50}},
+        ])
 
     def test_unknown_result_never_executes_twice_after_more_ticks(self):
         self.fake.outcome = "unknown"

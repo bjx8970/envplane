@@ -194,7 +194,10 @@ def _run_start() -> int:
                 from .web.server import serve
                 if not serve(runtime, origin, port):
                     exit_code = EXIT_RUNTIME_FAILURE
-            while not origin and not stop_event.wait(settings.lock_poll_seconds):
+            while not origin and not stop_event.is_set():
+                runtime.wakeup.wait(settings.lock_poll_seconds, stop_event)
+                if stop_event.is_set():
+                    break
                 try:
                     runtime.poll()
                     health = runtime.health()

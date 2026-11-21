@@ -14,6 +14,7 @@ from sqlalchemy import text
 from ..coordination import require_fenced_connection
 from ..plugins.sdk import PreparedCall, ExecutionResult, canonical_json, json_digest
 from .adapters import UNAVAILABLE
+from .wakeup import notify_jobs
 
 
 class JobLeaseLost(RuntimeError):
@@ -602,14 +603,23 @@ class Repository:
             """), {"op": operation_id, "job": lease.job_id})
 
     @staticmethod
-    def _log_in(uow, job_id, code):
-        # The caller holds the Job lock. Append only platform-defined event
-        # codes, so this public history never includes provider output.
+    def _log_in(uow, job_id, code, data=None):
+        # The caller holds the Job lock. Only platform-defined codes are public.
         uow.execute(text("""
             INSERT INTO control_plane.job_logs(job_id,sequence,data)
-            SELECT :job,COALESCE(MAX(sequence),-1)+1,jsonb_build_object('code',CAST(:code AS text))
+            SELECT :job,COALESCE(MAX(sequence),-1)+1,
+                   CAST(:data AS jsonb) || jsonb_build_object('code',CAST(:code AS text))
             FROM control_plane.job_logs WHERE job_id=:job
-        """), {"job": job_id, "code": code})
+        """), {"job": job_id, "code": code, "data": canonical_json(data or {})})
+
+    def report_job_event(self, lease, code, data, *, step_id, operation_id=None):
+        with self.runtime.fenced_transaction() as uow:
+            self._guard(uow, lease)
+            self._log_in(uow, lease.job_id, code, {
+                "step_id": str(step_id),
+                "operation_id": str(operation_id) if operation_id is not None else None,
+                "details": self.safe_json(data),
+            })
 
     def request_cancel(self, job_id, *, actor_id=None):
         """Authorize browser cancellation in its write transaction."""
@@ -632,6 +642,7 @@ class Repository:
             """), {"job": job_id})
             if result is not None:
                 self._log_in(uow, result, "cancel_requested")
+                notify_jobs(uow)
             return result
 
     def record_cancel(self, lease, call_id, result):

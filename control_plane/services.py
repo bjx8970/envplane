@@ -56,6 +56,7 @@ class PluginServices:
         self.secrets = None
         self.configuration = None
         self.driver = None
+        self._listener = None
         self.sessions = None
         self.session_openings = None
         self.admission = None
@@ -130,6 +131,17 @@ class PluginServices:
             if isinstance(self.sessions, SessionService):
                 self.sessions.authorizer = self.credentials.session_authorizer
             self.sessions.start()
+        if self.driver_factory is None:
+            from .execution.wakeup import PostgresWakeupListener
+
+            engine = self.runtime._engine
+            dialect = engine.dialect
+            args, kwargs = dialect.create_connect_args(engine.url)
+            kwargs["timeout"] = min(1, self.runtime.settings.connect_timeout_seconds)
+            self._listener = PostgresWakeupListener(
+                partial(dialect.connect, *args, **kwargs), self.runtime.wakeup,
+            )
+            self._listener.start()
 
     def tick(self):
         if self._state != 'running':
@@ -155,6 +167,9 @@ class PluginServices:
         # termination of uncooperative plugins or remote commands.
         self._state = 'stopping'
         try:
+            if self._listener is not None:
+                self._listener.stop()
+                self._listener = None
             if self.driver is not None:
                 self.driver.stop()
             if self.sessions is not None:

@@ -47,14 +47,16 @@ class _Cancellation:
 
 
 class _Logger:
-    __slots__ = ('__callback', '__sanitize', '__count')
-    def __init__(self, callback, sanitize):
-        self.__callback, self.__sanitize, self.__count = callback, sanitize, 0
+    __slots__ = ('__callback', '__sanitize', '__deadline', '__count')
+    def __init__(self, callback, sanitize, deadline):
+        self.__callback, self.__sanitize, self.__deadline = callback, sanitize, deadline
+        self.__count = 0
     def log(self, level, message, **details):
         if level not in ('debug', 'info', 'warning', 'error') or self.__count >= 100:
             return
+        self.__deadline.check()
         data = self.__sanitize({'level': level, 'message': message, 'details': details})
-        finite_json(data, max_bytes=16384, max_items=100)
+        finite_json(data, max_bytes=16384, max_items=100, max_depth=30)
         self.__count += 1
         if self.__callback:
             self.__callback(data)
@@ -162,10 +164,16 @@ class ContextBuilder:
                 finite_json(safe, object_only=object_only)
                 return callback(key, safe)
             return send
+        progress_count = 0
+
         def report_progress(value):
+            nonlocal progress_count
+            if progress_count >= 100:
+                return None
             deadline.check()
             safe = self._secrets.safe_json(value)
-            finite_json(safe, max_bytes=16384)
+            finite_json(safe, max_bytes=16384, max_depth=30)
+            progress_count += 1
             return progress(safe) if progress else None
         return RuntimeContext(str(plugin_instance_id), str(row.environment_id), str(job_id),
             str(step_instance_id), str(operation_id) if operation_id else None, invocation_key,
@@ -174,5 +182,5 @@ class ContextBuilder:
             self._secrets.bind(job_id, plugin_instance_id, row.environment_id,
                                prepared.secret_refs if prepared is not None else None,
                                step_instance_id=step_instance_id, operation_id=operation_id, access_guard=access_guard),
-            _Logger(logger, self._secrets.safe_json), report_progress, _Cancellation(cancellation),
+            _Logger(logger, self._secrets.safe_json, deadline), report_progress, _Cancellation(cancellation),
             bounded(report_external_ref), bounded(report_checkpoint))

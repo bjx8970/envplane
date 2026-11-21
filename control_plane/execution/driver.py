@@ -5,6 +5,7 @@ small in-memory map contains only *live* call handles and never authorizes repla
 The service calls tick periodically even when NOTIFY is lost.
 """
 from dataclasses import dataclass
+from functools import partial
 from time import monotonic
 from uuid import uuid4
 
@@ -175,11 +176,14 @@ class ExecutionDriver:
             if attempt is None:
                 return None
             return lambda key, data: self.repository.report(lease, attempt.id, kind, key, data)
+        operation_id = operation["id"] if operation else None
+        event = partial(self.repository.report_job_event, lease, step_id=step["id"], operation_id=operation_id)
         return self.context_builder.build(job_id=lease.job_id, plugin_instance_id=instance_id,
-            step_instance_id=step["id"], operation_id=operation["id"] if operation else None,
+            step_instance_id=step["id"], operation_id=operation_id,
             invocation_key=operation["invocation_key"] if operation else str(step["id"]) + ":" + str(step["attempt"]),
             lease_token=str(lease.token), deadline=deadline, prepared=prepared,
             report_external_ref=report("external_ref"), report_checkpoint=report("checkpoint"),
+            logger=partial(event, "plugin_log"), progress=partial(event, "plugin_progress"),
             cancellation=lambda: self.repository.is_cancel_requested(lease.job_id))
 
     def _advance(self, lease):
