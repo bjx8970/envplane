@@ -1,4 +1,5 @@
 """Durable admission and dispatch of template-declared interactive openings."""
+from functools import partial
 from uuid import uuid4
 
 from sqlalchemy import text
@@ -207,9 +208,11 @@ class SessionOpenJobs:
         identity = str(step["id"]) + ":" + str(step["attempt"])
 
         def context(operation=None, prepared=None):
+            event = partial(self.repository.report_job_event, lease, step_id=step["id"], operation_id=operation)
             return self.services.contexts.build(job_id=lease.job_id, plugin_instance_id=instance,
                 step_instance_id=step["id"], operation_id=operation, invocation_key=identity,
-                lease_token=lease.token, deadline=deadline, prepared=prepared)
+                lease_token=lease.token, deadline=deadline, prepared=prepared,
+                logger=partial(event, "plugin_log"), progress=partial(event, "plugin_progress"))
 
         def prepare():
             plugin.validate_input(kind, entry["input"])

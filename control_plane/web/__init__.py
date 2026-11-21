@@ -505,7 +505,10 @@ def create_app(runtime, origin, *, poll=False, on_failure=None):
 
     async def poll_runtime():
         while True:
-            await anyio.sleep(runtime.settings.lock_poll_seconds)
+            await anyio.to_thread.run_sync(
+                runtime.wakeup.wait, runtime.settings.lock_poll_seconds, abandon_on_cancel=True,
+                limiter=poll_slot,
+            )
             try:
                 await anyio.to_thread.run_sync(runtime.poll, limiter=poll_slot)
             except Exception as exc:
@@ -519,8 +522,12 @@ def create_app(runtime, origin, *, poll=False, on_failure=None):
         async with anyio.create_task_group() as group:
             if poll:
                 group.start_soon(poll_runtime)
-            yield
-            group.cancel_scope.cancel()
+            try:
+                yield
+            finally:
+                group.cancel_scope.cancel()
+                if poll:
+                    runtime.wakeup.notify()
 
     async def http_error(request, exc):
         request_id = uuid4().hex

@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import text
 
 from .coordination import require_fenced_connection
+from .execution.wakeup import notify_jobs
 
 
 class StorageConflict(RuntimeError):
@@ -80,6 +81,7 @@ def admit_job(connection, *, actor_id, request_key, request_digest, environment_
            "input": json.dumps(input, allow_nan=False),
            "snapshot": json.dumps(execution_snapshot, allow_nan=False)})
     if inserted is not None:
+        notify_jobs(connection)
         return inserted, False
     previous = connection.execute(text("""
         SELECT id,request_digest FROM control_plane.jobs

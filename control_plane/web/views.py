@@ -176,7 +176,8 @@ class Views:
                     SELECT sequence,created_at,
                            CASE WHEN data->>'code' IN ('claimed','cancel_requested','dispatch_execute',
                                'dispatch_poll','dispatch_cancel','result_succeeded','result_failed',
-                               'result_pending_external','result_unknown') THEN data->>'code'
+                               'result_pending_external','result_unknown','plugin_log','plugin_progress')
+                               THEN data->>'code'
                                ELSE 'event' END AS code FROM control_plane.job_logs
                     WHERE job_id=:job AND sequence>:after ORDER BY sequence LIMIT 100
                 """, job=job, after=after)

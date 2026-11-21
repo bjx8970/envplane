@@ -19,6 +19,7 @@ from sqlalchemy import text
 
 from control_plane.config import RuntimeSettings
 from control_plane.execution.repository import ExecutionConflict
+from control_plane.execution.wakeup import notify_jobs
 from control_plane.plugins.capacity import CapacitySettings
 from control_plane.plugins.sdk import AuthorizationDenied
 from control_plane.quota import QuotaExceeded
@@ -136,6 +137,22 @@ class BusinessIntegrationTests(unittest.TestCase):
                 return row.environment_id
             time.sleep(.02)
         self.fail(f"Job {job} did not reach a terminal state in time")
+
+    def test_job_admission_wakes_the_live_listener_only_on_commit(self):
+        wakeup = self.runtime.wakeup
+        self.assertTrue(wakeup.wait(3), "PostgreSQL listener did not subscribe")
+
+        with self.assertRaisesRegex(RuntimeError, "intentional rollback"):
+            with self.runtime.fenced_transaction() as tx:
+                notify_jobs(tx)
+                raise RuntimeError("intentional rollback")
+        self.assertFalse(wakeup.wait(0.6))
+
+        job, replay = self.create()
+        self.assertFalse(replay)
+        self.assertTrue(wakeup.wait(3), "committed job did not wake the runtime")
+        self.assertEqual(self.create(), (job, True))
+        self.assertFalse(wakeup.wait(0.6))
 
     def test_documented_ssh_template_runs_and_resource_access_tracks_live_assignments(self):
         self.assertEqual(self.business.list_candidates(self.teacher, self.course, self.version), {

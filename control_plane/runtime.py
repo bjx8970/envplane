@@ -3,6 +3,7 @@ from sqlalchemy import text
 from .config import COORDINATOR_LOCK_KEY
 from .coordination import CoordinatorLease
 from .database import create_database_engine
+from .execution.wakeup import Wakeup
 from .migrations import SchemaMismatch, check_schema
 from .permissions import RuntimePermissionError, validate_runtime_permissions
 
@@ -34,6 +35,7 @@ class StartupDeadlineExceeded(RuntimeError):
 class ControlPlaneRuntime:
     def __init__(self, settings, *, driver_factory=None, session_factory=None):
         self.settings = settings
+        self.wakeup = Wakeup()
         self._engine = None
         self._lease = None
         self._state = "stopped"
