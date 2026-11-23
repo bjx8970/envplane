@@ -62,6 +62,25 @@ class ConfigurationService:
                              WHERE id=:id'''), {'id': instance_id, 'revision': revision})
         return ConfigurationVersion(identity, str(instance_id), revision, json_clone(envelope), plugin.plugin_version, plugin.code_digest)
 
+    def rebind_in(self, uow, instance_id, *, expected_revision):
+        """Publish the current envelope for loaded code without changing history."""
+        require_fenced_connection(uow)
+        active_instance(uow, instance_id)
+        row = uow.execute(text("""
+            SELECT i.plugin_key,i.configuration_revision,v.configuration,v.plugin_version,v.code_digest
+            FROM control_plane.plugin_instances i
+            JOIN control_plane.plugin_instance_versions v
+              ON v.instance_id=i.id AND v.revision=i.configuration_revision
+            WHERE i.id=:id FOR UPDATE OF i
+        """), {"id": instance_id}).first()
+        if row is None or row.configuration_revision != expected_revision:
+            raise StorageConflict("configuration revision changed")
+        loaded = self._registry.get(row.plugin_key)
+        if (loaded.plugin_version, loaded.code_digest) == (row.plugin_version, row.code_digest):
+            raise StorageConflict("configuration is already bound to the loaded package")
+        config = self.put_in(uow, instance_id, row.configuration, expected_revision=expected_revision)
+        return config
+
     def get_in(self, connection, instance_id, revision=None):
         active_instance(connection, instance_id)
         if revision is None:

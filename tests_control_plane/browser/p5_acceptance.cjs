@@ -70,6 +70,11 @@ async function job(page) {
   try {
     const admin = await login(browser, "admin");
     await btn(admin, "插件实例").click();
+    const upgrade = panel(admin, "upgrade-example · p5_fixture");
+    await upgrade.getByText("不可用", { exact: true }).waitFor();
+    admin.once("dialog", dialog => dialog.accept());
+    await btn(upgrade, "为已加载插件发布配置").click();
+    await upgrade.getByText("可用", { exact: true }).waitFor();
     async function instance(plugin, alias, data) {
       await admin.getByLabel("已加载插件").selectOption(plugin);
       await admin.getByLabel("实例别名").fill(alias);
@@ -134,11 +139,30 @@ async function job(page) {
     await admin.getByRole("table", { name: "执行池容量" }).waitFor();
     await btn(admin, "查看 P5 browser environment").click();
     await heading(admin, "关联 Operation").waitFor();
+    await btn(admin, "查看证据详情").first().click();
+    await admin.getByText(/固定目标.*指纹/).waitFor();
+    await btn(admin, "确认核验此证据").click();
+    await admin.getByText("记录核对 · 已保存核对记录", { exact: true }).waitFor();
     await admin.getByLabel("核对结论").selectOption("evidence_inconclusive");
     await btn(admin, "保存核对记录").click();
-    await admin.getByText("记录核对 · 已保存核对记录", { exact: true }).waitFor();
+    await admin.locator("p").filter({ hasText: /^证据不足，仍需核对 ·/ }).waitFor();
     await btn(admin, "查询原调用").click();
     await admin.getByText("查询原调用 · 远端确认成功", { exact: true }).waitFor();
+    await btn(student, "返回环境").click();
+    await student.getByText("触发待核对操作", { exact: true }).click();
+    await btn(student, "执行「触发待核对操作」").click();
+    await heading(student, "Job 执行结果").waitFor();
+    await student.locator("output").filter({ hasText: /^blocked$/ }).waitFor();
+    await btn(admin, "返回运维").click();
+    await btn(admin, "查看 P5 browser environment").click();
+    await btn(admin, "查询原调用").click();
+    await admin.getByText("查询原调用 · 当前授权或依赖无法完成处置", { exact: true }).waitFor();
+    assert.equal(await btn(admin, "应用已验证结果").count(), 0);
+    await btn(admin, "查看证据详情").first().click();
+    await admin.getByText("插件报告 · succeeded", { exact: true }).waitFor();
+    await btn(admin, "确认核验此证据").click();
+    await btn(admin, "应用已验证结果").click();
+    await admin.getByText("应用已验证结果 · 已应用成功结果", { exact: true }).waitFor();
     await btn(student, "返回环境").click();
     console.log("PASS administrator operational status, blocked Job review and recovery poll");
     const delivered = student.waitForResponse(response => response.url().includes("/credentials/"));

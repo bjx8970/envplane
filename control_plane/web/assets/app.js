@@ -333,6 +333,21 @@ const RECOVERY_OUTCOMES = {
   call_deadline_exceeded: "查询超期", dispatch_capacity_unavailable: "查询容量不足",
 };
 
+function renderEvidenceSummary(panel, detail) {
+  if (detail.outcome) panel.append(el("p", "插件报告 · " + detail.outcome));
+  if (detail.protocol_error) panel.append(el("p", "结果未通过协议校验"));
+  const labels = { target: "固定目标", current_reference: "当前续查引用",
+    reported_reference: "返回的续查引用", evidence: "证据内容", output: "结果输出" };
+  for (const [key, label] of Object.entries(labels)) {
+    const value = detail[key];
+    if (value) panel.append(el("p", `${label} · ${value.type} · ${value.bytes} 字节 · 指纹 ${value.fingerprint}`));
+  }
+  if (detail.method) panel.append(el("p", "来源方式 · " + detail.method));
+  if (detail.external_reference_count !== undefined) {
+    panel.append(el("p", `外部引用 ${detail.external_reference_count} 条 · 检查点 ${detail.checkpoint_count} 条`));
+  }
+}
+
 async function showBlockedJob(jobId) {
   const area = changePage("阻断 Job", "运维");
   const screen = state.screen;
@@ -386,11 +401,31 @@ async function showBlockedJob(jobId) {
       item.append(el("p", `${record.kind} · ${record.created_at}`), el("p", "证据 " + record.evidence_id),
         el("p", "Operation " + record.operation_id),
         el("p", record.call_attempt_id ? "来源调用 " + record.call_attempt_id : "来源调用未知"));
+      const details = el("div");
+      const reviewed = job.requests.find(request => request.action === "review" &&
+        request.actor_id === state.user.id && request.reason === "evidence_reviewed" &&
+        request.evidence_id === record.evidence_id && request.expected_revision === job.group_revision);
+      const confirm = sendRecovery("review");
+      item.append(button("查看证据详情", async () => {
+        const detail = await api(path + "/evidence/" + record.evidence_id);
+        details.replaceChildren();
+        renderEvidenceSummary(details, detail);
+        if (job.state === "blocked" && !busy && !reviewed && detail.group_revision === job.group_revision) {
+          details.append(button("确认核验此证据", () => confirm({
+            operation_id: record.operation_id, evidence_id: record.evidence_id, reason: "evidence_reviewed",
+          })));
+        }
+      }), details);
       if (job.recoverable && record.can_apply && !busy) {
-        const send = sendRecovery("apply_result");
-        item.append(button("应用已验证结果", () => send({
-          operation_id: record.operation_id, evidence_id: record.evidence_id, reason: "apply_verified_result",
-        })));
+        if (reviewed) {
+          const send = sendRecovery("apply_result");
+          item.append(button("应用已验证结果", () => send({
+            operation_id: record.operation_id, evidence_id: record.evidence_id,
+            confirmed_review_id: reviewed.request_id, reason: "apply_verified_result",
+          })));
+        } else {
+          item.append(el("p", "应用结果前请查看证据详情并确认核验。"));
+        }
       }
       evidence.append(item);
     }
@@ -409,15 +444,8 @@ async function showBlockedJob(jobId) {
       const form = formIn(history);
       const reason = select(form, "核对结论", ["evidence_reviewed", "evidence_inconclusive"]
         .map(key => [key, RECOVERY_REASONS[key]]));
-      const linked = select(form, "关联证据", job.evidence.map(record => [
-        record.evidence_id, record.kind + " · " + record.evidence_id,
-      ]), { empty: "整个 Job" });
       const send = sendRecovery("review");
-      submit(form, "保存核对记录", () => {
-        const record = job.evidence.find(item => item.evidence_id === linked.value);
-        return send(record ? { reason: reason.value, evidence_id: record.evidence_id,
-          operation_id: record.operation_id } : { reason: reason.value });
-      });
+      submit(form, "保存核对记录", () => send({ reason: reason.value }));
     }
     if (busy) timer = setTimeout(() => refresh().catch(error => announce(error.message)), 1200);
   }
@@ -783,6 +811,14 @@ async function showPlugins() {
     const pane = section(area, (item.instance_alias || item.id) + " · " + item.plugin_key);
     pane.append(el("p", item.available ? "可用" : "不可用"));
     const path = "/admin/plugins/" + item.id;
+    if (item.needs_rebind) {
+      pane.append(el("p", "当前配置版本绑定了旧插件代码。核对配置后可为新任务发布版本。"),
+        button("为已加载插件发布配置", async () => {
+          if (!window.confirm("确认将当前配置用于已加载插件？既有 Job 仍按各自的固定版本处理。")) return;
+          await api(path + "/rebind", "POST", { expected_revision: item.configuration_revision });
+          await showPlugins();
+        }));
+    }
     const edit = formIn(pane);
     const config = jsonField(edit, "当前配置（JSON）", item.configuration);
     submit(edit, "保存配置版本", async () => {

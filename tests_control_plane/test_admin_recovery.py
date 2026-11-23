@@ -10,7 +10,8 @@ from uuid import uuid4
 from sqlalchemy import text
 
 from control_plane.execution.repository import ExecutionConflict
-from control_plane.plugins.sdk import ExecutionResult
+from control_plane.plugins.capacity import CapacityRejected
+from control_plane.plugins.sdk import Deadline, ExecutionResult
 from control_plane.runtime import ControlPlaneRuntime
 from tests_control_plane.test_p5_terminal import TerminalFixture
 
@@ -54,6 +55,22 @@ class AdminRecoveryTests(TerminalFixture, TestCase):
         reply = self.admin.get(path)
         self.assertEqual(reply.status_code, 200, reply.text)
         return next(request for request in reply.json()["requests"] if request["request_id"] == request_id)
+
+    def confirm(self, path, job, operation, evidence):
+        detail_path = path + "/evidence/" + evidence
+        review = self.payload(job, operation, action="review", reason="evidence_reviewed", evidence_id=evidence)
+        self.assertEqual(self.admin.post(path + "/recovery", json=review).status_code, 409)
+        self.assertEqual(self.student.get(detail_path).status_code, 403)
+        detail = self.admin.get(detail_path)
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertNotIn("opaque-fixture", detail.text)
+        self.assertEqual(detail.json()["outcome"], "succeeded")
+        self.assertEqual(detail.json()["output"]["type"], "object")
+        self.assertRegex(detail.json()["output"]["fingerprint"], r"^[a-f0-9]{32}$")
+        self.assertNotIn("confirmed", detail.text)
+        accepted = self.admin.post(path + "/recovery", json=review)
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        return accepted.json()["request_id"]
 
     def test_authorized_review_idempotency_and_single_poll(self):
         path, job, operation = self.block()
@@ -102,12 +119,16 @@ class AdminRecoveryTests(TerminalFixture, TestCase):
                                     ExecutionResult("succeeded", output={"confirmed": False}).to_dict())
         bad_request = self.payload(job, operation, action="apply_result", reason="apply_verified_result",
                                    evidence_id=str(bad))
+        self.assertEqual(self.admin.post(path + "/recovery", json=bad_request).status_code, 400)
+        bad_request["confirmed_review_id"] = self.confirm(path, job, operation, str(bad))
         rejected = self.admin.post(path + "/recovery", json=bad_request)
         self.assertEqual(rejected.status_code, 202, rejected.text)
         self.wait_for(lambda: self.disposition(path, rejected.json()["request_id"])["state"] == "blocked")
         job = self.admin.get(path).json()
         payload = self.payload(job, operation, action="apply_result", reason="apply_verified_result",
-                               evidence_id=str(evidence))
+                               evidence_id=str(evidence), confirmed_review_id=bad_request["confirmed_review_id"])
+        self.assertEqual(self.admin.post(path + "/recovery", json=payload).status_code, 409)
+        payload["confirmed_review_id"] = self.confirm(path, job, operation, str(evidence))
         barrier = Barrier(2)
 
         def submit(_):
@@ -124,6 +145,13 @@ class AdminRecoveryTests(TerminalFixture, TestCase):
         self.wait_for(lambda: self.disposition(path, str(winners[0]))["outcome"] == "result_applied")
         self.assertEqual(self.admin.get(path).json()["state"], "succeeded")
         self.assertEqual([method for method, _ in self.ssh.recovery_calls], ["execute"])
+        with self.runtime.fenced_transaction() as db:
+            audit_review = db.scalar(text("""
+                SELECT data->>'confirmed_review_id' FROM control_plane.audit_events
+                WHERE job_id=:job AND operation_id=:op AND action='execution.admin_recovery'
+                  AND result='result_applied'
+            """), {"job": job["job_id"], "op": operation})
+            self.assertEqual(audit_review, payload["confirmed_review_id"])
 
     def test_pending_and_revocation_never_dispatch_another_call(self):
         path, job, operation = self.block()
@@ -155,6 +183,73 @@ class AdminRecoveryTests(TerminalFixture, TestCase):
         self.assertEqual(self.disposition(path, result.json()["request_id"])["state"], "queued")
         self.wait_for(lambda: self.disposition(path, result.json()["request_id"])["outcome"] == "remote_succeeded")
 
+    def test_poll_updates_reference_and_handles_both_null_representations(self):
+        path, job, operation = self.block()
+
+        def poll_pending(ref):
+            self.ssh.poll_override = lambda: ExecutionResult("pending_external", external_execution_ref=ref)
+            job = self.admin.get(path).json()
+            result = self.admin.post(path + "/recovery", json=self.payload(job, operation))
+            self.assertEqual(result.status_code, 202, result.text)
+            self.wait_for(lambda: self.disposition(path, result.json()["request_id"])["outcome"] == "remote_still_pending")
+
+        poll_pending({"id": "updated-reference"})
+        poll_pending(None)
+        self.assertEqual(self.ssh.recovery_references, [{"id": "opaque-fixture-reference"}, {"id": "updated-reference"}])
+        with self.runtime.fenced_transaction() as db:
+            self.assertTrue(db.scalar(text("""
+                SELECT EXISTS (SELECT FROM control_plane.operation_evidence WHERE operation_id=:op
+                    AND kind='late_result' AND data #>> '{external_execution_ref,id}'='opaque-fixture-reference')
+            """), {"op": operation}))
+        for null in ("NULL", "'null'::jsonb"):
+            with self.subTest(null=null):
+                with self.runtime.fenced_transaction() as db:
+                    db.execute(text(f"UPDATE control_plane.operations SET external_execution_ref={null} WHERE id=:op"),
+                               {"op": operation})
+                self.assertFalse(self.admin.get(path).json()["operations"][0]["has_external_reference"])
+                poll_pending(None)
+                self.assertIsNone(self.ssh.recovery_references[-1])
+                with self.runtime.fenced_transaction() as db:
+                    self.assertTrue(db.scalar(text(
+                        "SELECT external_execution_ref IS NULL FROM control_plane.operations WHERE id=:op"
+                    ), {"op": operation}))
+
+    def test_control_capacity_keeps_request_queued_and_retries_proven_rejection(self):
+        path, job, operation = self.block()
+        capacity = self.runtime.services.capacity
+        with self.runtime.fenced_transaction() as db:
+            instance = db.scalar(text("SELECT plugin_instance_id FROM control_plane.operations WHERE id=:op"),
+                                 {"op": operation})
+        gate = Event()
+        self.addCleanup(gate.set)
+        fillers = [capacity.submit(str(instance), lambda: gate.wait(4), lane="control",
+                                   deadline_at=Deadline.after(4).expires_at)
+                   for _ in range(capacity.settings.instance_limit)]
+        queued = self.admin.post(path + "/recovery", json=self.payload(job, operation))
+        self.assertEqual(queued.status_code, 202, queued.text)
+        key = queued.json()["request_id"]
+        self.runtime.poll()
+        self.assertEqual(self.disposition(path, key)["state"], "queued")
+        self.assertEqual(self.admin.get(path).json()["group_revision"], job["group_revision"])
+        gate.set()
+        for handle in fillers:
+            end = monotonic() + 2
+            while not handle.done() and monotonic() < end:
+                sleep(.02)
+            self.assertTrue(handle.done())
+        with patch.object(capacity, "submit", side_effect=CapacityRejected()):
+            self.runtime.poll()
+        self.assertEqual(self.disposition(path, key)["state"], "queued")
+        self.assertEqual([method for method, _ in self.ssh.recovery_calls], ["execute"])
+        self.wait_for(lambda: self.disposition(path, key)["outcome"] == "remote_succeeded")
+        self.assertEqual([method for method, _ in self.ssh.recovery_calls], ["execute", "poll"])
+        with self.runtime.fenced_transaction() as db:
+            self.assertTrue(db.scalar(text("""
+                SELECT EXISTS (SELECT FROM control_plane.audit_events WHERE job_id=:job
+                    AND action='execution.admin_recovery' AND result='dispatch_not_started'
+                    AND data->>'request_id'=:id AND data->>'call_attempt_id' IS NOT NULL)
+            """), {"job": job["job_id"], "id": key}))
+
     def test_local_constraint_rollback_retains_poll_evidence(self):
         path, job, operation = self.block()
         driver = self.runtime.services.driver
@@ -173,7 +268,8 @@ class AdminRecoveryTests(TerminalFixture, TestCase):
         self.assertEqual(job["operations"][0]["state"], "unknown")
         evidence, = [record for record in job["evidence"] if record["can_apply"]]
         request = self.payload(job, operation, action="apply_result", reason="apply_verified_result",
-                               evidence_id=evidence["evidence_id"])
+                               evidence_id=evidence["evidence_id"],
+                               confirmed_review_id=self.confirm(path, job, operation, evidence["evidence_id"]))
         applied = self.admin.post(path + "/recovery", json=request)
         self.assertEqual(applied.status_code, 202, applied.text)
         self.wait_for(lambda: self.disposition(path, applied.json()["request_id"])["outcome"] == "result_applied")

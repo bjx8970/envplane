@@ -182,6 +182,8 @@ ExecutionResult
 
 输出 Schema 错误需保存原始安全结果和协议错误状态，保留外部引用；不能因此重新发送变更。大体积 stdout/stderr 采用有界日志或受控产物引用，不能无限塞入结果和内存。
 
+插件可在 `pending_external` 的 poll 结果中返回同一调用的新续查引用。平台保留之前的引用作为证据，下次使用新引用。省略引用或返回 JSON null 时沿用已有引用；缺少已有值时传空引用，由插件按同一 invocation key 的契约查询。
+
 错误结构为 code、message、details、retry_hint。code 可以是 invalid_input、unavailable、authentication_failed、conflict、timeout、protocol_error 等通用类别；插件可提供命名空间化细节。message/details 必须脱敏。retry_hint 只是建议，不能覆盖 effect、未知结果、幂等与恢复规则。
 
 ### 3.3 cancel

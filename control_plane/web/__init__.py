@@ -209,8 +209,12 @@ class HttpAPI:
     def blocked_job(self, actor, token, body, path, query):
         return self.operations.blocked_job(actor["id"], path["job_id"])
 
+    def recovery_evidence(self, actor, token, body, path, query):
+        return self.operations.evidence_detail(actor["id"], path["job_id"], path["evidence_id"])
+
     def submit_recovery(self, actor, token, body, path, query):
-        _fields(body, ("action", "reason", "request_key", "expected_revision"), ("operation_id", "evidence_id"))
+        _fields(body, ("action", "reason", "request_key", "expected_revision"),
+                ("operation_id", "evidence_id", "confirmed_review_id"))
         service = self.services.recovery
         if service is None:
             raise LeadershipLost("execution recovery is unavailable")
@@ -218,6 +222,7 @@ class HttpAPI:
             actor["id"], path["job_id"], action=body["action"], reason=body["reason"],
             request_key=_id(body["request_key"]), expected_revision=body["expected_revision"],
             operation_id=_id(body.get("operation_id")), evidence_id=_id(body.get("evidence_id")),
+            confirmed_review_id=_id(body.get("confirmed_review_id")),
         )
         location = "/api/admin/blocked-jobs/" + path["job_id"]
         return response({"request_id": key, "status_url": location, "replayed": replayed},
@@ -323,6 +328,8 @@ class HttpAPI:
                 revision = item.pop("plugin_version"), item.pop("code_digest")
                 item["available"] = bool(item["enabled"] and package
                     and revision == (package.plugin_version, package.code_digest))
+                item["needs_rebind"] = bool(item["enabled"] and package and revision[1]
+                    and revision != (package.plugin_version, package.code_digest))
             return {"loaded": sorted(loaded), "instances": instances,
                     "unavailable": sorted(self.services.registry.unavailable)}
 
@@ -348,6 +355,20 @@ class HttpAPI:
             config = self.services.configuration.put_in(db, instance, body["configuration"],
                                                        expected_revision=revision)
             _audit(db, actor["id"], "plugin.configure", instance_id=instance)
+            return {"id": instance, "revision": config.revision}
+
+    def rebind_plugin(self, actor, token, body, path, query):
+        _fields(body, ("expected_revision",))
+        revision = body["expected_revision"]
+        if type(revision) is not int or not 1 <= revision < 2**63 - 1:
+            raise ValueError()
+        with self.runtime.fenced_transaction() as db:
+            if active_role(db, actor["id"], lock=True) != "admin":
+                raise AuthorizationDenied()
+            instance = path["instance_id"]
+            config = self.services.configuration.rebind_in(db, instance, expected_revision=revision)
+            _audit(db, actor["id"], "plugin.rebind_configuration", instance_id=instance,
+                   previous_revision=revision, revision=config.revision, code_digest=config.code_digest)
             return {"id": instance, "revision": config.revision}
 
     def plugin_enabled(self, actor, token, body, path, query):
@@ -464,6 +485,7 @@ class HttpAPI:
             route("/api/admin/operations/status", "GET", self.operations_status),
             route("/api/admin/blocked-jobs", "GET", self.blocked_jobs),
             route(blocked, "GET", self.blocked_job),
+            route(blocked + "/evidence/{evidence_id:uuid}", "GET", self.recovery_evidence),
             route(blocked + "/recovery", "POST", self.submit_recovery),
             route("/api/session", "GET", self.session, public=True),
             route("/api/login", "POST", self.login, public=True),
@@ -487,6 +509,7 @@ class HttpAPI:
             route("/api/admin/plugins", "GET", self.plugins),
             route("/api/admin/plugins", "POST", self.put_plugin),
             route(plugin, "PUT", self.put_plugin),
+            route(plugin + "/rebind", "POST", self.rebind_plugin),
             route(plugin + "/enabled", "PUT", self.plugin_enabled),
             route(plugin + "/storage", "GET", self.plugin_storage),
             route(plugin + "/storage", "PUT", self.put_plugin_storage),

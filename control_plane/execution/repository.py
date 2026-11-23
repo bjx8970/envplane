@@ -511,18 +511,23 @@ class Repository:
                     self._block_in(uow, lease, op, "unknown_external_result")
                 elif result.outcome == "pending_external":
                     policy = PreparedCall.from_dict(op["prepared_call"]).execution_policy
-                    if result.external_execution_ref is None and policy.recovery != "queryable":
+                    # Earlier returned references remain in the append-only raw results.
+                    ref = (op["external_execution_ref"] if result.external_execution_ref is None
+                           else result.external_execution_ref)
+                    if ref is None and policy.recovery != "queryable":
                         self._block_in(uow, lease, op, "missing_recovery_reference")
-                    elif recovery is not None:
+                    else:
                         uow.execute(text("""
                             UPDATE control_plane.operations
-                            SET external_execution_ref=COALESCE(external_execution_ref,CAST(:ref AS jsonb))
+                            SET external_execution_ref=CAST(:ref AS jsonb),updated_at=clock_timestamp()
                             WHERE id=:op
-                        """), {"op": op["id"], "ref": _json(result.external_execution_ref)})
-                        self._block_in(uow, lease, op, "remote_still_pending")
-                    else:
-                        uow.execute(text("UPDATE control_plane.operations SET state='pending_external',external_execution_ref=CAST(:ref AS jsonb),updated_at=clock_timestamp() WHERE id=:op"), {"op": op["id"], "ref": canonical_json(result.external_execution_ref)})
-                        uow.execute(text("UPDATE control_plane.job_steps SET state='waiting_external',updated_at=clock_timestamp() WHERE id=:step"), {"step": op["step_id"]})
+                        """), {"op": op["id"], "ref": _json(ref)})
+                        if recovery is not None:
+                            self._block_in(uow, lease, op, "remote_still_pending")
+                        else:
+                            uow.execute(text("UPDATE control_plane.operations SET state='pending_external' WHERE id=:op"),
+                                        {"op": op["id"]})
+                            uow.execute(text("UPDATE control_plane.job_steps SET state='waiting_external',updated_at=clock_timestamp() WHERE id=:step"), {"step": op["step_id"]})
                 elif result.outcome == "failed":
                     uow.execute(text("UPDATE control_plane.operations SET state='failed',error=CAST(:error AS jsonb),finished_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=:op"), {"op": op["id"], "error": _json(raw["error"])})
                     uow.execute(text("UPDATE control_plane.job_steps SET state='failed',error=CAST(:error AS jsonb),finished_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=:step"), {"step": op["step_id"], "error": _json(raw["error"])})

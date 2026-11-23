@@ -18,6 +18,9 @@ def upgrade():
             actor_id uuid NOT NULL REFERENCES control_plane.users(id) ON DELETE RESTRICT,
             request_key uuid NOT NULL,
             expected_revision bigint NOT NULL CHECK (expected_revision >= 0),
+            queue_revision bigint NOT NULL CHECK (queue_revision >= expected_revision),
+            deferred_until timestamptz,
+            confirmed_review_id uuid REFERENCES control_plane.execution_recovery_requests(id) ON DELETE RESTRICT,
             active_revision bigint,
             coordinator_revision bigint,
             call_attempt_id uuid UNIQUE,
@@ -39,11 +42,13 @@ def upgrade():
                 REFERENCES control_plane.operation_call_attempts(id, operation_id) ON DELETE RESTRICT,
             CHECK (action='review' OR operation_id IS NOT NULL),
             CHECK (action<>'apply_result' OR evidence_id IS NOT NULL),
+            CHECK ((action='apply_result') = (confirmed_review_id IS NOT NULL)),
             CHECK (evidence_id IS NULL OR operation_id IS NOT NULL),
             CHECK ((state IN ('completed', 'blocked')) = (finished_at IS NOT NULL)),
             CHECK ((state IN ('completed', 'blocked')) = (outcome IS NOT NULL)),
             CHECK ((active_revision IS NULL) = (coordinator_revision IS NULL)),
             CHECK (state<>'running' OR active_revision IS NOT NULL),
+            CHECK (state<>'queued' OR active_revision IS NULL),
             CHECK (call_attempt_id IS NULL OR (action='poll' AND active_revision IS NOT NULL))
         );
         CREATE UNIQUE INDEX recovery_one_active_per_group ON control_plane.execution_recovery_requests(group_id)
@@ -57,15 +62,15 @@ def upgrade():
         CREATE TRIGGER recovery_request_identity BEFORE UPDATE ON control_plane.execution_recovery_requests
             FOR EACH ROW EXECUTE FUNCTION control_plane.protect_record(
                 'job_id','group_id','operation_id','evidence_id','actor_id','request_key',
-                'expected_revision','action','reason','created_at');
+                'expected_revision','confirmed_review_id','action','reason','created_at');
         CREATE TRIGGER recovery_request_terminal BEFORE UPDATE ON control_plane.execution_recovery_requests
             FOR EACH ROW WHEN (OLD.state IN ('completed','blocked'))
             EXECUTE FUNCTION control_plane.protect_record();
         CREATE TRIGGER recovery_request_claim BEFORE UPDATE ON control_plane.execution_recovery_requests
-            FOR EACH ROW WHEN (OLD.active_revision IS NOT NULL)
+            FOR EACH ROW WHEN (OLD.active_revision IS NOT NULL AND NEW.state<>'queued')
             EXECUTE FUNCTION control_plane.protect_record('active_revision','coordinator_revision');
         CREATE TRIGGER recovery_request_dispatch BEFORE UPDATE ON control_plane.execution_recovery_requests
-            FOR EACH ROW WHEN (OLD.call_attempt_id IS NOT NULL)
+            FOR EACH ROW WHEN (OLD.call_attempt_id IS NOT NULL AND NEW.state<>'queued')
             EXECUTE FUNCTION control_plane.protect_record('call_attempt_id');
     """)
 

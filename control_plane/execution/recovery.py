@@ -55,7 +55,8 @@ class RecoveryRequests:
 
     def _validate(self, db, job, request):
         action = request["action"]
-        if job is None or job["state"] != "blocked" or job["group_revision"] != request["expected_revision"]:
+        revision = request.get("queue_revision", request["expected_revision"])
+        if job is None or job["state"] != "blocked" or job["group_revision"] != revision:
             raise ExecutionConflict("blocked Job changed")
         operation_id, evidence_id = request["operation_id"], request["evidence_id"]
         operation = self._operation(db, job["id"], operation_id) if operation_id is not None else None
@@ -63,6 +64,13 @@ class RecoveryRequests:
         if (operation_id is not None and operation is None) or (evidence_id is not None and evidence is None):
             raise ExecutionConflict("evidence or Operation does not belong to the Job")
         if action == "review":
+            if evidence_id is not None and request["reason"] == "evidence_reviewed" and not db.scalar(text("""
+                SELECT EXISTS (SELECT FROM control_plane.audit_events
+                    WHERE job_id=:job AND operation_id=:op AND actor_id=:actor AND action='execution.evidence_view'
+                      AND data->>'evidence_id'=:evidence AND data->>'group_revision'=:revision)
+            """), {"job": job["id"], "op": operation_id, "actor": request["actor_id"],
+                   "evidence": str(evidence_id), "revision": str(revision)}):
+                raise ExecutionConflict("open the current evidence detail before confirming it")
             return
         if (job["kind"] == "session_open" or job["group_state"] != "blocked"
                 or job["current_job_id"] != job["id"] or operation is None
@@ -91,6 +99,15 @@ class RecoveryRequests:
             result = ExecutionResult.from_dict(evidence["data"])
             if result.outcome != "succeeded" or result.protocol_error:
                 raise ExecutionConflict("evidence is not a confirmed result")
+            if not db.scalar(text("""
+                SELECT EXISTS (SELECT FROM control_plane.execution_recovery_requests
+                    WHERE id=:review AND job_id=:job AND operation_id=:op AND evidence_id=:evidence
+                      AND actor_id=:actor AND expected_revision=:revision AND action='review'
+                      AND reason='evidence_reviewed' AND state='completed')
+            """), {"review": request["confirmed_review_id"], "job": job["id"], "op": operation_id,
+                   "evidence": evidence_id, "actor": request["actor_id"],
+                   "revision": request["expected_revision"]}):
+                raise ExecutionConflict("the same administrator must confirm this exact evidence and revision")
 
     @staticmethod
     def _audit(db, request, environment, result):
@@ -100,24 +117,28 @@ class RecoveryRequests:
             VALUES (:actor,:env,:job,:op,'execution.admin_recovery',:result,
                     jsonb_build_object('request_id',CAST(:id AS uuid),'action',CAST(:action AS text),
                         'reason',CAST(:reason AS text),'evidence_id',CAST(:evidence AS uuid),
-                        'expected_revision',CAST(:revision AS bigint)))
+                        'expected_revision',CAST(:revision AS bigint),'confirmed_review_id',CAST(:review AS uuid),
+                        'call_attempt_id',CAST(:call AS uuid)))
         """), {"actor": request["actor_id"], "env": environment, "job": request["job_id"],
                "op": request["operation_id"], "id": request["id"], "action": request["action"],
                "reason": request["reason"], "evidence": request["evidence_id"],
-               "revision": request["expected_revision"], "result": result})
+               "revision": request["expected_revision"], "review": request["confirmed_review_id"],
+               "call": request["call_attempt_id"], "result": result})
 
     def submit(self, actor, job_id, *, action, reason, request_key, expected_revision,
-               operation_id=None, evidence_id=None):
+               operation_id=None, evidence_id=None, confirmed_review_id=None):
         if (not isinstance(action, str) or not isinstance(reason, str)
                 or reason not in REASONS.get(action, ())
                 or type(expected_revision) is not int or not 0 <= expected_revision < 2**63
                 or request_key is None or (evidence_id is not None and operation_id is None)
                 or (action != "review" and operation_id is None)
                 or (action == "apply_result" and evidence_id is None)
+                or ((action == "apply_result") != (confirmed_review_id is not None))
                 or (action == "poll" and evidence_id is not None)):
             raise ValueError("invalid recovery request")
         request = {"action": action, "reason": reason, "expected_revision": expected_revision,
-                   "job_id": job_id, "operation_id": operation_id, "evidence_id": evidence_id}
+                   "job_id": job_id, "operation_id": operation_id, "evidence_id": evidence_id,
+                   "confirmed_review_id": confirmed_review_id}
         with self.runtime.fenced_transaction() as db:
             self._admin(db, actor, lock=True)
             previous = db.execute(text("""
@@ -128,7 +149,7 @@ class RecoveryRequests:
                     raise ExecutionConflict("recovery request key has different input")
                 return previous["id"], True
             job = self._job(db, job_id)
-            self._validate(db, job, request)
+            self._validate(db, job, {**request, "actor_id": actor})
             queued = action != "review"
             if queued:
                 if db.scalar(text("""
@@ -144,8 +165,9 @@ class RecoveryRequests:
             saved = db.execute(text("""
                 INSERT INTO control_plane.execution_recovery_requests
                     (job_id,group_id,actor_id,request_key,expected_revision,operation_id,evidence_id,
-                     action,reason,state,outcome,finished_at)
-                VALUES (:job_id,:group,:actor,:key,:expected_revision,:operation_id,:evidence_id,:action,:reason,
+                     queue_revision,confirmed_review_id,action,reason,state,outcome,finished_at)
+                VALUES (:job_id,:group,:actor,:key,:expected_revision,:operation_id,:evidence_id,
+                        :expected_revision,:confirmed_review_id,:action,:reason,
                         :state,CASE WHEN :queued THEN NULL ELSE 'reviewed' END,
                         CASE WHEN :queued THEN NULL ELSE clock_timestamp() END)
                 RETURNING *
@@ -156,30 +178,39 @@ class RecoveryRequests:
                 notify_jobs(db)
             return saved["id"], False
 
-    def claim(self, owner, seconds, busy_jobs):
+    def claim(self, owner, seconds, busy_jobs, *, check_poll_capacity=None, limit=32):
         with self.runtime.fenced_transaction() as db:
-            request = db.execute(text("""
-                SELECT r.* FROM control_plane.execution_recovery_requests r JOIN control_plane.jobs j ON j.id=r.job_id
+            candidates = db.execute(text("""
+                SELECT r.*,o.plugin_instance_id FROM control_plane.execution_recovery_requests r
+                JOIN control_plane.jobs j ON j.id=r.job_id
+                LEFT JOIN control_plane.operations o ON o.id=r.operation_id
                 WHERE r.state='queued' AND NOT (j.id=ANY(CAST(:busy AS uuid[])))
                   AND (j.state<>'blocked' OR j.lease_expires_at IS NULL OR j.lease_expires_at<=clock_timestamp())
-                ORDER BY r.created_at,r.id LIMIT 1 FOR UPDATE OF r SKIP LOCKED
-            """), {"busy": list(busy_jobs)}).mappings().first()
-            if request is None:
-                return None
-            job = self._job(db, request["job_id"])
-            try:
-                self._admin(db, request["actor_id"], lock=True)
-                self._validate(db, job, request)
-            except (PluginError, ExecutionConflict, ValueError):
-                self.finish_in(db, request, job["environment_id"], "request_no_longer_eligible")
-                return None
-            lease = self.repository._takeover_in(db, job, owner, seconds)
-            db.execute(text("""
-                UPDATE control_plane.execution_recovery_requests
-                SET state='running',active_revision=:revision,coordinator_revision=:coordinator WHERE id=:id
-            """), {"id": request["id"], "revision": lease.group_revision,
-                   "coordinator": lease.coordinator_revision})
-            return dict(request), lease
+                  AND (r.deferred_until IS NULL OR r.deferred_until<=clock_timestamp())
+                ORDER BY (r.action='apply_result') DESC,r.created_at,r.id LIMIT :limit FOR UPDATE OF r SKIP LOCKED
+            """), {"busy": list(busy_jobs), "limit": limit}).mappings().all()
+            for request in candidates:
+                job = self._job(db, request["job_id"])
+                try:
+                    self._admin(db, request["actor_id"], lock=True)
+                    self._validate(db, job, request)
+                except (PluginError, ExecutionConflict, ValueError):
+                    self.finish_in(db, request, job["environment_id"], "request_no_longer_eligible")
+                    continue
+                if request["action"] == "poll" and check_poll_capacity is not None:
+                    try:
+                        check_poll_capacity(str(request["plugin_instance_id"]), lane="control")
+                    except CapacityRejected:
+                        continue
+                lease = self.repository._takeover_in(db, job, owner, seconds)
+                db.execute(text("""
+                    UPDATE control_plane.execution_recovery_requests
+                    SET state='running',active_revision=:revision,coordinator_revision=:coordinator,
+                        deferred_until=NULL WHERE id=:id
+                """), {"id": request["id"], "revision": lease.group_revision,
+                       "coordinator": lease.coordinator_revision})
+                return dict(request), lease
+            return None
 
     def guard_in(self, db, request_id, lease, operation_id, action, *, call_id=None):
         request = db.execute(text("""
@@ -212,6 +243,25 @@ class RecoveryRequests:
         db.execute(text("""
             UPDATE control_plane.execution_recovery_requests SET call_attempt_id=:call WHERE id=:id
         """), {"id": request_id, "call": call_id})
+
+    def defer_unstarted_poll(self, request_id, lease, operation_id, call_id):
+        """Capacity.submit rejected before a worker could acquire the callback."""
+        with self.runtime.fenced_transaction() as db:
+            job = self.repository._guard(db, lease)
+            request = self.guard_in(db, request_id, lease, operation_id, "poll", call_id=call_id)
+            self._audit(db, request, job["environment_id"], "dispatch_not_started")
+            db.execute(text("""
+                UPDATE control_plane.jobs SET state='blocked',lease_owner=NULL,lease_token=NULL,
+                    lease_expires_at=NULL,heartbeat_at=NULL
+                WHERE id=:job
+            """), {"job": lease.job_id})
+            db.execute(text("UPDATE control_plane.execution_groups SET state='blocked' WHERE id=:id"),
+                       {"id": lease.group_id})
+            db.execute(text("""
+                UPDATE control_plane.execution_recovery_requests SET state='queued',queue_revision=active_revision,
+                    active_revision=NULL,coordinator_revision=NULL,call_attempt_id=NULL,
+                    deferred_until=clock_timestamp()+interval '500 milliseconds' WHERE id=:id
+            """), {"id": request_id})
 
     def guard_report_in(self, db, job, lease, call):
         request_id = db.scalar(text("""

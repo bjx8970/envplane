@@ -12,6 +12,7 @@ from uuid import uuid4
 from jsonschema import ValidationError
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
+from ..plugins.capacity import CapacityRejected
 from ..plugins.sdk import Deadline, PreparedCall, ExecutionResult, CancelResult, PluginError
 from .adapters import UNAVAILABLE, AdapterUnavailable
 from .repository import JobLeaseLost, ExecutionConflict, InvalidTransition
@@ -130,7 +131,6 @@ class ExecutionDriver:
             try:
                 self.capacity.check_admission()
                 eligible = []
-                from ..plugins.capacity import CapacityRejected
                 for instance in self.repository.candidate_instances():
                     try:
                         self.capacity.check_admission(str(instance))
@@ -143,7 +143,6 @@ class ExecutionDriver:
             except Exception as exc:
                 # Capacity rejection is an expected bounded refusal, not a DB or
                 # leadership error. Never hide an arbitrary persistence failure.
-                from ..plugins.capacity import CapacityRejected
                 if not isinstance(exc, CapacityRejected):
                     raise
         for key, lease in list(self._leases.items()):
@@ -157,7 +156,8 @@ class ExecutionDriver:
     def _advance_recovery(self):
         recovery = self.recovery
         busy_jobs = {str(call["lease"].job_id) for call in self._calls.values()}
-        claimed = recovery.claim(self.owner, self.settings.lease_seconds, busy_jobs)
+        claimed = recovery.claim(self.owner, self.settings.lease_seconds, busy_jobs,
+                                 check_poll_capacity=self.capacity.check_admission, limit=self.settings.scan_limit)
         if claimed is None:
             return
         request, lease = claimed
@@ -173,7 +173,8 @@ class ExecutionDriver:
                                               applicator=self.applicator, recovery_id=request["id"])
             else:
                 step = next(step for step in steps if step["id"] == operation["step_id"])
-                self._submit_operation(lease, step, operation, prepared, "poll", recovery_id=request["id"])
+                if self._submit_operation(lease, step, operation, prepared, "poll", recovery_id=request["id"]) is False:
+                    return
             self.adopt(lease)
         except (JobLeaseLost, DBAPIError, ValidationError, StopIteration, *JOB_FAULTS) as error:
             if isinstance(error, DBAPIError) and not _constraint_violation(error):
@@ -394,6 +395,9 @@ class ExecutionDriver:
             handle = self.capacity.submit(str(instance_id), invoke, deadline_at=attempt.deadline_at,
                                           call_id=attempt.id, lane="ordinary" if method == "execute" else "control")
         except Exception as exc:
+            if recovery_id is not None and isinstance(exc, CapacityRejected):
+                self.recovery.defer_unstarted_poll(recovery_id, lease, operation["id"], attempt.id)
+                return False
             try:
                 if recovery_id is None:
                     self.repository.block(lease, attempt.id, "dispatch_capacity_unavailable")

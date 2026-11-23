@@ -3,7 +3,9 @@ import base64
 import json
 import os
 from pathlib import Path
+import shutil
 from tempfile import TemporaryDirectory
+from time import monotonic, sleep
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -39,13 +41,15 @@ class HttpTests(TestCase):
     def setUp(self):
         _, url = self.enterContext(runtime_database())
         directory = self.enterContext(TemporaryDirectory())
+        self.plugin_directory = Path(directory) / "packages"
+        shutil.copytree(ROOT / "plugins" / "ssh", self.plugin_directory / "ssh")
         self.enterContext(patch.dict(os.environ, {
             "CONTROL_PLANE_SECRET_KEYRING": json.dumps({"test": base64.b64encode(os.urandom(32)).decode()}),
             "CONTROL_PLANE_SECRET_ACTIVE_KEY_ID": "test",
         }))
         self.runtime = ControlPlaneRuntime(RuntimeSettings.from_env({
             "CONTROL_PLANE_DATABASE_URL": url, "CONTROL_PLANE_RUNTIME_CONFIG": deployment(
-                directory, plugin_directory=str(ROOT / "plugins"), required=["ssh"])}))
+                directory, plugin_directory=str(self.plugin_directory), required=["ssh"])}))
         self.addCleanup(self.runtime.stop)
         self.runtime.start()
         self.app = create_app(self.runtime, ORIGIN)
@@ -170,3 +174,58 @@ class HttpTests(TestCase):
         self.assertEqual(revoked.status_code, 200)
         self.assertEqual(student.get(env).status_code, 403)
         self.assertEqual(student.get(accepted.headers["Location"]).status_code, 403)
+
+    def test_rebind_upgraded_ssh_configuration_preserves_old_job_snapshot(self):
+        created = self.create()
+        self.assertEqual(created.status_code, 202, created.text)
+        self.runtime.poll()
+        environment = self.teacher_client.get(created.headers["Location"]).json()["environment_id"]
+        path = "/api/environments/" + environment
+        self.assertEqual(self.teacher_client.post(path + "/assignments",
+                                                 json={"student_id": self.student}).status_code, 200)
+        old = self.client("student").post(path + "/actions/describe", json={"request_key": "old-package"})
+        self.assertEqual(old.status_code, 202, old.text)
+        before = self.runtime.services.configuration.get(self.instance)
+        settings = self.runtime.settings
+        self.runtime.stop()
+        plugin = self.plugin_directory / "ssh" / "plugin.py"
+        with plugin.open("a", encoding="utf-8") as source:
+            source.write("\n# Isolated package upgrade with a new code digest.\n")
+        self.runtime = ControlPlaneRuntime(settings)
+        self.addCleanup(self.runtime.stop)
+        self.runtime.start()
+        self.app = create_app(self.runtime, ORIGIN)
+        admin, student = self.client("admin"), self.client("student")
+        instance = admin.get("/api/admin/plugins").json()["instances"][0]
+        self.assertTrue(instance["needs_rebind"])
+        self.assertFalse(instance["available"])
+        republish = "/api/admin/plugins/" + self.instance + "/rebind"
+        self.assertEqual(student.post(republish, json={"expected_revision": before.revision}).status_code, 403)
+        self.assertEqual(admin.post(republish, json={"expected_revision": before.revision + 1}).status_code, 409)
+        result = admin.post(republish, json={"expected_revision": before.revision})
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(admin.post(republish, json={"expected_revision": before.revision}).status_code, 409)
+        after = self.runtime.services.configuration.get(self.instance)
+        self.assertEqual(after.configuration, before.configuration)
+        self.assertEqual(after.revision, before.revision + 1)
+        self.assertNotEqual(after.code_digest, before.code_digest)
+        self.assertTrue(admin.get("/api/admin/plugins").json()["instances"][0]["available"])
+        self.runtime.poll()
+        self.assertEqual(student.get(old.headers["Location"]).json()["state"], "blocked")
+        new = student.post(path + "/actions/describe", json={"request_key": "new-package"})
+        self.assertEqual(new.status_code, 202, new.text)
+        end = monotonic() + 4
+        while monotonic() < end:
+            self.runtime.poll()
+            if student.get(new.headers["Location"]).json()["state"] == "succeeded":
+                break
+            sleep(.02)
+        else:
+            self.fail("new Job did not finish using the rebound configuration")
+        with self.runtime.fenced_transaction() as db:
+            snapshots = db.execute(text("""
+                SELECT configuration_revision,code_digest FROM control_plane.job_plugin_snapshots
+                WHERE job_id IN (:old,:new) ORDER BY configuration_revision
+            """), {"old": old.json()["job_id"], "new": new.json()["job_id"]}).all()
+            self.assertEqual([tuple(row) for row in snapshots],
+                             [(before.revision, before.code_digest), (after.revision, after.code_digest)])
