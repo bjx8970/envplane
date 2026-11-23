@@ -23,7 +23,7 @@ from control_plane.plugins.registry import PluginRegistry
 from control_plane.plugins.ssh import SSHPlugin
 
 
-def _server(private_key, ready, mode):
+def _server(private_key, ready, mode, port=0):
     key = paramiko.RSAKey.from_private_key(io.StringIO(private_key))
     class Server(paramiko.ServerInterface):
         def check_auth_password(self, username, password):
@@ -40,8 +40,9 @@ def _server(private_key, ready, mode):
                 time.sleep(2)
             return True
     listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.settimeout(4)
-    listener.bind(("127.0.0.1", 0))
+    listener.bind(("127.0.0.1", port))
     listener.listen(1)
     ready.send(listener.getsockname()[1])
     transport = None

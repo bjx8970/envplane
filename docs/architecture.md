@@ -1,6 +1,6 @@
 # v1 架构与产品边界
 
-本文描述 v1 目标设计。当前独立控制面实现 P0 至 P3 服务层，实施范围和实测记录见仓库 README。
+本文描述 v1 目标设计。当前独立控制面已接入 P5 HTTP、模板界面、WebSSH 及管理员运维入口。实施范围和实测记录见仓库 README。
 
 入口：[README](../readme.md)。专题：[插件](plugin-contract.md)、[模板与资源](template-resource-contract.md)、[执行持久化](execution-persistence-contract.md)、[身份安全](identity-security-contract.md)。
 

@@ -5,6 +5,7 @@ Business readiness, credential viewing and remote revocation belong to P3.
 """
 from contextlib import contextmanager
 import base64
+import hmac
 import json
 import os
 import secrets as random_secrets
@@ -62,6 +63,7 @@ class SecretService:
             raise ValueError('AES-256 keyring requires named 32-byte keys')
         self._engine, self._runtime = engine, runtime
         self.__keys, self.__active = dict(keyring), active_key_id
+        self.__evidence_key = hmac.digest(keyring[active_key_id], b"control-plane/evidence/v1", "sha256")
         self.__delivered = set()
         self.__delivered_bytes = 0
         from threading import RLock
@@ -113,6 +115,18 @@ class SecretService:
             elif isinstance(item, list):
                 stack.extend(item)
         return json.loads(encoded)
+
+    def evidence_fingerprint(self, value):
+        return hmac.digest(self.__evidence_key, canonical_json(value).encode(), "sha256").hex()[:32]
+
+    def verification_reference(self, reference, *, key_id=None):
+        key_id = self.__active if key_id is None else key_id
+        key = self.__keys.get(key_id)
+        if key is None:
+            raise ReferenceUnavailable("external verification fingerprint key is unavailable")
+        purpose_key = hmac.digest(key, b"control-plane/external-verification/v1", "sha256")
+        return {"key_id": key_id, "reference_fingerprint": hmac.digest(
+            purpose_key, reference.encode(), "sha256").hex()[:32]}
 
     def _aad(self, row):
         return canonical_json({'secret_id': str(row.secret_id), 'version_id': str(row.id),

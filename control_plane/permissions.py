@@ -23,7 +23,7 @@ _MUTABLE = frozenset({
     "plugin_instances", "plugin_storage_heads", "teacher_quotas", "quota_reservations",
     "environments", "experiment_resources", "environment_assignments", "execution_groups",
     "conflict_protections", "jobs", "job_steps", "operations", "local_resource_items",
-    "secrets", "secret_versions", "interactive_sessions", "access_revocations",
+    "secrets", "secret_versions", "interactive_sessions", "access_revocations", "execution_recovery_requests",
 })
 _TABLE_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN")
 _COLUMN_PRIVILEGES = frozenset({"SELECT", "INSERT", "UPDATE", "REFERENCES"})

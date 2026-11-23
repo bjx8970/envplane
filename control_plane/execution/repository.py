@@ -71,6 +71,7 @@ def _seconds(value):
 class Repository:
     def __init__(self, runtime, *, reference_validator=UNAVAILABLE._unavailable, source_publisher=None, safe_json=None, authorize_job=None):
         self.runtime = runtime
+        self.recovery = None
         self.authorize_job = authorize_job
         self.reference_validator = reference_validator
         self.source_publisher = source_publisher
@@ -296,7 +297,7 @@ class Repository:
             self._guard(uow, lease)
             return _dict(row)
 
-    def begin_call(self, lease, operation_id, method, seconds, *, retry_of_call_id=None):
+    def begin_call(self, lease, operation_id, method, seconds, *, retry_of_call_id=None, recovery_id=None):
         """Return only after intent AND immutable call provenance have committed."""
         if method not in ("execute", "poll", "cancel"):
             raise ValueError("unsupported operation method")
@@ -304,6 +305,10 @@ class Repository:
         with self.runtime.fenced_transaction() as uow:
             job = self._guard(uow, lease)
             self._authorize(uow, job)
+            if recovery_id is not None:
+                if method != "poll":
+                    raise InvalidTransition("administrator recovery only dispatches poll")
+                self.recovery.guard_in(uow, recovery_id, lease, operation_id, "poll")
             op = uow.execute(text("SELECT * FROM control_plane.operations WHERE id=:op AND job_id=:job FOR UPDATE"), {"op": operation_id, "job": lease.job_id}).one()
             prepared = PreparedCall.from_dict(op.prepared_call)
             policy = prepared.execution_policy
@@ -361,6 +366,8 @@ class Repository:
                     "seconds": seconds, "retry": retry_of_call_id})
             if deadline is None:
                 raise InvalidTransition("original execute deadline is exhausted; recovery cannot refresh it")
+            if recovery_id is not None:
+                self.recovery.attach_call_in(uow, recovery_id, call_id)
             if method == "cancel":
                 uow.execute(text("UPDATE control_plane.operations SET cancel_requested_at=COALESCE(cancel_requested_at,clock_timestamp()),cancellation_result='requested' WHERE id=:op"), {"op": operation_id})
             self._guard(uow, lease)
@@ -421,9 +428,11 @@ class Repository:
         # share a transaction. A late report is append-only and grants nothing.
         try:
             with self.runtime.fenced_transaction() as uow:
-                self._guard(uow, lease)
+                job = self._guard(uow, lease)
                 call = self._call(uow, call_id)
                 self._match_call(lease, call)
+                if self.recovery is not None and call["method"] == "poll":
+                    self.recovery.guard_report_in(uow, job, lease, call)
                 evidence = self._append(uow, call, kind, key, data, event_id, trusted=True)
                 if kind == "checkpoint" and self.source_publisher is not None:
                     self.source_publisher(uow, lease.job_id, call["plugin_instance_id"], call["operation_id"], evidence)
@@ -440,7 +449,8 @@ class Repository:
                 or call["coordinator_revision"] != lease.coordinator_revision):
             raise JobLeaseLost("call attempt belongs to an old execution lease")
 
-    def record_result(self, lease, call_id, result, *, projector=UNAVAILABLE, applicator=UNAVAILABLE):
+    def record_result(self, lease, call_id, result, *, projector=UNAVAILABLE, applicator=UNAVAILABLE,
+                      recovery_id=None):
         """Raw safe evidence commits FIRST; local projection failure cannot erase it.
 
         Schema checks happen before this API (RuntimeAdapter); a protocol_error is
@@ -466,6 +476,11 @@ class Repository:
                 job = self._guard(uow, lease)
                 call = self._call(uow, call_id)
                 self._match_call(lease, call)
+                recovery = None
+                if recovery_id is not None:
+                    recovery = self.recovery.guard_in(uow, recovery_id, lease, call["operation_id"], "poll",
+                                                      call_id=call_id)
+                    self._authorize(uow, job)
                 op = _dict(uow.execute(text("""
                     SELECT o.*,j.environment_id,j.logical_invocation_id,j.execution_group_id,j.kind AS job_kind
                     FROM control_plane.operations o JOIN control_plane.jobs j ON j.id=o.job_id WHERE o.id=:op
@@ -488,14 +503,31 @@ class Repository:
                 if result.protocol_error:
                     self._block_in(uow, lease, op, "protocol_error", protocol_error=dict(result.protocol_error))
                 elif result.outcome == "unknown":
+                    if result.external_execution_ref is not None and op["external_execution_ref"] is None:
+                        uow.execute(text("""
+                            UPDATE control_plane.operations SET external_execution_ref=CAST(:ref AS jsonb)
+                            WHERE id=:op
+                        """), {"op": op["id"], "ref": canonical_json(result.external_execution_ref)})
                     self._block_in(uow, lease, op, "unknown_external_result")
                 elif result.outcome == "pending_external":
                     policy = PreparedCall.from_dict(op["prepared_call"]).execution_policy
-                    if result.external_execution_ref is None and policy.recovery != "queryable":
+                    # Earlier returned references remain in the append-only raw results.
+                    ref = (op["external_execution_ref"] if result.external_execution_ref is None
+                           else result.external_execution_ref)
+                    if ref is None and policy.recovery != "queryable":
                         self._block_in(uow, lease, op, "missing_recovery_reference")
                     else:
-                        uow.execute(text("UPDATE control_plane.operations SET state='pending_external',external_execution_ref=CAST(:ref AS jsonb),updated_at=clock_timestamp() WHERE id=:op"), {"op": op["id"], "ref": canonical_json(result.external_execution_ref)})
-                        uow.execute(text("UPDATE control_plane.job_steps SET state='waiting_external',updated_at=clock_timestamp() WHERE id=:step"), {"step": op["step_id"]})
+                        uow.execute(text("""
+                            UPDATE control_plane.operations
+                            SET external_execution_ref=CAST(:ref AS jsonb),updated_at=clock_timestamp()
+                            WHERE id=:op
+                        """), {"op": op["id"], "ref": _json(ref)})
+                        if recovery is not None:
+                            self._block_in(uow, lease, op, "remote_still_pending")
+                        else:
+                            uow.execute(text("UPDATE control_plane.operations SET state='pending_external' WHERE id=:op"),
+                                        {"op": op["id"]})
+                            uow.execute(text("UPDATE control_plane.job_steps SET state='waiting_external',updated_at=clock_timestamp() WHERE id=:step"), {"step": op["step_id"]})
                 elif result.outcome == "failed":
                     uow.execute(text("UPDATE control_plane.operations SET state='failed',error=CAST(:error AS jsonb),finished_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=:op"), {"op": op["id"], "error": _json(raw["error"])})
                     uow.execute(text("UPDATE control_plane.job_steps SET state='failed',error=CAST(:error AS jsonb),finished_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=:step"), {"step": op["step_id"], "error": _json(raw["error"])})
@@ -511,6 +543,12 @@ class Repository:
                     applicator.apply(uow, op, projection)
                 self._log_in(uow, lease.job_id, "result_" + result.outcome)
                 self._guard(uow, lease, terminal=True)
+                if recovery is not None:
+                    outcome = "protocol_error" if result.protocol_error else {
+                        "succeeded": "remote_succeeded", "failed": "remote_failed",
+                        "pending_external": "remote_still_pending", "unknown": "unknown_external_result",
+                    }[result.outcome]
+                    self.recovery.finish_in(uow, recovery, job["environment_id"], outcome)
             return "applied"
         except JobLeaseLost:
             # Even when a newer coordinator accepts the raw result, the original
@@ -519,7 +557,8 @@ class Repository:
         except Exception:
             # Entire local projection transaction rolled back. Retain the safe
             # original result and block under a fresh, fully checked transaction.
-            self.block(lease, call_id, "local_result_application_failed")
+            if recovery_id is None:
+                self.block(lease, call_id, "local_result_application_failed")
             raise
 
     @staticmethod
@@ -689,6 +728,8 @@ class Repository:
                 SELECT j.*,g.revision AS group_revision FROM control_plane.jobs j
                 JOIN control_plane.execution_groups g ON g.id=j.execution_group_id
                 WHERE j.state IN ('running','cancel_requested')
+                  AND NOT EXISTS (SELECT FROM control_plane.execution_recovery_requests r
+                                  WHERE r.job_id=j.id AND r.state='running')
                   AND (j.lease_expires_at<=clock_timestamp() OR EXISTS (
                     SELECT 1 FROM control_plane.operations o
                     JOIN control_plane.operation_call_attempts c ON c.operation_id=o.id
@@ -737,11 +778,33 @@ class Repository:
             evidence = uow.execute(text("SELECT e.id,e.operation_id FROM control_plane.operation_evidence e JOIN control_plane.operations o ON o.id=e.operation_id WHERE e.id=:evidence AND o.job_id=:job"), {"evidence": evidence_id, "job": job_id}).first()
             if evidence is None:
                 raise ExecutionConflict("recovery evidence does not belong to this job")
-            token = uuid4()
-            revision = uow.scalar(text("UPDATE control_plane.execution_groups SET state='active',revision=revision+1,reason=CAST(:reason AS jsonb),updated_at=clock_timestamp() WHERE id=:group AND revision=:expected RETURNING revision"), {"group": row.execution_group_id, "expected": expected_revision, "reason": canonical_json({"actor_id": str(actor_id), "reason": reason, "evidence_id": str(evidence_id)})})
-            uow.execute(text("UPDATE control_plane.jobs SET state='running',lease_owner=:owner,lease_token=:token,lease_expires_at=clock_timestamp()+(:seconds*interval '1 second'),heartbeat_at=clock_timestamp() WHERE id=:job"), {"job": job_id, "owner": owner, "token": token, "seconds": lease_seconds})
-            uow.execute(text("INSERT INTO control_plane.audit_events(actor_id,environment_id,job_id,operation_id,action,result,data) VALUES (:actor,:environment,:job,:operation,'execution.recover','accepted',CAST(:data AS jsonb))"), {"actor": actor_id, "environment": row.environment_id, "job": job_id, "operation": evidence.operation_id, "data": canonical_json({"reason": reason, "evidence_id": str(evidence_id), "revision": revision})})
-            return self._lease(_dict(row), owner, token, revision)
+            if uow.scalar(text("""
+                SELECT EXISTS (SELECT FROM control_plane.execution_recovery_requests
+                               WHERE group_id=:group AND state IN ('queued','running'))
+            """), {"group": row.execution_group_id}):
+                raise ExecutionConflict("administrator recovery is already pending")
+            lease = self._takeover_in(uow, _dict(row), owner, lease_seconds,
+                                      reason={"actor_id": str(actor_id), "reason": reason, "evidence_id": str(evidence_id)})
+            uow.execute(text("INSERT INTO control_plane.audit_events(actor_id,environment_id,job_id,operation_id,action,result,data) VALUES (:actor,:environment,:job,:operation,'execution.recover','accepted',CAST(:data AS jsonb))"), {"actor": actor_id, "environment": row.environment_id, "job": job_id, "operation": evidence.operation_id, "data": canonical_json({"reason": reason, "evidence_id": str(evidence_id), "revision": lease.group_revision})})
+            return lease
+
+    def _takeover_in(self, uow, job, owner, seconds, *, reason=None):
+        revision = uow.scalar(text("""
+            UPDATE control_plane.execution_groups SET state='active',revision=revision+1,
+                reason=COALESCE(CAST(:reason AS jsonb),reason),updated_at=clock_timestamp()
+            WHERE id=:group AND revision=:expected AND current_job_id=:job AND state='blocked'
+            RETURNING revision
+        """), {"job": job["id"], "group": job["execution_group_id"], "expected": job["group_revision"],
+               "reason": _json(reason)})
+        if revision is None:
+            raise ExecutionConflict("recovery owner or revision changed")
+        token = uuid4()
+        uow.execute(text("""
+            UPDATE control_plane.jobs SET state='running',lease_owner=:owner,lease_token=:token,
+                lease_expires_at=clock_timestamp()+(:seconds*interval '1 second'),
+                heartbeat_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=:job
+        """), {"job": job["id"], "owner": owner, "token": token, "seconds": seconds})
+        return self._lease(job, owner, token, revision)
 
     def latest_call(self, operation_id, method="execute"):
         with self.runtime.fenced_transaction() as uow:
@@ -753,7 +816,7 @@ class Repository:
         with self.runtime.fenced_transaction() as uow:
             return int(uow.scalar(text("SELECT count(*) FROM control_plane.operation_call_attempts WHERE operation_id=:op AND method=:method"), {"op": operation_id, "method": method}))
 
-    def replay_result(self, lease, evidence_id, *, projector=UNAVAILABLE, applicator=UNAVAILABLE):
+    def replay_result(self, lease, evidence_id, *, projector=UNAVAILABLE, applicator=UNAVAILABLE, recovery_id=None):
         """Reapply only local mapping from saved evidence; never invokes a plugin.
 
         A new recovery lease cannot masquerade as the original call. Adopt the
@@ -766,12 +829,19 @@ class Repository:
             # network call; apply below using the current lease and original raw.
             evidence, operation_id = row.data, row.operation_id
             source_call_id = row.call_attempt_id
-        return self._adopt_result(lease, operation_id, source_call_id, evidence_id, ExecutionResult.from_dict(evidence), projector, applicator)
+        return self._adopt_result(lease, operation_id, source_call_id, evidence_id, ExecutionResult.from_dict(evidence),
+                                  projector, applicator, recovery_id)
 
-    def _adopt_result(self, lease, operation_id, source_call_id, evidence_id, result, projector, applicator):
+    def _adopt_result(self, lease, operation_id, source_call_id, evidence_id, result, projector, applicator,
+                      recovery_id=None):
         with self.runtime.fenced_transaction() as uow:
             job = self._guard(uow, lease)
             self._authorize(uow, job)
+            recovery = None
+            if recovery_id is not None:
+                recovery = self.recovery.guard_in(uow, recovery_id, lease, operation_id, "apply_result")
+                if str(recovery["evidence_id"]) != str(evidence_id):
+                    raise ExecutionConflict("recovery evidence changed")
             op = _dict(uow.execute(text("SELECT o.*,j.environment_id,j.logical_invocation_id,j.execution_group_id FROM control_plane.operations o JOIN control_plane.jobs j ON j.id=o.job_id WHERE o.id=:op AND o.job_id=:job FOR UPDATE OF o"), {"op": operation_id, "job": lease.job_id}).one())
             if result.outcome != "succeeded" or result.protocol_error or op["state"] not in ("running", "unknown", "pending_external"):
                 raise ExecutionConflict("saved result is not a confirmed applicable success")
@@ -784,6 +854,8 @@ class Repository:
             applicator.apply(uow, op, projection)
             uow.execute(text("INSERT INTO control_plane.audit_events(actor_id,environment_id,job_id,operation_id,action,result,data) VALUES (:actor,:environment,:job,:op,'execution.adopt_result','applied',CAST(:data AS jsonb))"), {"actor": job["actor_id"], "environment": job["environment_id"], "job": lease.job_id, "op": operation_id, "data": canonical_json({"evidence_id": str(evidence_id), "source_call_attempt_id": str(source_call_id)})})
             self._guard(uow, lease, terminal=True)
+            if recovery is not None:
+                self.recovery.finish_in(uow, recovery, job["environment_id"], "result_applied")
         return "applied"
 
     def recover_opening_unknown(self, operation_id, code="session_opening_interrupted"):

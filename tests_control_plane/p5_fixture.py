@@ -5,7 +5,7 @@ requests. It echoes UTF-8 bytes and never launches an operating-system shell.
 """
 import base64
 from contextlib import contextmanager, suppress
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 import os
 from pathlib import Path
@@ -52,6 +52,11 @@ MANIFEST = {
         }}),
         "observe": capability("read_only", {"type": "object", "properties": {"state": {"type": "string"}}}),
         "retire": capability("mutating", {"type": "object"}),
+        "confirm": {
+            **capability("mutating", {"type": "object", "required": ["confirmed"],
+                                      "properties": {"confirmed": {"const": True}}}),
+            "execution": ExecutionPolicy(effect="mutating", recovery="queryable").to_dict(),
+        },
     },
 }
 
@@ -85,7 +90,24 @@ class Provisioner:
         if prepared.action_key == "retire":
             fixture.password = None
             return ExecutionResult("succeeded", output={})
+        if prepared.action_key == "confirm":
+            fixture.recovery_calls.append(("execute", context.invocation_key))
+            return ExecutionResult("unknown", external_execution_ref={"id": "opaque-fixture-reference"},
+                                   external_refs=({"key": "partial", "reference": "opaque-fixture-evidence"},))
         raise AssertionError("unexpected fixture action")
+
+    def poll(self, prepared, execution_ref, context):
+        context.deadline.check()
+        fixture = SERVERS[context.configuration["terminal"]["port"]]
+        fixture.recovery_calls.append(("poll", context.invocation_key))
+        fixture.recovery_references.append(execution_ref)
+        if prepared.action_key != "confirm":
+            raise ValueError("unexpected recovery target")
+        if fixture.poll_override is not None:
+            return fixture.poll_override()
+        if execution_ref != {"id": "opaque-fixture-reference"}:
+            raise ValueError("unexpected recovery target")
+        return ExecutionResult("succeeded", output={"confirmed": True})
 
 
 class EchoHandler(paramiko.ServerInterface):
@@ -134,6 +156,9 @@ def echo_server(host_key):
             flood = threading.Event()
 
         server = EchoServer()
+        server.recovery_calls = []
+        server.recovery_references = []
+        server.poll_override = None
 
         def serve():
             while not stop.is_set():
@@ -227,9 +252,34 @@ def browser_server():
     from control_plane.web.server import serve as serve_http
 
     with environment(paramiko.RSAKey.generate(2048)) as (runtime, ssh, _):
-        # Only deployment data is seeded. The browser creates the instances,
-        # publishes the template and performs every business mutation.
+        # Seed a deployment's old configuration for the upgrade UI.
+        with runtime.fenced_transaction() as db:
+            instance = db.scalar(text("""
+                INSERT INTO control_plane.plugin_instances(plugin_key,instance_alias)
+                VALUES ('p5_fixture','upgrade-example') RETURNING id
+            """))
+            db.execute(text("""
+                INSERT INTO control_plane.plugin_instance_versions
+                    (instance_id,revision,configuration,plugin_version,code_digest)
+                VALUES (:id,1,'{"data":{},"allowed_secret_refs":[]}'::jsonb,'1.0.0',repeat('a',64))
+            """), {"id": instance})
+            db.execute(text("UPDATE control_plane.plugin_instances SET configuration_revision=1 WHERE id=:id"),
+                       {"id": instance})
         origin = os.environ.get("P5_BROWSER_ORIGIN", "http://localhost:18742")
+        driver = runtime.services.driver
+        driver.settings = replace(driver.settings, lease_seconds=4, heartbeat_seconds=1)
+        apply_result = driver.applicator.apply
+        interrupted = False
+
+        def apply_with_one_interruption(uow, operation, projection):
+            nonlocal interrupted
+            if (not interrupted and operation["prepared_call"]["action_key"] == "confirm"
+                    and ssh.recovery_references and len(ssh.recovery_references) == 2):
+                interrupted = True
+                raise ValueError("synthetic local projection failure after a saved result")
+            return apply_result(uow, operation, projection)
+
+        driver.applicator.apply = apply_with_one_interruption
         port = int(origin.rsplit(":", 1)[1])
         path = os.environ["P5_BROWSER_FIXTURE_PATH"]
         Path(path).write_text(json.dumps({"target": ssh.target_ref}), encoding="utf-8")

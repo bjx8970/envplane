@@ -9,6 +9,10 @@ from functools import partial
 from time import monotonic
 from uuid import uuid4
 
+from jsonschema import ValidationError
+from sqlalchemy.exc import DBAPIError, IntegrityError
+
+from ..plugins.capacity import CapacityRejected
 from ..plugins.sdk import Deadline, PreparedCall, ExecutionResult, CancelResult, PluginError
 from .adapters import UNAVAILABLE, AdapterUnavailable
 from .repository import JobLeaseLost, ExecutionConflict, InvalidTransition
@@ -22,6 +26,14 @@ class DriverDiagnostic(RuntimeError):
 # connectivity, coordinator leadership) is a global fault and must still surface.
 JOB_FAULTS = (ExecutionConflict, InvalidTransition, AdapterUnavailable, PluginError,
               ValueError, KeyError, DriverDiagnostic)
+
+
+def _constraint_violation(error):
+    if isinstance(error, IntegrityError):
+        return True
+    details = error.orig.args[0] if error.orig.args else None
+    # pg8000 reports some constraint violations as ProgrammingError.
+    return isinstance(details, dict) and str(details.get("C", "")).startswith("23")
 
 
 @dataclass(frozen=True)
@@ -54,9 +66,10 @@ class DriverSettings:
 
 class ExecutionDriver:
     def __init__(self, repository, capacity, registry, context_builder, *, planner=UNAVAILABLE,
-                 projector=UNAVAILABLE, applicator=UNAVAILABLE, settings=None, owner=None):
+                 projector=UNAVAILABLE, applicator=UNAVAILABLE, settings=None, owner=None, recovery=None):
         self.repository, self.capacity, self.registry = repository, capacity, registry
         self.context_builder = context_builder
+        self.recovery = recovery
         # Pin validation and secret leak/provenance checks are core capabilities,
         # never plugin-supplied functions. Fake builders live only in tests.
         repository.reference_validator = context_builder.validate_prepared_in
@@ -104,17 +117,20 @@ class ExecutionDriver:
             self._last_heartbeat = now
         if now - self._last_scan >= self.settings.recovery_interval_seconds:
             # No recovery plugin code runs in the scan or ordinary pool.
+            if self.recovery is not None:
+                self.recovery.reconcile(self.settings.scan_limit)
             room = self.settings.max_jobs - len(self._leases)
             if room > 0:
                 for lease in self.repository.recover_expired(self.owner, self.settings.lease_seconds,
                                                             limit=min(room, self.settings.scan_limit)):
                     self._leases[str(lease.job_id)] = lease
             self._last_scan = now
+        if self.recovery is not None and len(self._leases) < self.settings.max_jobs:
+            self._advance_recovery()
         if len(self._leases) < self.settings.max_jobs:
             try:
                 self.capacity.check_admission()
                 eligible = []
-                from ..plugins.capacity import CapacityRejected
                 for instance in self.repository.candidate_instances():
                     try:
                         self.capacity.check_admission(str(instance))
@@ -127,7 +143,6 @@ class ExecutionDriver:
             except Exception as exc:
                 # Capacity rejection is an expected bounded refusal, not a DB or
                 # leadership error. Never hide an arbitrary persistence failure.
-                from ..plugins.capacity import CapacityRejected
                 if not isinstance(exc, CapacityRejected):
                     raise
         for key, lease in list(self._leases.items()):
@@ -137,6 +152,34 @@ class ExecutionDriver:
                 self._leases.pop(key, None)
             except JOB_FAULTS as exc:
                 self._isolate(lease, exc)
+
+    def _advance_recovery(self):
+        recovery = self.recovery
+        busy_jobs = {str(call["lease"].job_id) for call in self._calls.values()}
+        claimed = recovery.claim(self.owner, self.settings.lease_seconds, busy_jobs,
+                                 check_poll_capacity=self.capacity.check_admission, limit=self.settings.scan_limit)
+        if claimed is None:
+            return
+        request, lease = claimed
+        try:
+            _, steps, operations = self.repository.view(lease)
+            operation = next(operation for operation in operations if operation["id"] == request["operation_id"])
+            prepared = PreparedCall.from_dict(operation["prepared_call"])
+            if request["action"] == "apply_result":
+                evidence = recovery.result(lease, request["id"], operation["id"])
+                loaded = self._loaded(self._binding(lease, operation["plugin_instance_id"]))
+                loaded.validate_output(prepared.action_key, evidence.output)
+                self.repository.replay_result(lease, request["evidence_id"], projector=self.projector,
+                                              applicator=self.applicator, recovery_id=request["id"])
+            else:
+                step = next(step for step in steps if step["id"] == operation["step_id"])
+                if self._submit_operation(lease, step, operation, prepared, "poll", recovery_id=request["id"]) is False:
+                    return
+            self.adopt(lease)
+        except (JobLeaseLost, DBAPIError, ValidationError, StopIteration, *JOB_FAULTS) as error:
+            if isinstance(error, DBAPIError) and not _constraint_violation(error):
+                raise
+            recovery.abort(request["id"], "recovery_could_not_proceed")
 
     def _isolate(self, lease, exc):
         """Persist a job-scoped failure as blocked and never re-raise it.
@@ -308,7 +351,7 @@ class ExecutionDriver:
         self._calls[str(call_id)] = {"handle": handle, "lease": lease, "step": step,
             "instance_id": instance_id, "stage": "prepare", "deadline": deadline, "timed_out": False}
 
-    def _submit_operation(self, lease, step, operation, prepared, method):
+    def _submit_operation(self, lease, step, operation, prepared, method, *, recovery_id=None):
         instance_id = operation["plugin_instance_id"]
         loaded = self._loaded(self._binding(lease, instance_id))
         self.context_builder.validate_prepared(lease.job_id, instance_id, prepared, step_instance_id=step["id"])
@@ -316,11 +359,15 @@ class ExecutionDriver:
         seconds = min(seconds, step["input"].get("timeout_seconds", seconds))
         previous = self.repository.latest_call(operation["id"], method)
         retry = previous["id"] if method == "execute" and operation["state"] == "unknown" and previous else None
-        attempt = self.repository.begin_call(lease, operation["id"], method, seconds, retry_of_call_id=retry)
+        attempt = self.repository.begin_call(lease, operation["id"], method, seconds,
+                                             retry_of_call_id=retry, recovery_id=recovery_id)
         deadline = Deadline.from_at(attempt.deadline_at)
         context = self._context(lease, step, instance_id, deadline, operation=operation, attempt=attempt, prepared=prepared)
         def invoke():
             deadline.check()
+            if recovery_id is not None:
+                self.recovery.verify_dispatch(recovery_id, lease, operation["id"], attempt.id)
+                deadline.check()
             if method == "execute":
                 result = loaded.implementation.execute(prepared, context)
             else:
@@ -348,25 +395,35 @@ class ExecutionDriver:
             handle = self.capacity.submit(str(instance_id), invoke, deadline_at=attempt.deadline_at,
                                           call_id=attempt.id, lane="ordinary" if method == "execute" else "control")
         except Exception as exc:
+            if recovery_id is not None and isinstance(exc, CapacityRejected):
+                self.recovery.defer_unstarted_poll(recovery_id, lease, operation["id"], attempt.id)
+                return False
             try:
-                self.repository.block(lease, attempt.id, "dispatch_capacity_unavailable")
+                if recovery_id is None:
+                    self.repository.block(lease, attempt.id, "dispatch_capacity_unavailable")
+                else:
+                    self.recovery.abort(recovery_id, "dispatch_capacity_unavailable")
             except (JobLeaseLost, ExecutionConflict, InvalidTransition):
                 pass
             if isinstance(exc, JOB_FAULTS):
                 raise DriverDiagnostic("dispatch capacity unavailable") from None
             raise
         self._calls[str(attempt.id)] = {"handle": handle, "lease": lease, "step": step,
-            "stage": method, "operation": operation, "attempt": attempt, "deadline": deadline, "timed_out": False}
+            "stage": method, "operation": operation, "attempt": attempt, "deadline": deadline, "timed_out": False,
+            "recovery_id": recovery_id}
 
     def _harvest(self):
         for key, call in list(self._calls.items()):
             handle, lease = call["handle"], call["lease"]
+            recovery_id = call.get("recovery_id")
             if not handle.done():
                 if call["deadline"].expired and not call["timed_out"]:
                     call["timed_out"] = True
                     try:
                         if call["stage"] == "prepare":
                             self.repository.prepare_failed(lease, call["step"]["id"], code="prepare_timeout")
+                        elif recovery_id is not None:
+                            self.recovery.abort(recovery_id, "call_deadline_exceeded")
                         else:
                             self.repository.block(lease, call["attempt"].id, "call_deadline_exceeded")
                     except JobLeaseLost:
@@ -403,11 +460,18 @@ class ExecutionDriver:
                     self.repository.record_cancel(lease, call["attempt"].id, result)
                 else:
                     self.repository.record_result(lease, call["attempt"].id, result,
-                                                  projector=self.projector, applicator=self.applicator)
+                                                  projector=self.projector, applicator=self.applicator,
+                                                  recovery_id=recovery_id)
             except JobLeaseLost:
                 self._leases.pop(str(lease.job_id), None)
-            except JOB_FAULTS as exc:
-                self._isolate(lease, exc)
+            except (*JOB_FAULTS, DBAPIError) as exc:
+                if isinstance(exc, DBAPIError) and (recovery_id is None or not _constraint_violation(exc)):
+                    raise
+                if recovery_id is not None:
+                    self.recovery.abort(recovery_id, "recovery_could_not_proceed")
+                    self._leases.pop(str(lease.job_id), None)
+                else:
+                    self._isolate(lease, exc)
             self._next_poll[str(call["operation"]["id"])] = monotonic() + self.settings.poll_interval_seconds
 
 

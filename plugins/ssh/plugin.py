@@ -8,17 +8,19 @@ Hosts are private Storage objects at ``hosts/<id>``. They contain a numeric
 from __future__ import annotations
 
 import base64
+from hashlib import sha256
 import hmac
 import io
 import ipaddress
 import json
 from pathlib import Path
+import re
 import socket
 import threading
 import time
 
 from control_plane.plugins.sdk import (ExecutionPolicy, ExecutionResult, PluginError, PreparedCall,
-                  SafeError, SecretRef, StorageRef, finite_json)
+                  SafeError, SecretRef, StorageRef, canonical_json, finite_json)
 
 
 def _abort_transport(transport):
@@ -68,7 +70,10 @@ class SSHPlugin:
                 raise PluginError("invalid_input", "duplicate host option")
             return PreparedCall(action_key, {"options": items}, storage_refs=tuple(refs),
                                 execution_policy=ExecutionPolicy(effect="read_only"))
-        if action_key != "execute_command" or not isinstance(input, dict) or set(input) != {"host_id", "command"}:
+        required = {"host_id", "command"}
+        optional = {"include_target_fingerprint", "expected_target_fingerprint"}
+        if (action_key != "execute_command" or not isinstance(input, dict)
+                or not required <= input.keys() or input.keys() - required - optional):
             raise PluginError("invalid_input", "invalid SSH action parameters")
         host_id, command = input["host_id"], input["command"]
         if not isinstance(host_id, str) or not host_id or len(host_id) > 240 or "/" in host_id:
@@ -77,13 +82,30 @@ class SSHPlugin:
             raise PluginError("invalid_input", "invalid SSH command")
         entry = context.storage.get("hosts/" + host_id)
         host = self._host(entry.value)
+        include_target = input.get("include_target_fingerprint", False)
+        if not isinstance(include_target, bool):
+            raise PluginError("invalid_input", "invalid SSH target fingerprint option")
+        if "expected_target_fingerprint" in input:
+            expected = input["expected_target_fingerprint"]
+            if not isinstance(expected, str) or re.fullmatch("[a-f0-9]{64}", expected) is None:
+                raise PluginError("invalid_input", "invalid SSH target fingerprint")
+            if expected != self._target_fingerprint(host):
+                raise PluginError("fixed_target_changed", "SSH inventory no longer points to the original target")
         secret = context.secrets.resolve(SecretRef(**host["credential"]))
         if secret.version_id is None:
             raise PluginError("unavailable", "credential version was not fixed")
         host["credential"] = secret.to_dict()
-        return PreparedCall(action_key, {"command": command}, target_ref=host,
+        resolved = {"command": command}
+        if include_target:
+            resolved["include_target_fingerprint"] = True
+        return PreparedCall(action_key, resolved, target_ref=host,
                             storage_refs=(entry.ref,), secret_refs=(secret,),
                             execution_policy=ExecutionPolicy())
+
+    @staticmethod
+    def _target_fingerprint(host):
+        identity = {field: host[field] for field in ("hostname", "port", "username", "host_key")}
+        return sha256(canonical_json(identity).encode()).hexdigest()
 
     @staticmethod
     def _host(value):
@@ -204,8 +226,11 @@ class SSHPlugin:
                     status = channel.recv_exit_status()
                     if status < 0:
                         raise PluginError("connection_lost", "SSH command completion is unknown")
-                    return ExecutionResult("succeeded", output={"exit_code": status,
-                        "stdout": stdout.decode("utf-8", errors="replace"), "stderr": stderr.decode("utf-8", errors="replace")})
+                    output = {"exit_code": status, "stdout": stdout.decode("utf-8", errors="replace"),
+                              "stderr": stderr.decode("utf-8", errors="replace")}
+                    if prepared_call.resolved_input.get("include_target_fingerprint", False):
+                        output["target_fingerprint"] = self._target_fingerprint(host)
+                    return ExecutionResult("succeeded", output=output)
                 if not transport.is_active() or channel.closed:
                     raise PluginError("connection_lost", "SSH command completion is unknown")
                 time.sleep(min(0.01, deadline.check(), max(0.001, wait_until - time.monotonic())))
