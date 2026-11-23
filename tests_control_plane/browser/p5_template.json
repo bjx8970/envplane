@@ -40,7 +40,16 @@
       }
     }
   }],
-  "actions": {},
+  "actions": {
+    "confirm": {
+      "label": "触发待核对操作",
+      "roles": ["student"],
+      "parameters": {},
+      "steps": [{
+        "id": "confirm", "plugin_instance": "fixture", "action": "confirm", "timeout_seconds": 8, "input": {}
+      }]
+    }
+  },
   "readiness": {
     "require_steps": ["install"],
     "require_resources": ["endpoint"],

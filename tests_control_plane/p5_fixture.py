@@ -5,7 +5,7 @@ requests. It echoes UTF-8 bytes and never launches an operating-system shell.
 """
 import base64
 from contextlib import contextmanager, suppress
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 import os
 from pathlib import Path
@@ -52,6 +52,11 @@ MANIFEST = {
         }}),
         "observe": capability("read_only", {"type": "object", "properties": {"state": {"type": "string"}}}),
         "retire": capability("mutating", {"type": "object"}),
+        "confirm": {
+            **capability("mutating", {"type": "object", "required": ["confirmed"],
+                                      "properties": {"confirmed": {"const": True}}}),
+            "execution": ExecutionPolicy(effect="mutating", recovery="queryable").to_dict(),
+        },
     },
 }
 
@@ -85,7 +90,21 @@ class Provisioner:
         if prepared.action_key == "retire":
             fixture.password = None
             return ExecutionResult("succeeded", output={})
+        if prepared.action_key == "confirm":
+            fixture.recovery_calls.append(("execute", context.invocation_key))
+            return ExecutionResult("unknown", external_execution_ref={"id": "opaque-fixture-reference"},
+                                   external_refs=({"key": "partial", "reference": "opaque-fixture-evidence"},))
         raise AssertionError("unexpected fixture action")
+
+    def poll(self, prepared, execution_ref, context):
+        context.deadline.check()
+        fixture = SERVERS[context.configuration["terminal"]["port"]]
+        fixture.recovery_calls.append(("poll", context.invocation_key))
+        if prepared.action_key != "confirm" or execution_ref != {"id": "opaque-fixture-reference"}:
+            raise ValueError("unexpected recovery target")
+        if fixture.poll_override is not None:
+            return fixture.poll_override()
+        return ExecutionResult("succeeded", output={"confirmed": True})
 
 
 class EchoHandler(paramiko.ServerInterface):
@@ -134,6 +153,8 @@ def echo_server(host_key):
             flood = threading.Event()
 
         server = EchoServer()
+        server.recovery_calls = []
+        server.poll_override = None
 
         def serve():
             while not stop.is_set():
@@ -230,6 +251,8 @@ def browser_server():
         # Only deployment data is seeded. The browser creates the instances,
         # publishes the template and performs every business mutation.
         origin = os.environ.get("P5_BROWSER_ORIGIN", "http://localhost:18742")
+        driver = runtime.services.driver
+        driver.settings = replace(driver.settings, lease_seconds=4, heartbeat_seconds=1)
         port = int(origin.rsplit(":", 1)[1])
         path = os.environ["P5_BROWSER_FIXTURE_PATH"]
         Path(path).write_text(json.dumps({"target": ssh.target_ref}), encoding="utf-8")

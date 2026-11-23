@@ -49,4 +49,18 @@ node tests_control_plane/browser/p5_acceptance.cjs \
 
 ## 实测范围边界
 
-浏览器使用 HTTP/WS 回环地址。HTTPS Secure Cookie 在 HTTPS 基址的 HTTP 契约测试中检查，生产 TLS 代理链路未实测。远端撤权在浏览器中覆盖缺少远端能力的处置路径。测试服务运行合成回显，没有验证真实设备上的命令、外部直连终止或生产迁移。旧 Flask 套件不在本次验证范围内。
+P5 初版浏览器使用 HTTP/WS 回环地址，并通过 HTTPS 基址的 HTTP 契约测试检查 Secure Cookie。远端撤权在浏览器中覆盖缺少远端能力的处置路径。原 P5 验收范围为合成回显和一次性 PostgreSQL。
+
+## 管理员运维与隔离发布演练
+
+2026-11-23 在 Debian 13、Python 3.13、PostgreSQL 17.12、Playwright 1.60 和无头 Chromium 148.0.7778.96 上验证。现有浏览器脚本以回环 TLS 代理转发 HTTP 和 WebSocket，浏览器使用本次临时证书。通过 readiness、精确 Origin 和 Secure、HttpOnly、SameSite=Strict Cookie 检查。管理员查看容量、打开阻断 Job、选择核对结论并查询原调用。运维入口仅向管理员显示。原有发布、分配、学生动作、凭据、WebSSH 回显、接管、撤权和显式清理全部通过。
+
+使用一次性 PostgreSQL 17.12 和隔离 Python 环境运行严格入口 `python -B scripts/run_ci_tests.py`，453 项全部通过，0 跳过，用时 154.264 秒。测试对应关系见[执行故障窗口](../../docs/execution-persistence-contract.md#12-验收故障窗口)。
+
+| 发布检查 | 演练结果 |
+| --- | --- |
+| 新库版本与授权 | 在一次性专用库显式升级到 `0004_p3_business_services`，再升级到 `0005_admin_recovery`，重复升级成功。浏览器夹具使用独立低权限运行角色启动。 |
+| 停止旧变更入口 | 从 `main` 的隔离源码副本启动旧应用并验证回环入口。停止旧进程后确认入口关闭，合成对象、责任人及未决结果仍可从旧库核对。 |
+| 备份与回退 | 使用 `pg_dump` 备份合成记录及凭据密文，单独保管测试密钥。停止新控制面和 TLS 代理后恢复到另一空库，使用独立密钥解密验证，并从恢复库重新启动旧应用。 |
+
+正式切换前由部署负责人核实真实对象和远端未决调用、逐项确认接管责任与管理路径、验证生产备份和密钥恢复，再确认生产代理与维护窗口。任一项未确认时暂停切换；回退前先停新变更入口并复核接管对象的执行事实。

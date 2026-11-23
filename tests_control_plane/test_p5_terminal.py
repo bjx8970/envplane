@@ -20,7 +20,7 @@ from tests_control_plane.p5_fixture import COST, PASSWORD, environment, template
 ORIGIN = "https://terminal.test"
 
 
-class TerminalTests(TestCase):
+class TerminalFixture:
     @classmethod
     def setUpClass(cls):
         cls.host_key = paramiko.RSAKey.generate(2048)
@@ -109,6 +109,8 @@ class TerminalTests(TestCase):
                 return item
         self.fail(f"terminal did not emit expected {kind} frame")
 
+
+class TerminalTests(TerminalFixture, TestCase):
     def test_browser_authorization_pty_observe_takeover_release_and_revocation(self):
         info = self.student.get(self.env_url).json()
         self.assertEqual(info["resources"][0]["state"], "unknown")

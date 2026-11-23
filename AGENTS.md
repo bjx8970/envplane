@@ -9,7 +9,7 @@
 - [执行与持久化](docs/execution-persistence-contract.md)
 - [身份、授权与安全](docs/identity-security-contract.md)
 
-专题文档定义 v1 目标设计。独立 `control_plane/` 已接入 P0 启动、P1 持久化协调和最小权限、P2 插件运行时和 Job/Operation 执行、P3 模板与业务授权/配额，以及 P5 HTTP、模板界面和浏览器终端。变更说明区分设计、实现和实测。新控制面以回环 SSH 与隔离数据库验证流程，当前验收范围见 [P5 验收记录](tests_control_plane/browser/P5_ACCEPTANCE.md)。
+专题文档定义 v1 目标设计。独立 `control_plane/` 已接入 P0 启动、P1 持久化协调和最小权限、P2 插件运行时和 Job/Operation 执行、P3 模板与业务授权/配额，以及 P5 HTTP、模板界面和浏览器终端。管理员可查询运维状态并按证据处置阻断 Job。变更说明区分设计、实现和实测。新控制面以回环 SSH 与隔离数据库验证流程，当前验收范围见 [P5 验收记录](tests_control_plane/browser/P5_ACCEPTANCE.md)。
 
 ## 不得偏离的产品边界
 
@@ -65,7 +65,7 @@
 | `control_plane/services.py` / `admission.py` | 显式部署启用 P3 业务服务，准入与 P2 执行共享事务、快照和实时授权边界 |
 | `control_plane/templates.py` / `workflows.py` / `business.py` | P3 发布校验、持久展开、资源生成、环境动作与清理 |
 | `control_plane/identity.py` / `quota.py` / `credentials.py` / `access.py` | P3 课程授权、配额、凭据查看与撤权、会话入口解析 |
-| `control_plane/web/` | 同源 HTTP、模板驱动界面和 WebSocket 入口 |
+| `control_plane/web/` | 同源 HTTP、模板驱动界面、WebSocket 与管理员运维入口 |
 | `control_plane/session_jobs.py` | 通过固定 access 快照准入和建立 P2 会话 |
 | `plugins/ssh/` | SSH 管理命令与主机候选项 |
 | `plugins/ssh_terminal/` | 使用已确认环境凭据的 SSH PTY |

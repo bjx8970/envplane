@@ -18,7 +18,10 @@ function panel(page, name) {
   return page.locator("section").filter({ has: heading(page, name) });
 }
 async function login(browser, user) {
-  const page = await browser.newPage({ viewport: { width: 1250, height: 900 } });
+  const page = await browser.newPage({
+    viewport: { width: 1250, height: 900 },
+    ignoreHTTPSErrors: process.env.P5_ACCEPT_TEST_CERT === "1",
+  });
   page.setDefaultTimeout(15000);
   page.on("pageerror", error => console.error("Browser error:", error.message));
   page.on("response", response => {
@@ -30,6 +33,11 @@ async function login(browser, user) {
   await page.getByLabel("密码", { exact: true }).fill(password);
   await btn(page, "登录").click();
   await heading(page, "实验环境").waitFor();
+  if (new URL(origin).protocol === "https:") {
+    const cookies = await page.context().cookies(origin);
+    assert(cookies.some(cookie => cookie.name === "lab_session" && cookie.secure &&
+      cookie.httpOnly && cookie.sameSite === "Strict"));
+  }
   return page;
 }
 function terminalFrames(page) {
@@ -115,6 +123,24 @@ async function job(page) {
     await job(student);
     await student.getByText("资源观测状态 · online", { exact: true }).waitFor();
     await student.getByText(/^观测时间 · \d/).waitFor();
+    assert.equal(await btn(teacher, "运维").count(), 0);
+    assert.equal(await btn(student, "运维").count(), 0);
+    await student.getByText("触发待核对操作", { exact: true }).click();
+    await btn(student, "执行「触发待核对操作」").click();
+    await heading(student, "Job 执行结果").waitFor();
+    await student.locator("output").filter({ hasText: /^blocked$/ }).waitFor();
+    await btn(admin, "运维").click();
+    await heading(admin, "控制面状态").waitFor();
+    await admin.getByRole("table", { name: "执行池容量" }).waitFor();
+    await btn(admin, "查看 P5 browser environment").click();
+    await heading(admin, "关联 Operation").waitFor();
+    await admin.getByLabel("核对结论").selectOption("evidence_inconclusive");
+    await btn(admin, "保存核对记录").click();
+    await admin.getByText("记录核对 · 已保存核对记录", { exact: true }).waitFor();
+    await btn(admin, "查询原调用").click();
+    await admin.getByText("查询原调用 · 远端确认成功", { exact: true }).waitFor();
+    await btn(student, "返回环境").click();
+    console.log("PASS administrator operational status, blocked Job review and recovery poll");
     const delivered = student.waitForResponse(response => response.url().includes("/credentials/"));
     await btn(student, "查看凭据 1").click();
     const credentialResponse = await delivered;

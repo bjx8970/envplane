@@ -27,6 +27,7 @@ from ..quota import QuotaExceeded
 from ..runtime import LeadershipLost
 from ..templates import TemplateError
 from .auth import BrowserOrigin, BrowserSessions, COOKIE, HttpError, LIFETIME
+from .operations import OperationsViews
 from .terminal import metadata, route as terminal_route, terminal_service
 from .views import Views, require_role, rows
 
@@ -140,6 +141,7 @@ class HttpAPI:
         self.runtime, self.origin = runtime, BrowserOrigin.parse(origin)
         self.sessions = BrowserSessions(runtime)
         self.views = Views(runtime)
+        self.operations = OperationsViews(runtime)
         self.login_slots = anyio.CapacityLimiter(4)
         self.websocket_slots = anyio.CapacityLimiter(64)
 
@@ -197,6 +199,29 @@ class HttpAPI:
         health = self.runtime.health()
         ready = health["ready"] and self.services.business is not None
         return response({"status": "ready" if ready else "degraded"}, 200 if ready else 503)
+
+    def operations_status(self, actor, token, body, path, query):
+        return self.operations.status(actor["id"])
+
+    def blocked_jobs(self, actor, token, body, path, query):
+        return self.operations.blocked_jobs(actor["id"], _id(query.get("before")))
+
+    def blocked_job(self, actor, token, body, path, query):
+        return self.operations.blocked_job(actor["id"], path["job_id"])
+
+    def submit_recovery(self, actor, token, body, path, query):
+        _fields(body, ("action", "reason", "request_key", "expected_revision"), ("operation_id", "evidence_id"))
+        service = self.services.recovery
+        if service is None:
+            raise LeadershipLost("execution recovery is unavailable")
+        key, replayed = service.submit(
+            actor["id"], path["job_id"], action=body["action"], reason=body["reason"],
+            request_key=_id(body["request_key"]), expected_revision=body["expected_revision"],
+            operation_id=_id(body.get("operation_id")), evidence_id=_id(body.get("evidence_id")),
+        )
+        location = "/api/admin/blocked-jobs/" + path["job_id"]
+        return response({"request_id": key, "status_url": location, "replayed": replayed},
+                        200 if body["action"] == "review" else 202, {"Location": location})
 
     def create_environment(self, actor, token, body, path, query):
         _fields(body, ("course_id", "template_version_id", "name", "request_key"), ("parameters",))
@@ -432,9 +457,14 @@ class HttpAPI:
         version = "/api/templates/{version_id:uuid}"
         user = "/api/users/{user_id:uuid}"
         job = "/api/jobs/{job_id:uuid}"
+        blocked = "/api/admin/blocked-jobs/{job_id:uuid}"
         plugin = "/api/admin/plugins/{instance_id:uuid}"
         return [
             route("/health/ready", "GET", self.health, public=True),
+            route("/api/admin/operations/status", "GET", self.operations_status),
+            route("/api/admin/blocked-jobs", "GET", self.blocked_jobs),
+            route(blocked, "GET", self.blocked_job),
+            route(blocked + "/recovery", "POST", self.submit_recovery),
             route("/api/session", "GET", self.session, public=True),
             route("/api/login", "POST", self.login, public=True),
             route("/api/logout", "POST", self.logout),

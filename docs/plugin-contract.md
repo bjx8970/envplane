@@ -76,7 +76,9 @@ v1 不支持热更新、在线安装、多版本并存或数据库中的可执�
         "additionalProperties": false,
         "properties": {
           "host_id": {"type": "string", "minLength": 1},
-          "command": {"type": "string", "minLength": 1}
+          "command": {"type": "string", "minLength": 1},
+          "include_target_fingerprint": {"type": "boolean"},
+          "expected_target_fingerprint": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
         },
         "required": ["host_id", "command"]
       },
@@ -86,7 +88,8 @@ v1 不支持热更新、在线安装、多版本并存或数据库中的可执�
         "properties": {
           "exit_code": {"type": "integer"},
           "stdout": {"type": "string"},
-          "stderr": {"type": "string"}
+          "stderr": {"type": "string"},
+          "target_fingerprint": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
         },
         "required": ["exit_code", "stdout"]
       },

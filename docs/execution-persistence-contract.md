@@ -199,6 +199,8 @@ v1 默认变更范围为 environment:{environment_id}。同一环境的资源变
 
 只有确认没有未决外部变更或完成有效处置时，才释放/移交保护。已确认停止执行的失败现场可允许显式 cleanup 接续；保留配额不等于必须永久阻止所有清理。管理员不能用普通“强制成功”按钮把事实未知改成已清理。
 
+管理员运维入口将结构化核对理由和请求写入 PostgreSQL。同一执行组最多有一条未结恢复请求，接续沿用原 Job 和 Operation，使用执行组 revision 获取推进资格。查询只派发一次原调用的 poll，应用成功证据通过原插件输出 Schema 和本地工作流处理。只要结果仍未决，冲突与配额继续按原工作流保护。控制面重启时，有已提交派发意图的管理员查询保留为中断记录，下一次查询须重新显式提交。
+
 ## 8. 环境状态与清理
 
 环境 lifecycle：creating、ready、create_failed、blocked、deleting、delete_failed、deleted。blocked 另存阻断阶段/原因和之前目标状态，恢复时按 Job/Operation 事实推进。
@@ -294,3 +296,25 @@ COMMIT
 17. 普通轮换后仍授权且远端接受的旧凭据可继续原 Job；紧急吊销/已知失效则阻断，不能读 latest、回退旧秘密或把历史密文存在当可用证据。
 18. Job 内新 Storage/Secret 版本只有显式派生引用可进入后续步骤，恢复不重复生成、不刷新原命名空间视图。
 19. 独立动作采用新的配置快照时，已有资源目标不静默改指其他主机/对象；需要替换时必须显式核对和关联恢复。
+
+| 窗口 | 回归测试 |
+| --- | --- |
+| 1 | [test_step_running_and_prepared_operation_are_atomic_on_write_failure](../tests_control_plane/test_p2_execution.py) |
+| 2 | [test_crash_before_dispatch_recovers_prepared_without_new_operation、test_crash_after_intent_unknown_blocks_and_retains_scope_and_quota](../tests_control_plane/test_p2_recovery.py) |
+| 3 | [test_sync_report_dedupes_and_preserves_changed_same_key_history、test_local_projection_db_fault_preserves_raw_result_and_rolls_products_back](../tests_control_plane/test_p2_execution.py)、[test_local_constraint_rollback_retains_poll_evidence](../tests_control_plane/test_admin_recovery.py) |
+| 4 | [test_schema_error_preserves_original_safe_output_without_second_execute](../tests_control_plane/test_p2_driver.py) |
+| 5 | [test_same_old_token_cannot_gain_authority_under_new_coordinator](../tests_control_plane/test_p2_recovery.py)、[test_timeout_keeps_capacity_and_late_result_is_evidence_only](../tests_control_plane/test_admin_recovery.py) |
+| 6 | [test_two_recoverers_revision_cas_has_one_winner](../tests_control_plane/test_p2_recovery.py)、[test_concurrent_requests_and_local_application_use_original_evidence](../tests_control_plane/test_admin_recovery.py) |
+| 7 | [test_unknown_ssh_execution_keeps_quota_even_with_declared_empty_cleanup、test_finishing_cleanup_waits_for_new_source_fact_then_rejects_its_snapshot](../tests_control_plane/test_p3_integration.py) |
+| 8 | [test_atomic_admission_dedupe_does_not_capture_or_reserve_twice](../tests_control_plane/test_p2_driver.py)、[test_competing_courses_share_the_teachers_last_environment](../tests_control_plane/test_p3_integration.py) |
+| 9 | [test_skipped_required_cleanup_does_not_retire_environment_or_release_quota、test_documented_ssh_template_runs_and_resource_access_tracks_live_assignments](../tests_control_plane/test_p3_integration.py) |
+| 10 | [test_periodic_tick_claims_a_recovery_without_notification、test_restart_retains_committed_poll_intent_without_resubmission](../tests_control_plane/test_admin_recovery.py)、[test_optional_failure_reports_degraded_without_discarding_data](../tests_control_plane/test_p2_services.py) |
+| 11 | [test_cancel_requested_then_real_success_remains_success](../tests_control_plane/test_p2_execution.py) |
+| 12 | [test_restart_disconnect_persists_reason_but_not_remote_stopped](../tests_control_plane/test_p2_sessions.py)、[浏览器闭环](../tests_control_plane/browser/p5_acceptance.cjs) |
+| 13 | [test_exec_acknowledgement_wait_is_bounded_by_total_deadline](../tests_control_plane/test_p2_ssh.py)、[test_expired_original_execute_budget_cannot_be_refreshed_by_keyed_recovery、test_unknown_cancellation_retry_is_bounded_then_polls](../tests_control_plane/test_p2_recovery.py) |
+| 14 | [test_noncooperating_handle_remains_tracked_after_timeout](../tests_control_plane/test_p2_recovery.py)、[test_timeout_keeps_capacity_and_late_result_is_evidence_only](../tests_control_plane/test_admin_recovery.py)、[test_jobs_202_replay_409_capacity_503_and_safe_errors](../tests_control_plane/test_p5_http.py) |
+| 15 | [test_restart_retains_committed_poll_intent_without_resubmission、test_timeout_keeps_capacity_and_late_result_is_evidence_only](../tests_control_plane/test_admin_recovery.py)、[test_crash_after_intent_unknown_blocks_and_retains_scope_and_quota](../tests_control_plane/test_p2_recovery.py) |
+| 16 | [test_two_steps_use_original_config_storage_secret_snapshot_after_rotation](../tests_control_plane/test_p2_driver.py)、[test_list_stable_cursor_survives_concurrent_changes、test_capture_tamper_or_immutable_snapshot_mismatch_is_rejected](../tests_control_plane/test_p2_storage.py) |
+| 17 | [test_unversioned_mapping_stays_at_job_acceptance_after_rotation、test_revocation_and_known_invalidity_override_snapshots_and_handles](../tests_control_plane/test_p2_secrets.py) |
+| 18 | [test_write_does_not_authorize_guessing_new_version、test_successful_output_and_checkpoint_are_trusted_derived_sources](../tests_control_plane/test_p2_storage.py)、[test_stable_derive_reuses_version1_and_spec_conflicts](../tests_control_plane/test_p2_secrets.py) |
+| 19 | [test_documented_ssh_template_runs_and_resource_access_tracks_live_assignments](../tests_control_plane/test_p3_integration.py)，覆盖独立动作发现清单重定向并在准备阶段拒绝 |
