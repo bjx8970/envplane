@@ -13,12 +13,14 @@ from control_plane.execution.repository import ExecutionConflict
 from control_plane.plugins.capacity import CapacityRejected
 from control_plane.plugins.sdk import Deadline, ExecutionResult
 from control_plane.runtime import ControlPlaneRuntime
+from tests_control_plane.p5_fixture import COST, template
 from tests_control_plane.test_p5_terminal import TerminalFixture
 
 
 class AdminRecoveryTests(TerminalFixture, TestCase):
-    def block(self):
-        response = self.student.post(self.env_url + "/actions/confirm", json={"request_key": str(uuid4())})
+    def block(self, env_url=None):
+        response = self.student.post((env_url or self.env_url) + "/actions/confirm",
+                                     json={"request_key": str(uuid4())})
         job = self.wait_job(self.student, response, expected="blocked")
         path = "/api/admin/blocked-jobs/" + job["job_id"]
         response = self.admin.get(path)
@@ -58,7 +60,10 @@ class AdminRecoveryTests(TerminalFixture, TestCase):
 
     def confirm(self, path, job, operation, evidence):
         detail_path = path + "/evidence/" + evidence
-        review = self.payload(job, operation, action="review", reason="evidence_reviewed", evidence_id=evidence)
+        verification = {"source": "independent_record", "method": "matched_execution",
+                        "conclusion": "confirmed_succeeded", "reference": "local-record-opaque-40"}
+        review = self.payload(job, operation, action="review", reason="external_success_declared",
+                              evidence_id=evidence, verification=verification)
         self.assertEqual(self.admin.post(path + "/recovery", json=review).status_code, 409)
         self.assertEqual(self.student.get(detail_path).status_code, 403)
         detail = self.admin.get(detail_path)
@@ -68,9 +73,34 @@ class AdminRecoveryTests(TerminalFixture, TestCase):
         self.assertEqual(detail.json()["output"]["type"], "object")
         self.assertRegex(detail.json()["output"]["fingerprint"], r"^[a-f0-9]{32}$")
         self.assertNotIn("confirmed", detail.text)
+        seen = self.admin.post(path + "/recovery", json=self.payload(
+            job, operation, action="review", reason="evidence_reviewed", evidence_id=evidence))
+        self.assertEqual(seen.status_code, 200, seen.text)
+        insufficient = self.payload(job, operation, action="apply_result", reason="apply_verified_result",
+                                    evidence_id=evidence, confirmed_review_id=seen.json()["request_id"])
+        self.assertEqual(self.admin.post(path + "/recovery", json=insufficient).status_code, 409)
+        self.assertEqual(self.admin.post(path + "/recovery", json={**review, "verification": None}).status_code, 400)
+        self.assertEqual(self.admin.post(path + "/recovery", json={**review,
+                         "verification": {**verification, "conclusion": "inconclusive"}}).status_code, 400)
         accepted = self.admin.post(path + "/recovery", json=review)
         self.assertEqual(accepted.status_code, 200, accepted.text)
-        return accepted.json()["request_id"]
+        request_id = accepted.json()["request_id"]
+        self.assertTrue(self.admin.post(path + "/recovery", json=review).json()["replayed"])
+        self.assertEqual(self.admin.post(path + "/recovery", json={**review,
+                         "verification": {**verification, "reference": "different-record"}}).status_code, 409)
+        observed = self.disposition(path, request_id)
+        self.assertEqual(observed["outcome"], "external_verification_declared")
+        self.assertEqual(observed["verification"]["source"], verification["source"])
+        self.assertNotIn("reference", observed["verification"])
+        self.assertNotIn(verification["reference"], self.admin.get(path).text)
+        with self.runtime.fenced_transaction() as db:
+            audit = db.scalar(text("""
+                SELECT data->'verification' FROM control_plane.audit_events
+                WHERE job_id=:job AND action='execution.admin_recovery'
+                  AND result='external_verification_declared' AND data->>'request_id'=:id
+            """), {"job": job["job_id"], "id": request_id})
+            self.assertEqual(audit, observed["verification"])
+        return request_id
 
     def test_authorized_review_idempotency_and_single_poll(self):
         path, job, operation = self.block()
@@ -237,6 +267,11 @@ class AdminRecoveryTests(TerminalFixture, TestCase):
             while not handle.done() and monotonic() < end:
                 sleep(.02)
             self.assertTrue(handle.done())
+        with self.runtime.fenced_transaction() as db:
+            db.execute(text("""
+                UPDATE control_plane.execution_recovery_requests
+                SET deferred_until=clock_timestamp()-interval '1 second' WHERE id=:id
+            """), {"id": key})
         with patch.object(capacity, "submit", side_effect=CapacityRejected()):
             self.runtime.poll()
         self.assertEqual(self.disposition(path, key)["state"], "queued")
@@ -249,6 +284,62 @@ class AdminRecoveryTests(TerminalFixture, TestCase):
                     AND action='execution.admin_recovery' AND result='dispatch_not_started'
                     AND data->>'request_id'=:id AND data->>'call_attempt_id' IS NOT NULL)
             """), {"job": job["job_id"], "id": key}))
+
+    def test_saturated_instance_rotates_past_scan_limit_even_after_delays_expire(self):
+        self.runtime.services.business.set_quota(self.users["admin"], self.users["teacher"],
+                                                 limits={**COST, "environments": 4})
+        paths = [self.env_url]
+        for number in range(2):
+            environment = self.create_environment(f"Busy instance {number}", str(uuid4()))
+            paths.append("/api/environments/" + environment)
+        second = self.admin.post("/api/admin/plugins", json={
+            "plugin_key": "p5_fixture", "instance_alias": "fixture-b",
+            "configuration": {"data": {"terminal": self.ssh.target_ref}, "allowed_secret_refs": []},
+        })
+        self.assertEqual(second.status_code, 200, second.text)
+        definition = template()
+        definition["actions"]["confirm"]["steps"][0]["plugin_instance"] = "fixture-b"
+        candidate = self.admin.post("/api/templates", json={"definition": definition})
+        self.assertEqual(candidate.status_code, 201, candidate.text)
+        self.version = candidate.json()["version_id"]
+        self.assertEqual(self.admin.post("/api/templates/" + self.version + "/publish", json={}).status_code, 200)
+        idle = self.create_environment("Idle instance", str(uuid4()))
+        paths.append("/api/environments/" + idle)
+        for path in paths[1:]:
+            self.assertEqual(self.teacher.post(path + "/assignments", json={"student_id": self.users["student"]}).status_code, 200)
+        blocked = [self.block(path) for path in paths]
+        keys = []
+        for path, job, operation in blocked:
+            result = self.admin.post(path + "/recovery", json=self.payload(job, operation))
+            self.assertEqual(result.status_code, 202, result.text)
+            keys.append(result.json()["request_id"])
+
+        driver = self.runtime.services.driver
+        driver.settings = replace(driver.settings, scan_limit=2)
+        capacity = driver.capacity
+        capacity.settings = replace(capacity.settings, instance_limit=1)
+        with self.runtime.fenced_transaction() as db:
+            busy_instance = db.scalar(text("SELECT plugin_instance_id FROM control_plane.operations WHERE id=:id"),
+                                      {"id": blocked[0][2]})
+        gate = Event()
+        self.addCleanup(gate.set)
+        capacity.submit(str(busy_instance), lambda: gate.wait(8), lane="control", deadline_at=Deadline.after(8).expires_at)
+        self.runtime.poll()
+        with self.runtime.fenced_transaction() as db:
+            self.assertEqual(db.scalar(text("""
+                SELECT count(*) FROM control_plane.execution_recovery_requests
+                WHERE deferred_until IS NOT NULL AND id=ANY(CAST(:ids AS uuid[]))
+            """), {"ids": keys[:2]}), 2)
+            # Make the old head immediately eligible to prove rotation does not depend on timing.
+            db.execute(text("""
+                UPDATE control_plane.execution_recovery_requests
+                SET deferred_until=clock_timestamp() WHERE id=ANY(CAST(:ids AS uuid[]))
+            """), {"ids": keys[:2]})
+        self.wait_for(lambda: self.disposition(blocked[-1][0], keys[-1])["outcome"] == "remote_succeeded")
+        self.assertEqual([self.disposition(path, request)["state"] for (path, _, _), request
+                          in zip(blocked[:3], keys[:3])], ["queued"] * 3)
+        self.assertEqual([method for method, _ in self.ssh.recovery_calls].count("poll"), 1)
+        gate.set()
 
     def test_local_constraint_rollback_retains_poll_evidence(self):
         path, job, operation = self.block()

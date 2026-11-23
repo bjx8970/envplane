@@ -3,16 +3,25 @@ from sqlalchemy import text
 
 from ..identity import active_role
 from ..plugins.capacity import CapacityRejected
-from ..plugins.sdk import AuthorizationDenied, ExecutionResult, PluginError, PreparedCall
+from ..plugins.sdk import AuthorizationDenied, ExecutionResult, PluginError, PreparedCall, canonical_json
 from .repository import ExecutionConflict
 from .wakeup import notify_jobs
 
 
 REASONS = {
-    "review": {"evidence_reviewed", "evidence_inconclusive"},
+    "review": {"evidence_reviewed", "evidence_inconclusive", "external_success_declared"},
     "poll": {"check_remote_status"},
     "apply_result": {"apply_verified_result"},
 }
+CAPACITY_BACKOFF_SECONDS = .5
+
+
+def _success_evidence(evidence):
+    if evidence is None or evidence["kind"] != "late_result" or evidence["source_method"] not in ("execute", "poll"):
+        raise ExecutionConflict("evidence is not a saved plugin result")
+    result = ExecutionResult.from_dict(evidence["data"])
+    if result.outcome != "succeeded" or result.protocol_error:
+        raise ExecutionConflict("evidence is not a saved success result")
 
 
 class RecoveryRequests:
@@ -64,13 +73,15 @@ class RecoveryRequests:
         if (operation_id is not None and operation is None) or (evidence_id is not None and evidence is None):
             raise ExecutionConflict("evidence or Operation does not belong to the Job")
         if action == "review":
-            if evidence_id is not None and request["reason"] == "evidence_reviewed" and not db.scalar(text("""
+            if request["reason"] == "external_success_declared":
+                _success_evidence(evidence)
+            if evidence_id is not None and request["reason"] != "evidence_inconclusive" and not db.scalar(text("""
                 SELECT EXISTS (SELECT FROM control_plane.audit_events
                     WHERE job_id=:job AND operation_id=:op AND actor_id=:actor AND action='execution.evidence_view'
                       AND data->>'evidence_id'=:evidence AND data->>'group_revision'=:revision)
             """), {"job": job["id"], "op": operation_id, "actor": request["actor_id"],
                    "evidence": str(evidence_id), "revision": str(revision)}):
-                raise ExecutionConflict("open the current evidence detail before confirming it")
+                raise ExecutionConflict("open the current evidence detail before recording the review")
             return
         if (job["kind"] == "session_open" or job["group_state"] != "blocked"
                 or job["current_job_id"] != job["id"] or operation is None
@@ -94,23 +105,23 @@ class RecoveryRequests:
             """), {"op": operation_id}):
                 raise ExecutionConflict("original invocation has no committed attempt")
         else:
-            if evidence is None or evidence["kind"] != "late_result" or evidence["source_method"] not in ("execute", "poll"):
-                raise ExecutionConflict("evidence is not a confirmed result")
-            result = ExecutionResult.from_dict(evidence["data"])
-            if result.outcome != "succeeded" or result.protocol_error:
-                raise ExecutionConflict("evidence is not a confirmed result")
+            _success_evidence(evidence)
             if not db.scalar(text("""
                 SELECT EXISTS (SELECT FROM control_plane.execution_recovery_requests
                     WHERE id=:review AND job_id=:job AND operation_id=:op AND evidence_id=:evidence
                       AND actor_id=:actor AND expected_revision=:revision AND action='review'
-                      AND reason='evidence_reviewed' AND state='completed')
+                      AND reason='external_success_declared' AND state='completed'
+                      AND verification->>'conclusion'='confirmed_succeeded')
             """), {"review": request["confirmed_review_id"], "job": job["id"], "op": operation_id,
                    "evidence": evidence_id, "actor": request["actor_id"],
                    "revision": request["expected_revision"]}):
-                raise ExecutionConflict("the same administrator must confirm this exact evidence and revision")
+                raise ExecutionConflict("the same administrator must record external success for this evidence and revision")
 
     @staticmethod
     def _audit(db, request, environment, result):
+        verification = request["verification"]
+        audit_verification = ({key: value for key, value in verification.items() if key != "key_id"}
+                              if verification is not None else None)
         db.execute(text("""
             INSERT INTO control_plane.audit_events
                 (actor_id,environment_id,job_id,operation_id,action,result,data)
@@ -118,15 +129,16 @@ class RecoveryRequests:
                     jsonb_build_object('request_id',CAST(:id AS uuid),'action',CAST(:action AS text),
                         'reason',CAST(:reason AS text),'evidence_id',CAST(:evidence AS uuid),
                         'expected_revision',CAST(:revision AS bigint),'confirmed_review_id',CAST(:review AS uuid),
-                        'call_attempt_id',CAST(:call AS uuid)))
+                        'call_attempt_id',CAST(:call AS uuid),'verification',CAST(:verification AS jsonb)))
         """), {"actor": request["actor_id"], "env": environment, "job": request["job_id"],
                "op": request["operation_id"], "id": request["id"], "action": request["action"],
                "reason": request["reason"], "evidence": request["evidence_id"],
                "revision": request["expected_revision"], "review": request["confirmed_review_id"],
-               "call": request["call_attempt_id"], "result": result})
+               "call": request["call_attempt_id"], "result": result,
+               "verification": canonical_json(audit_verification) if audit_verification is not None else None})
 
     def submit(self, actor, job_id, *, action, reason, request_key, expected_revision,
-               operation_id=None, evidence_id=None, confirmed_review_id=None):
+               operation_id=None, evidence_id=None, confirmed_review_id=None, verification=None):
         if (not isinstance(action, str) or not isinstance(reason, str)
                 or reason not in REASONS.get(action, ())
                 or type(expected_revision) is not int or not 0 <= expected_revision < 2**63
@@ -134,8 +146,20 @@ class RecoveryRequests:
                 or (action != "review" and operation_id is None)
                 or (action == "apply_result" and evidence_id is None)
                 or ((action == "apply_result") != (confirmed_review_id is not None))
-                or (action == "poll" and evidence_id is not None)):
+                or (action == "poll" and evidence_id is not None)
+                or ((reason == "external_success_declared") != (verification is not None))
+                or (verification is not None and evidence_id is None)):
             raise ValueError("invalid recovery request")
+        if verification is not None:
+            if (not isinstance(verification, dict)
+                    or set(verification) != {"source", "method", "conclusion", "reference"}
+                    or verification["source"] not in ("provider_console", "provider_api", "independent_record")
+                    or verification["method"] not in ("matched_execution", "checked_resource_state", "cross_checked_records")
+                    or verification["conclusion"] != "confirmed_succeeded"):
+                raise ValueError("invalid external success declaration")
+            reference = verification["reference"]
+            if not isinstance(reference, str) or not 1 <= len(reference.strip()) <= 128 or not reference.isprintable():
+                raise ValueError("invalid external verification reference")
         request = {"action": action, "reason": reason, "expected_revision": expected_revision,
                    "job_id": job_id, "operation_id": operation_id, "evidence_id": evidence_id,
                    "confirmed_review_id": confirmed_review_id}
@@ -144,13 +168,21 @@ class RecoveryRequests:
             previous = db.execute(text("""
                 SELECT * FROM control_plane.execution_recovery_requests WHERE actor_id=:actor AND request_key=:key
             """), {"actor": actor, "key": request_key}).mappings().first()
+            stored_verification = None
+            if verification is not None:
+                prior_verification = previous["verification"] if previous is not None else None
+                key_id = prior_verification["key_id"] if prior_verification is not None else None
+                stored_verification = {key: verification[key] for key in ("source", "method", "conclusion")}
+                stored_verification.update(self.runtime.services.secrets.verification_reference(reference.strip(), key_id=key_id))
             if previous is not None:
-                if any(str(previous[key]) != str(value) for key, value in request.items()):
+                if (any(str(previous[key]) != str(value) for key, value in request.items())
+                        or previous["verification"] != stored_verification):
                     raise ExecutionConflict("recovery request key has different input")
                 return previous["id"], True
             job = self._job(db, job_id)
             self._validate(db, job, {**request, "actor_id": actor})
             queued = action != "review"
+            review_outcome = "external_verification_declared" if verification is not None else "reviewed"
             if queued:
                 if db.scalar(text("""
                     SELECT EXISTS (SELECT FROM control_plane.execution_recovery_requests
@@ -165,15 +197,17 @@ class RecoveryRequests:
             saved = db.execute(text("""
                 INSERT INTO control_plane.execution_recovery_requests
                     (job_id,group_id,actor_id,request_key,expected_revision,operation_id,evidence_id,
-                     queue_revision,confirmed_review_id,action,reason,state,outcome,finished_at)
+                     queue_revision,confirmed_review_id,verification,action,reason,state,outcome,finished_at)
                 VALUES (:job_id,:group,:actor,:key,:expected_revision,:operation_id,:evidence_id,
-                        :expected_revision,:confirmed_review_id,:action,:reason,
-                        :state,CASE WHEN :queued THEN NULL ELSE 'reviewed' END,
+                        :expected_revision,:confirmed_review_id,CAST(:verification AS jsonb),:action,:reason,
+                        :state,CASE WHEN :queued THEN NULL ELSE CAST(:review_outcome AS text) END,
                         CASE WHEN :queued THEN NULL ELSE clock_timestamp() END)
                 RETURNING *
             """), {**request, "group": job["execution_group_id"], "actor": actor, "key": request_key,
-                   "state": "queued" if queued else "completed", "queued": queued}).mappings().one()
-            self._audit(db, saved, job["environment_id"], "accepted" if queued else "reviewed")
+                   "state": "queued" if queued else "completed", "queued": queued,
+                   "verification": canonical_json(stored_verification) if stored_verification is not None else None,
+                   "review_outcome": review_outcome}).mappings().one()
+            self._audit(db, saved, job["environment_id"], "accepted" if queued else review_outcome)
             if queued:
                 notify_jobs(db)
             return saved["id"], False
@@ -187,7 +221,8 @@ class RecoveryRequests:
                 WHERE r.state='queued' AND NOT (j.id=ANY(CAST(:busy AS uuid[])))
                   AND (j.state<>'blocked' OR j.lease_expires_at IS NULL OR j.lease_expires_at<=clock_timestamp())
                   AND (r.deferred_until IS NULL OR r.deferred_until<=clock_timestamp())
-                ORDER BY (r.action='apply_result') DESC,r.created_at,r.id LIMIT :limit FOR UPDATE OF r SKIP LOCKED
+                ORDER BY (r.action='apply_result') DESC,COALESCE(r.deferred_until,r.created_at),r.id
+                LIMIT :limit FOR UPDATE OF r SKIP LOCKED
             """), {"busy": list(busy_jobs), "limit": limit}).mappings().all()
             for request in candidates:
                 job = self._job(db, request["job_id"])
@@ -201,6 +236,11 @@ class RecoveryRequests:
                     try:
                         check_poll_capacity(str(request["plugin_instance_id"]), lane="control")
                     except CapacityRejected:
+                        # Move this request behind older eligible work even after its delay expires.
+                        db.execute(text("""
+                            UPDATE control_plane.execution_recovery_requests
+                            SET deferred_until=clock_timestamp()+make_interval(secs=>:seconds) WHERE id=:id
+                        """), {"id": request["id"], "seconds": CAPACITY_BACKOFF_SECONDS})
                         continue
                 lease = self.repository._takeover_in(db, job, owner, seconds)
                 db.execute(text("""
@@ -260,8 +300,8 @@ class RecoveryRequests:
             db.execute(text("""
                 UPDATE control_plane.execution_recovery_requests SET state='queued',queue_revision=active_revision,
                     active_revision=NULL,coordinator_revision=NULL,call_attempt_id=NULL,
-                    deferred_until=clock_timestamp()+interval '500 milliseconds' WHERE id=:id
-            """), {"id": request_id})
+                    deferred_until=clock_timestamp()+make_interval(secs=>:seconds) WHERE id=:id
+            """), {"id": request_id, "seconds": CAPACITY_BACKOFF_SECONDS})
 
     def guard_report_in(self, db, job, lease, call):
         request_id = db.scalar(text("""

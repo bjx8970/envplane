@@ -152,7 +152,7 @@ class OperationsViews:
             """, job=job)
             detail["requests"] = rows(db, """
                 SELECT id AS request_id,actor_id,operation_id,evidence_id,action,reason,state,outcome,
-                       expected_revision,confirmed_review_id,
+                       expected_revision,confirmed_review_id,verification - 'key_id' AS verification,
                        created_at,finished_at FROM control_plane.execution_recovery_requests
                 WHERE job_id=:job ORDER BY created_at DESC,id DESC LIMIT 100
             """, job=job)

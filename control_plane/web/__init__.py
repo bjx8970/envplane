@@ -214,7 +214,7 @@ class HttpAPI:
 
     def submit_recovery(self, actor, token, body, path, query):
         _fields(body, ("action", "reason", "request_key", "expected_revision"),
-                ("operation_id", "evidence_id", "confirmed_review_id"))
+                ("operation_id", "evidence_id", "confirmed_review_id", "verification"))
         service = self.services.recovery
         if service is None:
             raise LeadershipLost("execution recovery is unavailable")
@@ -223,6 +223,7 @@ class HttpAPI:
             request_key=_id(body["request_key"]), expected_revision=body["expected_revision"],
             operation_id=_id(body.get("operation_id")), evidence_id=_id(body.get("evidence_id")),
             confirmed_review_id=_id(body.get("confirmed_review_id")),
+            verification=body.get("verification"),
         )
         location = "/api/admin/blocked-jobs/" + path["job_id"]
         return response({"request_id": key, "status_url": location, "replayed": replayed},

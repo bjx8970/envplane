@@ -314,24 +314,48 @@ async function showOperations(before) {
 }
 
 const RECOVERY_ACTIONS = {
-  review: "记录核对", poll: "查询原调用", apply_result: "应用已验证结果",
+  review: "记录核对", poll: "查询原调用", apply_result: "应用已保存结果",
 };
 const RECOVERY_REASONS = {
-  evidence_reviewed: "已核对已有证据", evidence_inconclusive: "证据不足，仍需核对",
-  check_remote_status: "确认原调用的远端状态", apply_verified_result: "采用已验证的成功证据",
+  evidence_reviewed: "已阅览证据摘要", evidence_inconclusive: "证据不足，仍需核对",
+  check_remote_status: "确认原调用的远端状态", apply_verified_result: "采用已保存的成功证据",
+  external_success_declared: "管理员声明已独立核实外部成功",
 };
 const RECOVERY_STATES = {
   queued: "等待处理", running: "处置中", completed: "已完成", blocked: "仍阻断",
 };
 const RECOVERY_OUTCOMES = {
   reviewed: "已保存核对记录", result_applied: "已应用成功结果",
-  remote_succeeded: "远端确认成功", remote_failed: "远端确认失败",
+  remote_succeeded: "插件查询报告成功", remote_failed: "插件查询报告失败",
+  external_verification_declared: "已保存外部核验声明",
   remote_still_pending: "远端仍在执行", unknown_external_result: "远端结果仍未知",
   protocol_error: "结果未通过协议验证", recovery_interrupted: "处置中断",
   recovery_could_not_proceed: "当前授权或依赖无法完成处置",
   request_no_longer_eligible: "原 Job 或授权条件已变化",
   call_deadline_exceeded: "查询超期", dispatch_capacity_unavailable: "查询容量不足",
 };
+const VERIFICATION_SOURCES = {
+  provider_console: "供应商控制台", provider_api: "供应商 API", independent_record: "独立运维记录",
+};
+const VERIFICATION_METHODS = {
+  matched_execution: "核对原调用记录", checked_resource_state: "检查外部资源状态",
+  cross_checked_records: "交叉核对操作记录",
+};
+
+function externalVerificationForm(panel, save) {
+  const form = formIn(panel);
+  form.append(el("p", "请依据独立来源核实外部执行事实。平台将把以下内容记录为管理员声明。"));
+  const source = select(form, "外部核验来源", Object.entries(VERIFICATION_SOURCES),
+    { empty: "选择来源", required: true });
+  const method = select(form, "外部核验方法", Object.entries(VERIFICATION_METHODS),
+    { empty: "选择方法", required: true });
+  const reference = field(form, "外部核验记录编号", { attrs: { required: "", maxlength: 128 } });
+  const conclusion = select(form, "外部核验结论", [["confirmed_succeeded", "已独立核实原调用成功"]],
+    { empty: "选择结论", required: true });
+  submit(form, "保存外部核验声明", () => save({
+    source: source.value, method: method.value, reference: reference.value, conclusion: conclusion.value,
+  }));
+}
 
 function renderEvidenceSummary(panel, detail) {
   if (detail.outcome) panel.append(el("p", "插件报告 · " + detail.outcome));
@@ -402,29 +426,35 @@ async function showBlockedJob(jobId) {
         el("p", "Operation " + record.operation_id),
         el("p", record.call_attempt_id ? "来源调用 " + record.call_attempt_id : "来源调用未知"));
       const details = el("div");
-      const reviewed = job.requests.find(request => request.action === "review" &&
-        request.actor_id === state.user.id && request.reason === "evidence_reviewed" &&
+      const attestation = job.requests.find(request => request.action === "review" &&
+        request.actor_id === state.user.id && request.reason === "external_success_declared" &&
         request.evidence_id === record.evidence_id && request.expected_revision === job.group_revision);
-      const confirm = sendRecovery("review");
+      const review = sendRecovery("review");
       item.append(button("查看证据详情", async () => {
         const detail = await api(path + "/evidence/" + record.evidence_id);
         details.replaceChildren();
         renderEvidenceSummary(details, detail);
-        if (job.state === "blocked" && !busy && !reviewed && detail.group_revision === job.group_revision) {
-          details.append(button("确认核验此证据", () => confirm({
+        if (job.state === "blocked" && !busy && detail.group_revision === job.group_revision) {
+          details.append(button("记录已阅览摘要", () => review({
             operation_id: record.operation_id, evidence_id: record.evidence_id, reason: "evidence_reviewed",
           })));
+          if (job.recoverable && record.can_apply && !attestation) {
+            externalVerificationForm(details, verification => review({
+              operation_id: record.operation_id, evidence_id: record.evidence_id,
+              reason: "external_success_declared", verification,
+            }));
+          }
         }
       }), details);
       if (job.recoverable && record.can_apply && !busy) {
-        if (reviewed) {
+        if (attestation) {
           const send = sendRecovery("apply_result");
-          item.append(button("应用已验证结果", () => send({
+          item.append(button("应用已保存结果", () => send({
             operation_id: record.operation_id, evidence_id: record.evidence_id,
-            confirmed_review_id: reviewed.request_id, reason: "apply_verified_result",
+            confirmed_review_id: attestation.request_id, reason: "apply_verified_result",
           })));
         } else {
-          item.append(el("p", "应用结果前请查看证据详情并确认核验。"));
+          item.append(el("p", "应用结果前请查看证据详情，并提交外部核验声明。"));
         }
       }
       evidence.append(item);
@@ -438,6 +468,11 @@ async function showBlockedJob(jobId) {
       record.append(el("p", `${RECOVERY_ACTIONS[request.action]} · ${outcome}`),
         el("p", `${RECOVERY_REASONS[request.reason]} · ${request.created_at}`),
         el("p", "管理员 " + request.actor_id));
+      if (request.verification) {
+        const verification = request.verification;
+        record.append(el("p", `管理员外部核验 · ${VERIFICATION_SOURCES[verification.source]}` +
+          ` · ${VERIFICATION_METHODS[verification.method]} · 原调用成功 · 记录指纹 ${verification.reference_fingerprint}`));
+      }
       history.append(record);
     }
     if (job.state === "blocked" && !busy) {

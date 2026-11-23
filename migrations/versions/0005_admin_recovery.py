@@ -21,12 +21,13 @@ def upgrade():
             queue_revision bigint NOT NULL CHECK (queue_revision >= expected_revision),
             deferred_until timestamptz,
             confirmed_review_id uuid REFERENCES control_plane.execution_recovery_requests(id) ON DELETE RESTRICT,
+            verification jsonb CHECK (verification IS NULL OR control_plane.bounded_json(verification,'object')),
             active_revision bigint,
             coordinator_revision bigint,
             call_attempt_id uuid UNIQUE,
             action text NOT NULL CHECK (action IN ('review', 'poll', 'apply_result')),
             reason text NOT NULL CHECK (
-                (action='review' AND reason IN ('evidence_reviewed', 'evidence_inconclusive'))
+                (action='review' AND reason IN ('evidence_reviewed', 'evidence_inconclusive', 'external_success_declared'))
                 OR (action='poll' AND reason='check_remote_status')
                 OR (action='apply_result' AND reason='apply_verified_result')),
             state text NOT NULL CHECK (state IN ('queued', 'running', 'completed', 'blocked')),
@@ -43,6 +44,8 @@ def upgrade():
             CHECK (action='review' OR operation_id IS NOT NULL),
             CHECK (action<>'apply_result' OR evidence_id IS NOT NULL),
             CHECK ((action='apply_result') = (confirmed_review_id IS NOT NULL)),
+            CHECK ((reason='external_success_declared') = (verification IS NOT NULL)),
+            CHECK (verification IS NULL OR (evidence_id IS NOT NULL AND state='completed')),
             CHECK (evidence_id IS NULL OR operation_id IS NOT NULL),
             CHECK ((state IN ('completed', 'blocked')) = (finished_at IS NOT NULL)),
             CHECK ((state IN ('completed', 'blocked')) = (outcome IS NOT NULL)),
@@ -53,8 +56,8 @@ def upgrade():
         );
         CREATE UNIQUE INDEX recovery_one_active_per_group ON control_plane.execution_recovery_requests(group_id)
             WHERE state IN ('queued','running');
-        CREATE INDEX recovery_queue ON control_plane.execution_recovery_requests(created_at,id)
-            WHERE state IN ('queued','running');
+        CREATE INDEX recovery_queue ON control_plane.execution_recovery_requests
+            ((action='apply_result') DESC,COALESCE(deferred_until,created_at),id) WHERE state='queued';
         CREATE INDEX recovery_job_history ON control_plane.execution_recovery_requests(job_id,created_at,id);
         CREATE INDEX jobs_blocked_review ON control_plane.jobs(created_at DESC,id DESC) WHERE state='blocked';
         CREATE TRIGGER recovery_requests_no_truncate BEFORE TRUNCATE ON control_plane.execution_recovery_requests
@@ -62,7 +65,7 @@ def upgrade():
         CREATE TRIGGER recovery_request_identity BEFORE UPDATE ON control_plane.execution_recovery_requests
             FOR EACH ROW EXECUTE FUNCTION control_plane.protect_record(
                 'job_id','group_id','operation_id','evidence_id','actor_id','request_key',
-                'expected_revision','confirmed_review_id','action','reason','created_at');
+                'expected_revision','confirmed_review_id','verification','action','reason','created_at');
         CREATE TRIGGER recovery_request_terminal BEFORE UPDATE ON control_plane.execution_recovery_requests
             FOR EACH ROW WHEN (OLD.state IN ('completed','blocked'))
             EXECUTE FUNCTION control_plane.protect_record();
