@@ -24,11 +24,8 @@ export PIP_CACHE_DIR="$ROOT/tmp/pip-cache"
 if [ ! -x "$PY" ]; then
   python3 -m venv "$VENV"
 fi
-# Install exactly the minimal control-plane dependencies, not legacy requirements.
 "$PY" -m pip install --disable-pip-version-check \
-  'sqlalchemy==2.0.49' 'pg8000==1.31.5' 'alembic==1.17.2' \
-  'jsonschema==4.25.1' 'PyYAML==6.0.3' 'cryptography==48.0.0' 'paramiko==5.0.0' \
-  'starlette==0.52.1' 'uvicorn==0.41.0' 'websockets==16.0' 'httpx==0.28.1'
+  -r "$ROOT/requirements.txt" 'httpx==0.28.1'
 
 TOKEN="$("$PY" -c 'import secrets; print(secrets.token_hex(12))')"
 CONTAINER="k8s-lab-p1-pg-$TOKEN"

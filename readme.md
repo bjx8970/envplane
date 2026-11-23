@@ -4,9 +4,9 @@
 
 ## 项目状态
 
-**新控制面已接入 P5 HTTP API、模板驱动界面和 WebSSH。管理员发布模板，教师创建及分配环境，学生按实时授权运行模板动作、查看环境凭据并使用终端。环境创建沿用 P3 的配额事务，插件调用和会话建立沿用 P2 的持久化执行边界。浏览器验收环境与实测范围见 [P5 验收记录](tests_control_plane/browser/P5_ACCEPTANCE.md)。**
+**仓库的控制面入口为 `python -m control_plane`，提供 HTTP API、模板驱动界面和 WebSSH。管理员发布模板，教师创建及分配环境，学生按实时授权运行模板动作、查看环境凭据并使用终端。环境创建使用配额事务，插件调用和会话建立通过持久化执行内核完成。浏览器验收环境与实测范围见 [P5 验收记录](tests_control_plane/browser/P5_ACCEPTANCE.md)。**
 
-旧 Flask/Jinja 单体仍保留独立入口，直接调用 PVE、OpenWrt，使用进程内任务队列和旧 `clusters`、`vms` 等模型。部署切换须满足架构中的退役前置条件。
+仍在运行旧部署的站点，切换前须完成[旧部署退役检查](docs/architecture.md#91-旧部署退役与硬切换前置条件)。
 
 ## 目标与角色
 
@@ -65,29 +65,23 @@
 
 ## 当前代码位置
 
-| 路径 | 当前实现，不是目标模块划分 |
+| 路径 | 当前实现 |
 | --- | --- |
-| `app.py` / `run.py` | Flask 路由、SocketIO 事件及启动入口 |
-| `modules/db.py` | 旧 SQLAlchemy 模型、PostgreSQL 连接、手写结构补列及 CRUD |
-| `modules/k8s_manager.py` | 固定 PVE/OpenWrt/K8s 编排、内存任务状态和手动重试 |
-| `modules/task_queue.py` | `queue.Queue`；create/delete 各一个线程，deploy 两个线程 |
-| `modules/pve_client.py` / `modules/openwrt_client.py` | 现有供应商协议封装，不是新插件接口 |
-| `modules/ssh_terminal.py` / `modules/status_cache.py` | 旧 WebSSH 会话与状态缓存 |
-| `modules/authz.py` / `modules/security_service.py` | 旧系统的授权策略及服务边界检查 |
-| `modules/audit.py` / `modules/credential_store.py` | 旧审计脱敏和 Fernet 凭据处理 |
-| `templates/` / `static/` | 当前 Jinja 页面和静态资源，不是实验环境模板 |
-| `tests/` | 旧系统 unittest 测试 |
+| `control_plane/cli.py` / `control_plane/runtime.py` | CLI、启动、协调与关闭 |
+| `control_plane/execution/` / `control_plane/plugins/` | 持久化执行、恢复和插件运行时 |
+| `control_plane/templates.py` / `control_plane/business.py` | 实验环境模板、准入与工作流 |
 | `control_plane/web/` | Starlette HTTP、浏览器界面和 WebSocket 适配 |
-| `control_plane/session_jobs.py` / `plugins/ssh_terminal/` | 会话建立 Job 与环境账户的 SSH PTY |
-| `tests_control_plane/browser/` | Chrome 闭环脚本、测试模板和验收记录 |
+| `plugins/` | SSH 管理命令与环境 SSH PTY 插件 |
+| `migrations/` | PostgreSQL Alembic 迁移 |
+| `tests_control_plane/` | 严格测试套件和 Chromium 验收 |
 
-当前数据库连接代码仅创建 PostgreSQL 引擎；测试中使用临时 SQLite 不表示支持 SQLite 部署。旧文档所述“默认 SQLite、在线切换数据库”不适用于当前代码。
+## 安装与数据库初始化
 
-当前启动也存在顺序限制：`app.py` 在数据库初始化前创建 `SSHManager`，其构造过程会读配置表。没有数据库配置或面对空 schema 时不能把现有启动路径视为可用的新系统初始化向导。新系统必须遵守显式初始化、导入无副作用的规范。
+```sh
+python -m pip install -r requirements.txt
+```
 
-## 新控制面 P1 持久化基座
-
-`control_plane/` 与旧 Flask 入口独立，不读取旧 `.db_config.json`、不导入旧业务模块，也不提供兼容层。只使用专用 PostgreSQL 数据库；应用表和 Alembic 版本表位于 `control_plane` schema。迁移发现无关用户表时拒绝执行，不迁移或覆盖旧库。
+控制面使用专用 PostgreSQL 数据库。应用表和 Alembic 版本表位于 `control_plane` schema，迁移发现无关用户表时会拒绝执行。
 
 ```sh
 # 管理会话：CONTROL_PLANE_DATABASE_URL 指向专用库的迁移账号。
@@ -157,13 +151,13 @@ P2 向 P3 提供插件能力、持久化执行、恢复与结果应用接口。�
 
 2026-11-18 P3 实测使用 Python 3.12、一次性 PostgreSQL 17 和回环 SSH，运行 `python -B scripts/run_ci_tests.py`。416 项通过，0 跳过。套件覆盖最小权限升级、模板发布、配额并发、授权撤销、持久展开、清理证据和凭据轮换。P5 实测见独立的浏览器验收记录。
 
-新控制面的严格测试入口（Linux/默认 WSL）：
+严格测试入口（Linux/WSL）：
 
 ```sh
 bash scripts/run_p1_tests.sh
 ```
 
-脚本默认在项目 `tmp/p1-venv` 安装最小依赖，使用本地 Podman 或 Docker 创建仅回环开放、密码认证的一次性 PostgreSQL 17，退出时清理自身容器。CI 默认只发现 `tests_control_plane/`，拒绝 skip、零测试、未运行完或失败；不把新控制面通过解释为旧系统通过。`scripts/run_ci_tests.py --legacy` 才额外发现旧套件，并要求事先安装其依赖。
+脚本默认在项目 `tmp/p1-venv` 安装运行依赖和测试所需的 HTTPX，使用本地 Podman 或 Docker 创建仅回环开放、密码认证的一次性 PostgreSQL 17，退出时清理自身容器。CI 发现 `tests_control_plane/` 中的测试，遇到跳过、零测试、未运行完或失败都会退出报错。
 
 P0 原始冻结文件及通过记录对应 `352437b`；P1 对空库拒启和显式迁移的演进见 `tests_control_plane/P0_ACCEPTANCE.md`，不重写历史冻结哈希。
 
@@ -177,14 +171,6 @@ P0 原始冻结文件及通过记录对应 `352437b`；P1 对空库拒启和显�
 2026-11-15 P2 实测：默认 WSL `RHEL-10.2`、项目隔离 Python 3.12、Podman 一次性 PostgreSQL 17，同一严格入口执行 `bash scripts/run_p1_tests.sh`，352 项全部通过，0 失败、0 错误、0 跳过（107.645 秒），测试容器由脚本退出清理。新增 P2 覆盖：迁移增量与旧 P1 数据升级前置拒绝、执行状态图与终态保护、claim/heartbeat/token/组 revision 双重 fencing、prepare 原子性与预算不刷新、派发意图与 call 来源先提交、同步/晚到证据去重与 `trusted_for_derivation` 边界、结果原子应用与本地重放、两恢复者 CAS、取消与真实成功竞态、未知/超时不重发、容量超期不返 slot 与饱和拒新、会话单控制者/接管/背压/撤权重启语义、Storage 快照与 CAS、Secrets 的实例级授权/轮换/吊销/派生幂等、准入同事务去重与回滚，以及最小 SSH 插件对隔离回环 Paramiko 服务的真实握手、严格 host key、命令与预算验证。
 
 P2 首轮的 10 个失败同源于受控 Unit of Work 结果缺少 `.mappings()`。补齐只读映射包装后通过全套断言。该历史结果的范围为 P2。
-
-旧系统的规范发现入口为：
-
-```sh
-python -B -m unittest discover -s tests -t .
-```
-
-旧测试使用 unittest、模拟供应商和临时数据库。新控制面的验证范围由独立严格套件与浏览器验收记录说明。
 
 新旧部署按[架构中的退役前置条件](docs/architecture.md#91-旧部署退役与硬切换前置条件)硬切换：先确认旧外部对象、未决任务、责任人和管理通道，验证旧库、凭据密文及独立密钥的备份恢复路径；新旧系统不得无协调同时修改同一对象。不要求自动迁移或兼容，不等于授权销毁真实资源、旧库、唯一管理凭据或故障证据。
 

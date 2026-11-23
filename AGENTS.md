@@ -9,7 +9,7 @@
 - [执行与持久化](docs/execution-persistence-contract.md)
 - [身份、授权与安全](docs/identity-security-contract.md)
 
-专题文档定义 v1 目标设计。独立 `control_plane/` 已接入 P0 启动、P1 持久化协调和最小权限、P2 插件运行时和 Job/Operation 执行、P3 模板与业务授权/配额，以及 P5 HTTP、模板界面和浏览器终端。变更说明区分设计、实现和实测。新控制面以回环 SSH 与隔离数据库验证流程，当前验收范围见 [P5 验收记录](tests_control_plane/browser/P5_ACCEPTANCE.md)。
+专题文档定义 v1 目标设计。控制面入口为 `python -m control_plane`，已接入 P0 启动、P1 持久化协调和最小权限、P2 插件运行时和 Job/Operation 执行、P3 模板与业务授权/配额，以及 P5 HTTP、模板界面和浏览器终端。变更说明区分设计、实现和实测。验收使用回环 SSH 与隔离数据库，范围见 [P5 验收记录](tests_control_plane/browser/P5_ACCEPTANCE.md)。
 
 ## 不得偏离的产品边界
 
@@ -50,16 +50,8 @@
 
 | 路径 | 现状 |
 | --- | --- |
-| `app.py` / `run.py` | 旧 HTTP、SocketIO 和入口，存在导入副作用 |
-| `modules/db.py` | PostgreSQL-only 连接，旧 models/CRUD，create_all + 手写补列 |
-| `modules/k8s_manager.py` | PVE/OpenWrt 固定编排、内存任务状态/重试 |
-| `modules/task_queue.py` | 导入时启动 create(1)、delete(1)、deploy(2) 守护线程 |
-| `modules/pve_client.py` / `modules/openwrt_client.py` | 供应商协议实现素材，不是目标插件协议 |
-| `modules/ssh_terminal.py` / `modules/status_cache.py` | 旧会话池和缓存 |
-| `modules/authz.py` / `modules/security_service.py` | 旧授权策略与服务检查 |
-| `modules/audit.py` / `modules/credential_store.py` | 旧脱敏与 Fernet 工具 |
-| `templates/` | Jinja 业务页面，与实验环境模板不同 |
-| `tests/` | 旧 unittest 安全/重试测试，确实存在 |
+| `control_plane/cli.py` / `control_plane/runtime.py` | 显式启停、协调与管理命令 |
+| `migrations/` | PostgreSQL Alembic 迁移 |
 | `control_plane/plugins/` | P2 插件运行时：SDK、Manifest 加载、Storage、Secrets、会话协议、容量与 Fake |
 | `control_plane/execution/` | P2 执行内核：状态机、claim/派发/证据/恢复、纯本地结果应用适配器 |
 | `control_plane/services.py` / `admission.py` | 显式部署启用 P3 业务服务，准入与 P2 执行共享事务、快照和实时授权边界 |
@@ -70,15 +62,12 @@
 | `plugins/ssh/` | SSH 管理命令与主机候选项 |
 | `plugins/ssh_terminal/` | 使用已确认环境凭据的 SSH PTY |
 
-当前代码没有默认 SQLite 引擎；临时 SQLite 只用于隔离测试。不要恢复“支持 SQLite 在线切换”或“没有测试”的旧描述。
-
-`SSHManager` 在旧应用 init_db 前读取配置表，全新配置/空库启动存在阻塞；不能声称旧 /db-config 向导已可用。不要以导入 app 的方式检查未知部署环境，避免启动迁移、连接和线程。
+部署使用专用 PostgreSQL 数据库。测试使用隔离数据库。
 
 ## 验证与操作约束
 
-- 旧测试入口：`python -B -m unittest discover -s tests -t .`；优先在默认 WSL 中运行开发和测试，先验证 Windows 路径映射。git/gh 留在当前 Windows worktree 执行。
-- 新控制面严格入口为 `bash scripts/run_p1_tests.sh`。脚本在隔离 Python 环境安装最小依赖，使用本地 Podman 或 Docker 自建一次性 PostgreSQL 17。浏览器夹具由同一脚本的 `--browser-fixture` 模式启动。当前实测结果见 [P5 验收记录](tests_control_plane/browser/P5_ACCEPTANCE.md)。
-- 新规范必须增加接口、状态机、数据库事务、崩溃、并发、权限和模板驱动 UI 验收；旧测试不能代替这些测试。
+- 严格测试入口为 `bash scripts/run_p1_tests.sh`。脚本在隔离 Python 环境安装依赖，使用本地 Podman 或 Docker 自建一次性 PostgreSQL 17。浏览器夹具由同一脚本的 `--browser-fixture` 模式启动。当前实测结果见 [P5 验收记录](tests_control_plane/browser/P5_ACCEPTANCE.md)。
+- 新规范必须增加接口、状态机、数据库事务、崩溃、并发、权限和模板驱动 UI 验收。
 - 文档更新通常无需运行真实设备、凭据迁移或生产部署；报告实际执行的检查，不复用历史测试次数。
 - 凭据、私钥、密文和加密密钥不写日志或提交。API 使用 Session/CSRF/精确 Origin 白名单，敏感查看和接管须审计。
 - 不主动恢复已删除的旧重构计划。新增规范只在用户明确要求文档时编写；删除过时文档直接删除，不做归档副本。

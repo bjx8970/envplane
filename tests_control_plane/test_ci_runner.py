@@ -119,27 +119,16 @@ class StrictResultTests(unittest.TestCase):
 
 
 class DiscoveryTests(unittest.TestCase):
-    def test_default_discovers_only_control_plane_once(self):
+    def test_discovers_control_plane_suite_once(self):
         with patch.object(runner.unittest, "TestLoader") as loader_class:
             loader = loader_class.return_value
             loader.errors = []
             loader.discover.return_value = unittest.TestSuite()
-            runner.discover_tests()
+            self.assertIs(runner.discover_tests(), loader.discover.return_value)
         loader.discover.assert_called_once_with(
             start_dir=str(runner.ROOT / "tests_control_plane"),
             pattern="test*.py",
             top_level_dir=str(runner.ROOT),
-        )
-
-    def test_legacy_is_explicit_and_discovers_each_directory_once(self):
-        with patch.object(runner.unittest, "TestLoader") as loader_class:
-            loader = loader_class.return_value
-            loader.errors = []
-            loader.discover.side_effect = [unittest.TestSuite(), unittest.TestSuite()]
-            runner.discover_tests(True)
-        self.assertEqual(
-            [call.kwargs["start_dir"] for call in loader.discover.call_args_list],
-            [str(runner.ROOT / "tests_control_plane"), str(runner.ROOT / "tests")],
         )
 
     def test_discovery_import_error_fails(self):

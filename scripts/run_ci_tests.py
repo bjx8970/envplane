@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strict control-plane CI; legacy tests are included only with --legacy."""
+"""Run the strict control-plane test suite."""
 
 from __future__ import annotations
 
@@ -79,21 +79,13 @@ class StrictTestResult(unittest.TextTestResult):
         )
 
 
-def discover_tests(include_legacy: bool = False) -> unittest.TestSuite:
+def discover_tests() -> unittest.TestSuite:
     loader = unittest.TestLoader()
-    suite = unittest.TestSuite()
-    # Never discover from the repository root: that can rediscover nested tests.
-    directories = ["tests_control_plane"]
-    if include_legacy:
-        directories.append("tests")
-    for directory in directories:
-        suite.addTests(
-            loader.discover(
-                start_dir=str(ROOT / directory),
-                pattern="test*.py",
-                top_level_dir=str(ROOT),
-            )
-        )
+    suite = loader.discover(
+        start_dir=str(ROOT / "tests_control_plane"),
+        pattern="test*.py",
+        top_level_dir=str(ROOT),
+    )
     if loader.errors:
         raise RuntimeError("test discovery failed")
     return suite
@@ -127,25 +119,16 @@ def run_suite(suite: unittest.TestSuite, *, stream) -> int:
 
 def main(argv=None, *, stream=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--legacy",
-        action="store_true",
-        help="also discover tests/ (requires its dependencies; no relaxed checks)",
-    )
-    args = parser.parse_args(argv)
+    parser.parse_args(argv)
     stream = sys.stderr if stream is None else stream
     try:
         preflight_database()
     except PreflightError as exc:
         print(str(exc), file=stream)
         return 2
-    print(
-        "Strict CI scope: tests_control_plane"
-        + (" + tests (legacy)" if args.legacy else " (legacy tests/ not included)"),
-        file=stream,
-    )
+    print("Strict CI scope: tests_control_plane", file=stream)
     try:
-        return run_suite(discover_tests(args.legacy), stream=stream)
+        return run_suite(discover_tests(), stream=stream)
     except (Exception, SystemExit):
         print(
             "STRICT CI FAILED: test discovery or execution terminated unexpectedly.",

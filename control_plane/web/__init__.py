@@ -33,7 +33,7 @@ from .views import Views, require_role, rows
 LOG = logging.getLogger(__name__)
 MAX_BODY = 1024 * 1024
 ASSETS = Path(__file__).parent / "assets"
-VENDOR = Path(__file__).resolve().parents[2] / "static" / "vendor" / "xterm"
+XTERM_ASSETS = ASSETS / "vendor" / "xterm"
 
 
 def _serialize(value):
@@ -545,6 +545,6 @@ def create_app(runtime, origin, *, poll=False, on_failure=None):
 
     assets = [Route("/", asset("index.html"))]
     assets += [Route("/assets/" + file, asset(file)) for file in ("app.js", "style.css", "terminal.js")]
-    assets += [Route("/assets/" + file, asset(file, VENDOR))
+    assets += [Route("/assets/" + file, asset(file, XTERM_ASSETS))
                for file in ("xterm.js", "xterm.min.css", "xterm-addon-fit.js")]
     return Starlette(routes=assets + api.routes() + [terminal_route(api)], lifespan=lifespan, exception_handlers={HTTPException: http_error})
