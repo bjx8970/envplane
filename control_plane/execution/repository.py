@@ -119,8 +119,8 @@ class Repository:
         if self.authorize_job is not None and not self.authorize_job(uow, job):
             from ..plugins.sdk import AuthorizationDenied
             raise AuthorizationDenied()
-        workflow = job["execution_snapshot"].get("workflow")
-        if isinstance(workflow, dict) and workflow.get("kind") == "cleanup":
+        workflow = job["execution_snapshot"]["workflow"]
+        if workflow["kind"] == "cleanup":
             from ..workflows import verify_cleanup_evidence
             verify_cleanup_evidence(uow, job, workflow)
 
@@ -500,7 +500,7 @@ class Repository:
                     uow.execute(text("UPDATE control_plane.operations SET state='failed',error=CAST(:error AS jsonb),finished_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=:op"), {"op": op["id"], "error": _json(raw["error"])})
                     uow.execute(text("UPDATE control_plane.job_steps SET state='failed',error=CAST(:error AS jsonb),finished_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=:step"), {"step": op["step_id"], "error": _json(raw["error"])})
                     uow.execute(text("UPDATE control_plane.jobs SET state='failed',error=CAST(:error AS jsonb),finished_at=clock_timestamp() WHERE id=:job"), {"job": lease.job_id, "error": _json(raw["error"])})
-                    self._interrupted(uow, job, dispatched=True)
+                    self._interrupted(uow, job)
                 else:
                     # These two trusted local adapters MUST NOT perform external I/O.
                     projection = projector.project(op, result)
@@ -523,17 +523,9 @@ class Repository:
             raise
 
     @staticmethod
-    def _interrupted(uow, job, *, blocked=False, cancelled=False, dispatched=False):
-        if isinstance(job["execution_snapshot"].get("workflow"), dict):
-            from ..workflows import record_interruption
-            record_interruption(uow, job, blocked=blocked, cancelled=cancelled)
-        elif blocked or dispatched:
-            # Legacy jobs have no template policy describing their effects.
-            Repository._quarantine(uow, job["environment_id"])
-
-    @staticmethod
-    def _quarantine(uow, environment_id):
-        uow.execute(text("UPDATE control_plane.quota_reservations SET state='quarantined',updated_at=clock_timestamp() WHERE environment_id=:environment AND state IN ('reserved','allocated')"), {"environment": environment_id})
+    def _interrupted(uow, job, *, blocked=False, cancelled=False):
+        from ..workflows import record_interruption
+        record_interruption(uow, job, blocked=blocked, cancelled=cancelled)
 
     def _block_in(self, uow, lease, op, code, *, protocol_error=None):
         error = canonical_json({"code": code, "message": "execution requires confirmed recovery evidence"})
@@ -576,14 +568,12 @@ class Repository:
         with self.runtime.fenced_transaction() as uow:
             job = self._guard(uow, lease)
             error = canonical_json({"code": code, "message": "fixed execution dependency requires review"})
-            if isinstance(job["execution_snapshot"].get("workflow"), dict):
-                # A denied/revoked dispatch never touched the remote endpoint.
-                # Keep the evidence but avoid a permanently "prepared" operation
-                # preventing an administrator's explicit cleanup of earlier work.
-                uow.execute(text("""UPDATE control_plane.operations
-                    SET state='cancelled',finished_at=clock_timestamp()
-                    WHERE job_id=:job AND state='prepared' AND dispatch_intent_at IS NULL"""),
-                    {"job": lease.job_id})
+            # Retire undispatched operations so they cannot prevent explicit
+            # cleanup of earlier work in the same environment.
+            uow.execute(text("""UPDATE control_plane.operations
+                SET state='cancelled',finished_at=clock_timestamp()
+                WHERE job_id=:job AND state='prepared' AND dispatch_intent_at IS NULL"""),
+                {"job": lease.job_id})
             uow.execute(text("UPDATE control_plane.job_steps SET state='blocked',error=CAST(:error AS jsonb) WHERE job_id=:job AND state IN ('pending','running','waiting_external')"), {"job": lease.job_id, "error": error})
             uow.execute(text("UPDATE control_plane.jobs SET state='blocked',error=CAST(:error AS jsonb) WHERE id=:job"), {"job": lease.job_id, "error": error})
             uow.execute(text("UPDATE control_plane.execution_groups SET state='blocked',reason=CAST(:error AS jsonb) WHERE id=:group"), {"group": lease.group_id, "error": error})
@@ -663,7 +653,7 @@ class Repository:
                 if not remaining:
                     uow.execute(text("UPDATE control_plane.jobs SET state='cancelled',finished_at=clock_timestamp() WHERE id=:job"), {"job": lease.job_id})
                 # Cancellation confirms execution stopped, not absence of resources.
-                self._interrupted(uow, job, cancelled=True, dispatched=True)
+                self._interrupted(uow, job, cancelled=True)
             self._guard(uow, lease, terminal=True)
 
     def cancel_undispatched(self, lease):
@@ -796,27 +786,23 @@ class Repository:
             require_fenced_connection(uow)
             row = uow.execute(text("""
                 SELECT o.*,j.environment_id,j.execution_group_id,g.revision AS group_revision,
-                  j.lease_owner,j.lease_token,j.lease_expires_at,j.state AS job_state
+                  j.lease_owner,j.lease_token,c.coordinator_owner,c.coordinator_revision
                 FROM control_plane.operations o JOIN control_plane.jobs j ON j.id=o.job_id
                 JOIN control_plane.execution_groups g ON g.id=j.execution_group_id
-                WHERE o.id=:op AND EXISTS (SELECT 1 FROM control_plane.interactive_sessions s
+                JOIN LATERAL (
+                    SELECT coordinator_owner,coordinator_revision FROM control_plane.operation_call_attempts
+                    WHERE operation_id=o.id AND method='execute' ORDER BY created_at DESC,id DESC LIMIT 1
+                ) c ON true
+                WHERE o.id=:op AND o.state='running' AND EXISTS (SELECT 1 FROM control_plane.interactive_sessions s
                   WHERE s.open_operation_id=o.id AND s.job_id=o.job_id AND s.state IN ('opening','disconnected'))
                 FOR UPDATE OF j,g,o
             """), {"op": operation_id}).first()
-            if row is None or row.state != "running":
-                return False
-            call = uow.execute(text("SELECT coordinator_owner,coordinator_revision FROM control_plane.operation_call_attempts WHERE operation_id=:op AND method='execute' ORDER BY created_at DESC,id DESC LIMIT 1"), {"op": operation_id}).first()
-            if call is None:
-                return False  # Legacy dispatched fact needs explicit review.
-            if (str(call.coordinator_owner), call.coordinator_revision) == self._identity():
-                return False  # Never steal a same-generation live opening call.
             owner, revision = self._identity()
+            if row is None or (str(row.coordinator_owner), row.coordinator_revision) == (owner, revision):
+                return False
             # The old coordinator has no current authority, even if the old job
             # deadline has not yet elapsed. This is fact recovery, not execution.
             lease = JobLease(row.job_id, row.lease_owner, row.lease_token, row.execution_group_id,
                              row.group_revision, owner, revision)
             self._block_in(uow, lease, _dict(row), code)
             return True
-
-
-ExecutionRepository = Repository

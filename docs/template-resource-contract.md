@@ -99,7 +99,7 @@ SSH 命令正文由管理员发布。业务用户不能覆盖正文。带用户�
 
 ## 4. 步骤、依赖与展开
 
-普通步骤字段：id、plugin_instance、action、input、depends_on、timeout_seconds、可选 for_each。未声明依赖的步骤只依赖输入引用所要求的已完成事实，不能靠文件排列掩盖缺失依赖；发布器必须校验引用的先行关系。
+普通步骤字段包括 id、plugin_instance、action、input、depends_on、timeout_seconds 和可选的 for_each。模板、选择器和访问入口均通过部署中唯一的实例别名填写 `plugin_instance`。未声明依赖的步骤只依赖输入引用所要求的已完成事实，发布器必须校验引用的先行关系。
 
 - 步骤 ID 在流程内唯一；依赖必须存在且无环。
 - 步骤输出必须通过插件 output_schema，才允许作为后续成功输入。

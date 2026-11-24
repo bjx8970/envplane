@@ -57,19 +57,21 @@ CREATE TABLE control_plane.courses (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     owner_teacher_id uuid NOT NULL REFERENCES control_plane.users(id) ON DELETE RESTRICT,
     name text NOT NULL, created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    UNIQUE (id, owner_teacher_id)
+    deleted_at timestamptz, UNIQUE (id, owner_teacher_id)
 );
 CREATE TABLE control_plane.groups (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     course_id uuid NOT NULL REFERENCES control_plane.courses(id) ON DELETE RESTRICT,
-    name text NOT NULL, created_at timestamptz NOT NULL DEFAULT clock_timestamp(), UNIQUE (id, course_id)
+    name text NOT NULL, created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    deleted_at timestamptz, UNIQUE (id, course_id)
 );
 CREATE TABLE control_plane.course_members (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     course_id uuid NOT NULL REFERENCES control_plane.courses(id) ON DELETE RESTRICT,
     student_id uuid NOT NULL REFERENCES control_plane.users(id) ON DELETE RESTRICT, group_id uuid,
     added_by uuid NOT NULL REFERENCES control_plane.users(id) ON DELETE RESTRICT,
-    joined_at timestamptz NOT NULL DEFAULT clock_timestamp(), UNIQUE (course_id, student_id),
+    joined_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    left_at timestamptz, UNIQUE (course_id, student_id),
     FOREIGN KEY (group_id, course_id) REFERENCES control_plane.groups(id, course_id) ON DELETE RESTRICT
 );
 CREATE TABLE control_plane.templates (
@@ -108,6 +110,9 @@ FOR EACH ROW EXECUTE FUNCTION control_plane.protect_template_status();
 
 CREATE TABLE control_plane.plugin_instances (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(), plugin_key text NOT NULL,
+    instance_alias text NOT NULL UNIQUE
+        CHECK (instance_alias ~ '^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$'
+               AND instance_alias !~* '^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$'),
     enabled boolean NOT NULL DEFAULT true,
     namespace_revision bigint NOT NULL DEFAULT 0 CHECK (namespace_revision >= 0),
     configuration_revision bigint NOT NULL DEFAULT 0 CHECK (configuration_revision >= 0),
@@ -115,7 +120,7 @@ CREATE TABLE control_plane.plugin_instances (
     created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 CREATE TRIGGER plugin_instance_identity BEFORE UPDATE OR DELETE ON control_plane.plugin_instances
-FOR EACH ROW EXECUTE FUNCTION control_plane.protect_record('id','plugin_key','created_at');
+FOR EACH ROW EXECUTE FUNCTION control_plane.protect_record('id','plugin_key','instance_alias','created_at');
 CREATE FUNCTION control_plane.protect_instance_revision() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     IF NEW.namespace_revision < OLD.namespace_revision OR NEW.configuration_revision < OLD.configuration_revision THEN
@@ -190,6 +195,7 @@ CREATE TABLE control_plane.secrets (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     purpose text NOT NULL CHECK (purpose IN ('admin_connection','environment')),
     environment_id uuid, derived_key text UNIQUE,
+    derived_spec_digest text CHECK (derived_spec_digest IS NULL OR length(derived_spec_digest) > 0),
     created_by uuid REFERENCES control_plane.users(id) ON DELETE RESTRICT,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     CHECK ((purpose = 'admin_connection' AND environment_id IS NULL)
@@ -197,6 +203,8 @@ CREATE TABLE control_plane.secrets (
 );
 CREATE TRIGGER secret_identity BEFORE UPDATE OR DELETE ON control_plane.secrets
 FOR EACH ROW EXECUTE FUNCTION control_plane.protect_record('id','purpose','environment_id','derived_key','created_at');
+CREATE TRIGGER secret_derived_spec BEFORE UPDATE ON control_plane.secrets
+FOR EACH ROW EXECUTE FUNCTION control_plane.protect_record('derived_spec_digest');
 CREATE TABLE control_plane.secret_versions (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     secret_id uuid NOT NULL REFERENCES control_plane.secrets(id) ON DELETE RESTRICT,
@@ -229,3 +237,78 @@ CREATE TABLE control_plane.coordinator_leases (
         OR (owner_id IS NOT NULL AND expires_at IS NOT NULL AND backend_pid IS NOT NULL))
 );
 INSERT INTO control_plane.coordinator_leases (id, revision) VALUES (1, 0);
+
+CREATE FUNCTION control_plane.protect_storage_head() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    target_version bigint;
+    target_revision bigint;
+    previous_version bigint;
+    previous_revision bigint;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'storage heads cannot be deleted; append a tombstone instead'
+            USING ERRCODE = '23514';
+    END IF;
+    IF TG_OP = 'UPDATE' AND
+       (NEW.instance_id IS DISTINCT FROM OLD.instance_id OR NEW.key IS DISTINCT FROM OLD.key) THEN
+        RAISE EXCEPTION 'storage head identity is immutable' USING ERRCODE = '23514';
+    END IF;
+
+    SELECT version, namespace_revision INTO target_version, target_revision
+      FROM control_plane.plugin_storage_versions
+      WHERE id = NEW.version_id AND instance_id = NEW.instance_id AND key = NEW.key;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'storage head must reference matching history' USING ERRCODE = '23514';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM control_plane.plugin_storage_versions
+        WHERE instance_id = NEW.instance_id AND key = NEW.key
+          AND (version > target_version OR namespace_revision > target_revision)
+    ) THEN
+        RAISE EXCEPTION 'storage head must reference the newest history' USING ERRCODE = '23514';
+    END IF;
+
+    IF TG_OP = 'UPDATE' AND NEW.version_id IS DISTINCT FROM OLD.version_id THEN
+        SELECT version, namespace_revision INTO previous_version, previous_revision
+          FROM control_plane.plugin_storage_versions
+          WHERE id = OLD.version_id AND instance_id = OLD.instance_id AND key = OLD.key;
+        IF NOT FOUND OR target_version <= previous_version OR target_revision <= previous_revision THEN
+            RAISE EXCEPTION 'storage head can only advance' USING ERRCODE = '23514';
+        END IF;
+    END IF;
+    -- UPDATE already serializes the head row. Do not take the instance lock here:
+    -- write_storage locks instance -> head, so head -> instance would deadlock.
+    RETURN NEW;
+END $$;
+CREATE TRIGGER storage_head_guard
+    BEFORE INSERT OR UPDATE OR DELETE ON control_plane.plugin_storage_heads
+    FOR EACH ROW EXECUTE FUNCTION control_plane.protect_storage_head();
+
+-- History and its head are written together, but history is inserted first.
+-- Check completeness at transaction end rather than rejecting that valid window.
+CREATE FUNCTION control_plane.check_storage_head_current() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM control_plane.plugin_storage_heads h
+        JOIN control_plane.plugin_storage_versions v
+          ON (v.id, v.instance_id, v.key) = (h.version_id, h.instance_id, h.key)
+        WHERE h.instance_id = NEW.instance_id AND h.key = NEW.key
+          AND NOT EXISTS (
+              SELECT 1 FROM control_plane.plugin_storage_versions newer
+              WHERE newer.instance_id = h.instance_id AND newer.key = h.key
+                AND (newer.version > v.version OR newer.namespace_revision > v.namespace_revision)
+          )
+    ) THEN
+        RAISE EXCEPTION 'storage history requires its newest current head'
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NULL;
+END $$;
+CREATE CONSTRAINT TRIGGER storage_history_head_current
+    AFTER INSERT ON control_plane.plugin_storage_versions
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION control_plane.check_storage_head_current();
+CREATE CONSTRAINT TRIGGER storage_head_current
+    AFTER INSERT OR UPDATE ON control_plane.plugin_storage_heads
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION control_plane.check_storage_head_current();

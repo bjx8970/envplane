@@ -27,6 +27,7 @@ from control_plane.runtime import ControlPlaneRuntime
 from control_plane.templates import TemplateError
 from control_plane.workflows import lock_evidence_environment, verify_cleanup_evidence
 from tests_control_plane.p1_harness import runtime_database
+from tests_control_plane.test_p1_schema import recorded_evidence
 from tests_control_plane.test_p2_services import deployment
 from tests_control_plane.test_p2_ssh import _server
 
@@ -348,9 +349,7 @@ class BusinessIntegrationTests(unittest.TestCase):
                     JOIN control_plane.operation_call_attempts c ON c.operation_id=o.id WHERE c.id=:id"""),
                                          {"id": call}).one()
                 lock_evidence_environment(writing, source.job_id)
-                writing.execute(text("""INSERT INTO control_plane.operation_evidence
-                    (operation_id,kind,ref_key,revision,data) VALUES (:id,'checkpoint','delayed',1,'{}')"""),
-                                {"id": source.id})
+                recorded_evidence(writing, source.id, call=call, ref_key="delayed")
                 future = pool.submit(self.finish, cleanup, expected="blocked")
                 self.wait_for_blocked_reader(writing, future)
             self.assertEqual(future.result(10), env)

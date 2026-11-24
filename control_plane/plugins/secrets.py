@@ -314,29 +314,6 @@ class SecretService:
             uow.execute(text('''INSERT INTO control_plane.job_secret_refs(job_id,plugin_instance_id,secret_version_id)
                 VALUES (:job,:instance,:version)'''), {'job': job_id, 'instance': instance_id, 'version': row.id})
 
-    def pin_job_in(self, uow, job_id, instance_id, config_version_id):
-        require_fenced_connection(uow)
-        active_instance(uow, instance_id)
-        config = uow.execute(text('''SELECT v.configuration,j.environment_id FROM control_plane.plugin_instance_versions v
-            JOIN control_plane.job_plugin_snapshots p ON p.instance_id=v.instance_id AND p.configuration_revision=v.revision
-            JOIN control_plane.jobs j ON j.id=p.job_id
-            WHERE v.id=:config AND p.job_id=:job AND v.instance_id=:instance'''),
-            {'config': config_version_id, 'job': job_id, 'instance': instance_id}).first()
-        if config is None:
-            raise AuthorizationDenied()
-        # The administrator's explicit configuration envelope is the ONLY initial authority.
-        for candidate in config.configuration.get('allowed_secret_refs', []):
-            candidate = dict(candidate)
-            if not candidate.get('version_id'):
-                candidate['version_id'] = str(uow.scalar(text('''SELECT id FROM control_plane.secret_versions
-                    WHERE secret_id=:secret ORDER BY version DESC LIMIT 1'''), {'secret': candidate['secret_id']}))
-            row = self._row(uow, candidate)
-            if row.purpose == 'environment' and str(row.environment_id) != str(config.environment_id):
-                raise AuthorizationDenied()
-            uow.execute(text('''INSERT INTO control_plane.job_secret_refs(job_id,plugin_instance_id,secret_version_id)
-                VALUES (:job,:instance,:version) ON CONFLICT DO NOTHING'''),
-                {'job': job_id, 'instance': instance_id, 'version': row.id})
-
     def bind(self, job_id, instance_id, environment_id, prepared_refs=None, *, step_instance_id=None, operation_id=None, access_guard=None):
         refs = None if prepared_refs is None else tuple(ref_dict(ref) for ref in prepared_refs)
         return BoundSecrets(self, str(job_id), str(instance_id), str(environment_id), refs,

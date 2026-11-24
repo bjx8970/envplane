@@ -219,17 +219,17 @@ class RecoveryTests(P2DatabaseCase):
         self.assertEqual(self.row("operations", op["id"])["state"], "cancelled")
         self.assertEqual(self.row("jobs", self.job)["state"], "cancelled")
         self.assertEqual(self.row("quota_reservations", self.reservation)["state"], "quarantined")
-        self.assertEqual(self.row("execution_groups", self.group)["state"], "active")
+        self.assertEqual(self.row("execution_groups", self.group)["state"], "blocked")
 
-    def test_undispatched_cancel_never_fakes_remote_cleanup(self):
+    def test_cancel_before_creation_dispatch_releases_reservation_and_scope(self):
         op = self.prepared()
         self.repo.request_cancel(self.job)
         self.repo.cancel_undispatched(self.lease)
         self.assertEqual(self.row("jobs", self.job)["state"], "cancelled")
         self.assertEqual(self.row("operations", op["id"])["state"], "cancelled")
-        # P3 adapter decides safe reservation release; kernel does not release
-        # existing occupancy merely from the absence of dispatch in THIS job.
-        self.assertEqual(self.row("quota_reservations", self.reservation)["state"], "reserved")
+        self.assertEqual(self.row("quota_reservations", self.reservation)["state"], "released")
+        self.assertEqual(self.row("execution_groups", self.group)["state"], "released")
+        self.assertEqual(self.row("environments", self.env)["lifecycle"], "create_failed")
 
 
 class DriverBudgetTests(unittest.TestCase):
@@ -310,7 +310,7 @@ class DriverBudgetTests(unittest.TestCase):
                      "step_id": uuid4(), "dispatch_intent_at": "set",
                      "cancellation_result": cancellation_result, "plugin_instance_id": uuid4()}
         job = {"cancel_requested_at": "set", "available_at": 0, "database_now": 1,
-               "execution_snapshot": {}}
+               "execution_snapshot": {"workflow": {"kind": "create", "steps": []}}}
         repo = mock.Mock()
         repo.view.return_value = (job, [{"id": operation["step_id"], "step_path": "s", "item_key": "",
                                          "state": "waiting_external", "input": {}, "output": None}], [operation])
@@ -360,7 +360,7 @@ class DriverBudgetTests(unittest.TestCase):
                      "step_id": uuid4(), "dispatch_intent_at": "set",
                      "cancellation_result": None, "plugin_instance_id": uuid4()}
         job = {"cancel_requested_at": None, "available_at": 0, "database_now": 1,
-               "execution_snapshot": {}}
+               "execution_snapshot": {"workflow": {"kind": "create", "steps": []}}}
         repo = mock.Mock()
         repo.view.return_value = (job, [{"id": operation["step_id"], "step_path": "s", "item_key": "",
                                          "state": "waiting_external", "input": {}, "output": None}], [operation])

@@ -8,13 +8,14 @@ from sqlalchemy.exc import DBAPIError
 
 from control_plane.config import RuntimeSettings
 from control_plane.migrations import (
-    BASELINE_REVISION, HEAD_REVISION, P1_REVISION, MigrationError,
-    SchemaMismatch, check_schema, run_migrations,
+    HEAD_REVISION, MigrationError, SchemaMismatch, check_schema, run_migrations,
 )
 from control_plane.permissions import grant_runtime_permissions, validate_runtime_permissions
-from tests_control_plane.p1_harness import fresh_database, migrated_database
+from tests_control_plane.p1_harness import migrated_database
 from tests_control_plane.pg_harness import engine_for
-from tests_control_plane.test_p1_schema import insert, job_arguments, operation_arguments
+from tests_control_plane.test_p1_schema import (
+    call_arguments, insert, job_arguments, operation_arguments, recorded_evidence,
+)
 
 
 def runtime_graph(connection):
@@ -24,13 +25,6 @@ def runtime_graph(connection):
     operation = operation_arguments(connection, job, step)
     op = insert(connection, "operations", **operation)
     return args, job, step, op, operation["plugin_instance_id"]
-
-
-def call_arguments(operation, **changes):
-    now = datetime.now(timezone.utc)
-    return dict(operation_id=operation, method="execute", job_lease_owner="test-worker",
-                job_lease_token=uuid4(), coordinator_owner=uuid4(), coordinator_revision=1,
-                created_at=now, deadline_at=now + timedelta(seconds=30), **changes)
 
 
 class P2SchemaTests(unittest.TestCase):
@@ -60,13 +54,7 @@ class P2SchemaTests(unittest.TestCase):
         return insert(self.conn, "operation_call_attempts", **values)
 
     def evidence(self, call=None, **changes):
-        values = dict(operation_id=self.op, kind="checkpoint", ref_key=uuid4().hex,
-                      revision=1, data={})
-        if call is not None:
-            values.update(call_attempt_id=call, event_id=uuid4().hex, event_digest="a" * 64,
-                          observed_at=datetime.now(timezone.utc))
-        values.update(changes)
-        return insert(self.conn, "operation_evidence", **values)
+        return recorded_evidence(self.conn, self.op, call=call, **changes)
 
     def secret(self):
         secret = insert(self.conn, "secrets", purpose="environment", environment_id=self.args["environment_id"])
@@ -109,14 +97,13 @@ class P2SchemaTests(unittest.TestCase):
             with self.conn.begin_nested():
                 insert(self.conn, "operation_call_attempts", **call_arguments(other, retry_of_call_id=call))
 
-    def test_evidence_legacy_nulls_and_new_event_deduplication(self):
-        self.evidence()
+    def test_evidence_event_identity_is_unique_per_operation(self):
         call = self.attempt()
         self.evidence(call, event_id="stable-event")
         with self.assertRaises(DBAPIError):
             with self.conn.begin_nested():
                 self.evidence(call, event_id="stable-event", event_digest="changed")
-        self.assertEqual(self.conn.scalar(text("SELECT count(*) FROM control_plane.operation_evidence")), 2)
+        self.assertEqual(self.conn.scalar(text("SELECT count(*) FROM control_plane.operation_evidence")), 1)
 
     def test_evidence_call_fk_cannot_cross_operations(self):
         _, _, _, other, _ = runtime_graph(self.conn)
@@ -128,7 +115,7 @@ class P2SchemaTests(unittest.TestCase):
     def test_evidence_event_metadata_is_not_partially_accepted(self):
         with self.assertRaises(DBAPIError):
             with self.conn.begin_nested():
-                self.evidence(event_id="orphan-event", event_digest="digest")
+                self.evidence(self.attempt(), call_attempt_id=None)
 
     def test_step_input_expansion_and_prepare_budget_are_fixed(self):
         self.rejects("UPDATE control_plane.job_steps SET input='1'::jsonb WHERE id=:id", {"id": self.step})
@@ -172,15 +159,18 @@ class P2SchemaTests(unittest.TestCase):
         self.rejects("UPDATE control_plane.job_steps SET state='pending' WHERE id=:id", {"id": self.step})
         self.rejects("UPDATE control_plane.job_steps SET output='{}'::jsonb WHERE id=:id", {"id": self.step})
 
-    def test_secret_grants_are_instance_scoped_with_unique_legacy_fill(self):
+    def test_secret_grants_require_explicit_instances(self):
         secret = self.secret()
-        self.conn.execute(text("INSERT INTO control_plane.job_secret_refs(job_id,secret_version_id) VALUES (:job,:secret)"), {"job": self.job, "secret": secret})
-        self.assertEqual(self.conn.scalar(text("SELECT plugin_instance_id FROM control_plane.job_secret_refs WHERE job_id=:id"), {"id": self.job}), self.instance)
+        self.rejects("INSERT INTO control_plane.job_secret_refs(job_id,secret_version_id) VALUES (:job,:secret)",
+                     {"job": self.job, "secret": secret}, code="23502")
+        self.conn.execute(text("""INSERT INTO control_plane.job_secret_refs
+            (job_id,plugin_instance_id,secret_version_id) VALUES (:job,:instance,:secret)"""),
+            {"job": self.job, "instance": self.instance, "secret": secret})
         # Same secret can be authorized independently to a second snapshot.
         other_step = insert(self.conn, "job_steps", job_id=self.job, step_path="second")
         second = operation_arguments(self.conn, self.job, other_step)["plugin_instance_id"]
         self.conn.execute(text("INSERT INTO control_plane.job_secret_refs(job_id,plugin_instance_id,secret_version_id) VALUES (:job,:instance,:secret)"), {"job": self.job, "instance": second, "secret": secret})
-        self.rejects("INSERT INTO control_plane.job_secret_refs(job_id,secret_version_id) VALUES (:job,:secret)", {"job": self.job, "secret": self.secret()})
+        self.rejects("INSERT INTO control_plane.job_secret_refs(job_id,secret_version_id) VALUES (:job,:secret)", {"job": self.job, "secret": self.secret()}, code="23502")
         self.assertEqual(self.conn.scalar(text("SELECT count(*) FROM control_plane.job_secret_refs")), 2)
 
     def test_secret_grant_rejects_unbound_instance_and_cross_instance_session(self):
@@ -291,7 +281,7 @@ class P2SchemaTests(unittest.TestCase):
         step = insert(self.conn, "job_steps", job_id=recovery, step_path="other-instance")
         other = operation_arguments(self.conn, recovery, step)
         other_op = insert(self.conn, "operations", **other)
-        other_evidence = insert(self.conn, "operation_evidence", operation_id=other_op,
+        other_evidence = recorded_evidence(self.conn, other_op,
                                 kind="checkpoint", ref_key="different-operation", revision=1, data={})
         for values, expected_code in (({"instance": other["plugin_instance_id"]}, "23503"),
                                       ({"evidence": other_evidence}, "23514")):
@@ -350,78 +340,9 @@ class P2SchemaTests(unittest.TestCase):
         # Role creation, ACLs and fixtures are rolled back with this test.
 
 
-class P2MigrationTests(unittest.TestCase):
+class ExecutionMigrationTests(unittest.TestCase):
     def settings(self, url):
         return RuntimeSettings.from_env({"CONTROL_PLANE_DATABASE_URL": url})
-
-    def test_p1_unique_authorized_instance_is_backfilled_without_rewriting_evidence(self):
-        with fresh_database() as url:
-            settings = self.settings(url)
-            run_migrations(settings, P1_REVISION)
-            engine = engine_for(url)
-            try:
-                with engine.begin() as conn:
-                    args, job, step, op, instance = runtime_graph(conn)
-                    secret = insert(conn, "secrets", purpose="environment", environment_id=args["environment_id"])
-                    version = insert(conn, "secret_versions", secret_id=secret, version=1, ciphertext=b"test", encryption_key_id="test")
-                    conn.execute(text("INSERT INTO control_plane.job_secret_refs(job_id,secret_version_id) VALUES (:job,:secret)"), {"job": job, "secret": version})
-                    evidence = insert(conn, "operation_evidence", operation_id=op, kind="checkpoint", ref_key="original", revision=1, data={})
-                run_migrations(settings)
-                with engine.connect() as conn:
-                    check_schema(conn)
-                    self.assertEqual(conn.scalar(text("SELECT plugin_instance_id FROM control_plane.job_secret_refs")), instance)
-                    row = conn.execute(text("SELECT id,call_attempt_id,event_id,trusted_for_derivation FROM control_plane.operation_evidence")).one()
-                    self.assertEqual(row.id, evidence)
-                    self.assertIsNone(row.call_attempt_id)
-                    self.assertIsNone(row.event_id)
-                    self.assertFalse(row.trusted_for_derivation)
-            finally:
-                engine.dispose()
-
-    def test_ambiguous_missing_or_unproven_legacy_grants_roll_back_entire_upgrade(self):
-        for mode in ("ambiguous", "missing", "derived"):
-            with self.subTest(mode=mode), fresh_database() as url:
-                settings = self.settings(url)
-                run_migrations(settings, P1_REVISION)
-                engine = engine_for(url)
-                try:
-                    with engine.begin() as conn:
-                        args = job_arguments(conn)
-                        job = insert(conn, "jobs", **args)
-                        if mode != "missing":
-                            step = insert(conn, "job_steps", job_id=job, step_path="first")
-                            operation_arguments(conn, job, step)
-                        if mode == "ambiguous":
-                            step = insert(conn, "job_steps", job_id=job, step_path="second")
-                            operation_arguments(conn, job, step)
-                        secret = insert(conn, "secrets", purpose="environment", environment_id=args["environment_id"])
-                        version = insert(conn, "secret_versions", secret_id=secret, version=1, ciphertext=b"test", encryption_key_id="test")
-                        conn.execute(text("INSERT INTO control_plane.job_secret_refs(job_id,secret_version_id,derived) VALUES (:job,:secret,:derived)"), {"job": job, "secret": version, "derived": mode == "derived"})
-                    with self.assertRaises(MigrationError):
-                        run_migrations(settings)
-                    with engine.begin() as conn:
-                        self.assertEqual(conn.scalar(text("SELECT version_num FROM control_plane.alembic_version")), P1_REVISION)
-                        self.assertIsNone(conn.scalar(text("SELECT to_regclass('control_plane.operation_call_attempts')")))
-                        self.assertEqual(conn.scalar(text("SELECT count(*) FROM control_plane.job_secret_refs")), 1)
-                        self.assertEqual(conn.scalar(text("""SELECT count(*) FROM pg_trigger WHERE
-                            tgrelid='control_plane.job_secret_refs'::regclass AND tgname='job_secret_refs_append_only' AND tgenabled='O'""")), 1)
-                finally:
-                    engine.dispose()
-
-    def test_empty_baseline_p1_head_roundtrip_preserves_incremental_path(self):
-        with fresh_database() as url:
-            settings = self.settings(url)
-            for target in (BASELINE_REVISION, P1_REVISION, HEAD_REVISION):
-                run_migrations(settings, target)
-            run_migrations(settings, P1_REVISION, upgrade=False)
-            run_migrations(settings)
-            run_migrations(settings, "base", upgrade=False)
-            engine = engine_for(url)
-            try:
-                with engine.connect() as conn:
-                    self.assertIsNone(conn.scalar(text("SELECT to_regnamespace('control_plane')")))
-            finally:
-                engine.dispose()
 
     def test_nonempty_downgrade_rejected_without_losing_call_history(self):
         with migrated_database() as url:
@@ -431,23 +352,17 @@ class P2MigrationTests(unittest.TestCase):
                     _, _, _, op, _ = runtime_graph(conn)
                     call = insert(conn, "operation_call_attempts", **call_arguments(op))
                 with self.assertRaises(MigrationError):
-                    run_migrations(self.settings(url), P1_REVISION, upgrade=False)
+                    run_migrations(self.settings(url), "base", upgrade=False)
                 with engine.connect() as conn:
                     self.assertEqual(conn.scalar(text("SELECT version_num FROM control_plane.alembic_version")), HEAD_REVISION)
                     self.assertEqual(conn.scalar(text("SELECT id FROM control_plane.operation_call_attempts")), call)
             finally:
                 engine.dispose()
 
-    def test_head_requires_call_attempt_table_and_p1_is_not_runtime_compatible(self):
-        with fresh_database() as url:
-            settings = self.settings(url)
-            run_migrations(settings, P1_REVISION)
+    def test_head_requires_call_attempt_table(self):
+        with migrated_database() as url:
             engine = engine_for(url)
             try:
-                with engine.connect() as conn:
-                    with self.assertRaises(SchemaMismatch):
-                        check_schema(conn)
-                run_migrations(settings)
                 with engine.begin() as conn:
                     conn.execute(text("ALTER TABLE control_plane.operation_call_attempts RENAME TO missing_calls"))
                     with self.assertRaises(SchemaMismatch):

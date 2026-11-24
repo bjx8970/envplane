@@ -250,9 +250,11 @@ class EnvironmentCredentialTests(ServicesFixture, unittest.TestCase):
         ref = self.secrets.create(b"terminal-use", purpose="environment", environment_id=self.environment)
         job, operation = self.remote_result(ref)
         target = {"host": "loopback-fixture"}
-        definition = {"access": {"entry": {"roles": ["student"], "session_type": "terminal",
-            "plugin_instance": str(self.instance), "target_ref": target, "credential_ref": ref.to_dict()}}}
         with self.lease.fenced_transaction() as uow:
+            alias = uow.scalar(text("SELECT instance_alias FROM control_plane.plugin_instances WHERE id=:id"),
+                               {"id": self.instance})
+            definition = {"access": {"entry": {"roles": ["student"], "session_type": "terminal",
+                "plugin_instance": alias, "target_ref": target, "credential_ref": ref.to_dict()}}}
             uow.execute(text("""
                 UPDATE control_plane.template_versions SET status='published',published_by=:teacher,
                     published_at=clock_timestamp(),definition=CAST(:definition AS jsonb)

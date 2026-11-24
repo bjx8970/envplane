@@ -10,18 +10,16 @@ from .persistence import RequestConflict, admit_job
 from .plugins.sdk import AuthorizationDenied, ReferenceUnavailable, canonical_json, json_digest
 from .quota import check_available, reserve, set_limits
 from .templates import TemplateError, load_version, quota_cost, validate_parameters
-from .workflows import cleanup_evidence_context
 
 
 def instance_binding(uow, alias):
-    """Accept a deployment alias or canonical UUID. Ambiguity fails closed."""
-    rows = uow.execute(text("""
+    row = uow.execute(text("""
         SELECT id,plugin_key FROM control_plane.plugin_instances
-        WHERE enabled AND (instance_alias=:alias OR id::text=:alias) FOR SHARE
-    """), {"alias": alias}).all()
-    if len(rows) != 1:
+        WHERE enabled AND instance_alias=:alias FOR SHARE
+    """), {"alias": alias}).first()
+    if row is None:
         raise ReferenceUnavailable("template plugin instance is unavailable")
-    return str(rows[0].id), rows[0].plugin_key
+    return str(row.id), row.plugin_key
 
 
 def _identifier(value):
@@ -44,7 +42,7 @@ def _evidence(uow, environment):
         "source_job_ids": [str(j.id) for j in jobs], "revisions": {}, "jobs": {}, "steps": {},
     }
     for job in jobs:
-        definitions = job.execution_snapshot.get("workflow", {}).get("steps", ())
+        definitions = job.execution_snapshot["workflow"]["steps"]
         snapshot["jobs"][str(job.id)] = {item["id"]: {} for item in definitions}
     steps = uow.execute(text("""
         SELECT s.job_id,s.step_path,s.item_key FROM control_plane.job_steps s
@@ -88,7 +86,11 @@ def _evidence(uow, environment):
             by_id[key][section][entry.ref_key] = {
                 "reference": entry.data, "revision": entry.revision, "observed_at": entry.created_at.isoformat(),
             }
-    snapshot["steps"] = snapshot["jobs"].get(str(create.id), {})
+    snapshot["steps"] = snapshot["jobs"][str(create.id)]
+    snapshot["unexpanded"] = {
+        path: instances.get("", {"operations": []})
+        for path, instances in snapshot["steps"].items()
+    }
     return snapshot
 
 
@@ -158,7 +160,7 @@ def _template_credentials(steps, instances, environment, resource, evidence=None
     """Read the template-selected parts of fixed products; data is never evaluated as a template."""
     products = {("environment", "create_results"): environment["create_results"],
                 ("resource", "data"): resource["data"] if resource else None,
-                ("evidence",): cleanup_evidence_context(evidence) if evidence else None}
+                ("evidence",): evidence}
     requests, inspected = {}, set()
     # The same fixed collection may appear in many step inputs or expanded items.
     budget = 1_048_576
@@ -245,9 +247,7 @@ def _template_credentials(steps, instances, environment, resource, evidence=None
 
 
 def authorize_job(uow, job, *, registry=None):
-    workflow = job["execution_snapshot"].get("workflow")
-    if not isinstance(workflow, dict):
-        return False
+    workflow = job["execution_snapshot"]["workflow"]
     if job["kind"] == "session_open":
         from .session_jobs import authorize_opening
         return authorize_opening(uow, registry, job)

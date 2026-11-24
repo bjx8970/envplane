@@ -16,6 +16,7 @@ from control_plane.plugins.secrets import SecretService
 from control_plane.plugins.storage import StorageService
 from tests_control_plane.p1_harness import runtime_database
 from tests_control_plane.pg_harness import engine_for
+from tests_control_plane.test_p1_schema import insert, recorded_evidence
 
 
 class ServicesFixture:
@@ -56,19 +57,24 @@ class ServicesFixture:
         self.admin = self.storage.bind(self.instance)
 
     def new_instance_in(self, uow):
-        instance = uow.scalar(text("INSERT INTO control_plane.plugin_instances(plugin_key) VALUES ('fake') RETURNING id"))
+        instance = insert(uow, "plugin_instances", plugin_key="fake")
         self.configurations.put_in(uow, instance, {'data': {}, 'allowed_secret_refs': []}, expected_revision=0)
         return instance
 
     def job(self, *, instances=None, logical=None):
         with self.lease.fenced_transaction() as uow:
+            captures = {
+                str(instance): self.configurations.capture_in(uow, instance, self.secrets, self.environment)
+                for instance in instances or (self.instance,)
+            }
+            snapshot = {"workflow": {"kind": "action", "steps": []}, "plugins": captures}
             job = uow.scalar(text('''INSERT INTO control_plane.jobs
                 (environment_id,execution_group_id,actor_id,request_key,request_digest,logical_invocation_id,kind,input,execution_snapshot)
-                VALUES (:environment,:group,:teacher,:key,'digest',:logical,'test','{}','{}') RETURNING id'''),
+                VALUES (:environment,:group,:teacher,:key,'digest',:logical,'test','{}',CAST(:snapshot AS jsonb)) RETURNING id'''),
                 {'environment': self.environment, 'group': self.group, 'teacher': self.teacher,
-                 'key': uuid4().hex, 'logical': logical or uuid4()})
-            for instance in instances or (self.instance,):
-                self.configurations.pin_job_in(uow, job, instance, self.secrets)
+                 'key': uuid4().hex, 'logical': logical or uuid4(), 'snapshot': canonical_json(snapshot)})
+            for instance, capture in captures.items():
+                self.configurations.bind_capture_in(uow, job, instance, capture, self.secrets)
             step = uow.scalar(text("INSERT INTO control_plane.job_steps(job_id,step_path) VALUES (:job,'create') RETURNING id"), {'job': job})
         return job, step
 
@@ -82,9 +88,7 @@ class ServicesFixture:
                  'output': canonical_json(data) if state == 'succeeded' else None})
             evidence = None
             if checkpoint:
-                evidence = uow.scalar(text('''INSERT INTO control_plane.operation_evidence
-                    (operation_id,kind,ref_key,revision,data,trusted_for_derivation) VALUES (:operation,'checkpoint','derived',1,CAST(:data AS jsonb),true) RETURNING id'''),
-                    {'operation': op, 'data': canonical_json(data)})
+                evidence = recorded_evidence(uow, op, ref_key="derived", data=data, trusted_for_derivation=True)
         return op, evidence
 
 
@@ -166,9 +170,7 @@ class StorageServiceTests(ServicesFixture, unittest.TestCase):
         new = self.admin.put('key', {'new': True}, first)
         operation, _ = self.source(job, step, {}, state='running')
         with self.lease.fenced_transaction() as uow:
-            uow.execute(text('''INSERT INTO control_plane.operation_evidence
-                (operation_id,kind,ref_key,revision,data) VALUES (:operation,'checkpoint','late',1,CAST(:data AS jsonb))'''),
-                {'operation': operation, 'data': canonical_json({'derived': new.to_dict()})})
+            recorded_evidence(uow, operation, ref_key="late", data={"derived": new.to_dict()})
         with self.assertRaises(AuthorizationDenied):
             self.storage.bind(self.instance, job).get('key', version=new.version_id)
 
@@ -232,7 +234,9 @@ class StorageServiceTests(ServicesFixture, unittest.TestCase):
             (environment_id,execution_group_id,actor_id,request_key,request_digest,kind,input,execution_snapshot)
             VALUES (:environment,:group,:teacher,:key,'digest','test','{}',CAST(:snapshot AS jsonb)) RETURNING id'''),
             {'environment': self.environment, 'group': self.group, 'teacher': self.teacher,
-             'key': uuid4().hex, 'snapshot': canonical_json({'plugins': {str(self.instance): capture}})})
+             'key': uuid4().hex, 'snapshot': canonical_json({
+                 "workflow": {"kind": "action", "steps": []}, "plugins": {str(self.instance): capture},
+             })})
 
     def test_capture_binds_exact_original_config_storage_and_secret_map(self):
         from control_plane.plugins.sdk import SecretRef

@@ -1,22 +1,22 @@
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import unittest
+from uuid import uuid4
 
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
 from control_plane.config import COORDINATOR_LOCK_KEY, RuntimeSettings
 from control_plane.coordination import CoordinatorLease
-from control_plane.migrations import MigrationError, run_migrations
 from control_plane.persistence import StorageConflict, write_storage
-from tests_control_plane.p1_harness import fresh_database, migrated_database
+from tests_control_plane.p1_harness import migrated_database
 from tests_control_plane.pg_harness import engine_for
 
 
 def instance(connection):
     return connection.scalar(text(
-        "INSERT INTO control_plane.plugin_instances(plugin_key) VALUES ('fake') RETURNING id"
-    ))
+        "INSERT INTO control_plane.plugin_instances(plugin_key,instance_alias) VALUES ('fake',:alias) RETURNING id"
+    ), {"alias": "test-" + uuid4().hex})
 
 
 def history(connection, instance_id, key="hosts", *, version=1, tombstone=False):
@@ -244,39 +244,3 @@ class StorageHeadTests(unittest.TestCase):
             self.assertEqual(conn.scalar(text("""
                 SELECT version_id FROM control_plane.plugin_storage_heads WHERE instance_id=:instance
             """), {"instance": plugin}), newest)
-
-
-class StorageHeadMigrationTests(unittest.TestCase):
-    def check_legacy_rejected(self, *, orphan):
-        with fresh_database() as url:
-            settings = RuntimeSettings.from_env({"CONTROL_PLANE_DATABASE_URL": url})
-            run_migrations(settings, "0001_v1_foundation")
-            engine = engine_for(url)
-            self.addCleanup(engine.dispose)
-            with engine.begin() as conn:
-                plugin = instance(conn)
-                first = history(conn, plugin)
-                if not orphan:
-                    history(conn, plugin, version=2)
-                    set_head(conn, plugin, first)
-            with self.assertRaises(MigrationError):
-                run_migrations(settings)
-            with engine.connect() as conn:
-                self.assertEqual(conn.scalar(text(
-                    "SELECT version_num FROM control_plane.alembic_version"
-                )), "0001_v1_foundation")
-                self.assertIsNone(conn.scalar(text(
-                    "SELECT to_regprocedure('control_plane.protect_storage_head()')"
-                )))
-                self.assertEqual(conn.scalar(text("""
-                    SELECT count(*) FROM control_plane.plugin_storage_versions WHERE instance_id=:instance
-                """), {"instance": plugin}), 1 if orphan else 2)
-                self.assertEqual(conn.scalar(text("""
-                    SELECT version_id FROM control_plane.plugin_storage_heads WHERE instance_id=:instance
-                """), {"instance": plugin}), None if orphan else first)
-
-    def test_upgrade_fails_closed_on_legacy_stale_head_without_repair(self):
-        self.check_legacy_rejected(orphan=False)
-
-    def test_upgrade_fails_closed_on_legacy_orphan_history_without_repair(self):
-        self.check_legacy_rejected(orphan=True)

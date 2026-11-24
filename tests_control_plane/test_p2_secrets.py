@@ -14,6 +14,7 @@ from control_plane.plugins.context import ContextBuilder
 from control_plane.plugins.sdk import (AuthorizationDenied, Deadline, PreparedCall, ReferenceUnavailable,
                                        SecretRef, canonical_json, finite_json)
 from control_plane.plugins.secrets import SecretHandle, SecretService
+from tests_control_plane.test_p1_schema import recorded_evidence
 from tests_control_plane.test_p2_storage import ServicesFixture
 
 
@@ -216,9 +217,8 @@ class SecretServiceTests(ServicesFixture, unittest.TestCase):
         job, step, operation, bound = self.producing()
         ref = bound.derive('password')
         with self.lease.fenced_transaction() as uow:
-            evidence = uow.scalar(text('''INSERT INTO control_plane.operation_evidence
-                (operation_id,kind,ref_key,revision,data,trusted_for_derivation) VALUES (:operation,'checkpoint','credential',1,CAST(:data AS jsonb),true) RETURNING id'''),
-                {'operation': operation, 'data': canonical_json({'credential': ref.to_dict()})})
+            evidence = recorded_evidence(uow, operation, ref_key="credential",
+                                         data={"credential": ref.to_dict()}, trusted_for_derivation=True)
             self.secrets.publish_from_source_in(uow, job, self.instance, operation, evidence)
         recovery, _ = self.job()
         with self.assertRaises(AuthorizationDenied):
@@ -256,9 +256,7 @@ class SecretServiceTests(ServicesFixture, unittest.TestCase):
         job, step, operation, bound = self.producing()
         ref = bound.derive('password')
         with self.lease.fenced_transaction() as uow:
-            evidence = uow.scalar(text('''INSERT INTO control_plane.operation_evidence
-                (operation_id,kind,ref_key,revision,data) VALUES (:operation,'checkpoint','late',1,CAST(:data AS jsonb)) RETURNING id'''),
-                {'operation': operation, 'data': canonical_json({'credential': ref.to_dict()})})
+            evidence = recorded_evidence(uow, operation, ref_key="late", data={"credential": ref.to_dict()})
         with self.assertRaises(ReferenceUnavailable):
             with self.lease.fenced_transaction() as uow:
                 self.secrets.publish_from_source_in(uow, job, self.instance, operation, evidence)

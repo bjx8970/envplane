@@ -111,7 +111,7 @@ class FakeAdmission:
         self.calls += 1
         case = self.case
         capture = case.configuration.capture_in(uow, case.instance, case.secrets, case.environment)
-        execution_snapshot = {"plugins": {str(case.instance): capture}, "workflow": "test-fixed"}
+        execution_snapshot = {"plugins": {str(case.instance): capture}, "workflow": {"kind": "create", "steps": []}}
         job, replay = admit_job(uow, actor_id=case.actor, request_key=fixed_request["request_key"],
             request_digest=fixed_request["request_digest"], environment_id=case.environment,
             execution_group_id=case.group, logical_invocation_id=uuid4(), kind="create", input={},

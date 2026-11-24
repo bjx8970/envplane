@@ -13,7 +13,7 @@ from sqlalchemy.engine import make_url
 from control_plane.config import COORDINATOR_LOCK_KEY, ConfigurationError, RuntimeSettings
 from control_plane.coordination import CoordinatorLease, LeaseLost
 from control_plane.migrations import (
-    HEAD_REVISION, MigrationConflict, MigrationError, check_schema, run_migrations,
+    MigrationConflict, MigrationError, check_schema, run_migrations,
 )
 from tests_control_plane.p1_harness import fresh_database, migrated_database
 from tests_control_plane.pg_harness import ROOT, engine_for, run_cli_once, terminate_backend
@@ -131,16 +131,25 @@ class MigrationTests(unittest.TestCase):
             finally:
                 engine.dispose()
 
-    def test_unknown_revision_refuses_start(self):
+    def test_retired_revision_refuses_start_upgrade_and_downgrade(self):
+        retired_revision = "0004_p3_business_services"
         with migrated_database() as url:
             engine = engine_for(url)
             try:
                 with engine.begin() as conn:
-                    conn.execute(text("UPDATE control_plane.alembic_version SET version_num='future_revision'"))
+                    conn.execute(text("UPDATE control_plane.alembic_version SET version_num=:revision"),
+                                 {"revision": retired_revision})
                 code, out, err = run_cli_once(url)
                 self.assertEqual(code, 4, out + err)
                 self.assertIn("revision", err)
                 self.assertNotIn('"event": "ready"', out)
+                for upgrade in (True, False):
+                    with self.assertRaises(MigrationError):
+                        run_migrations(settings_for(url), "head" if upgrade else "base", upgrade=upgrade)
+                with engine.connect() as conn:
+                    self.assertEqual(conn.scalar(text("SELECT version_num FROM control_plane.alembic_version")),
+                                     retired_revision)
+                    self.assertIsNotNone(conn.scalar(text("SELECT to_regclass('control_plane.jobs')")))
             finally:
                 engine.dispose()
 

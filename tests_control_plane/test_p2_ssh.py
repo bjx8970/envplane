@@ -6,7 +6,6 @@ import base64
 from contextlib import contextmanager
 import io
 import multiprocessing
-import json
 from pathlib import Path
 import socket
 import threading
@@ -20,7 +19,7 @@ from jsonschema import Draft202012Validator
 
 from control_plane.plugins.sdk import Deadline, PluginError, SecretRef, StorageRef
 from control_plane.plugins.registry import PluginRegistry
-from control_plane.plugins.ssh import SSHPlugin
+from plugins.ssh.plugin import SSHPlugin
 
 
 def _server(private_key, ready, mode):
@@ -202,8 +201,6 @@ class SSHPluginTests(unittest.TestCase):
         self.assertEqual(loaded.plugin_key, "ssh")
         self.assertEqual(loaded.code_digest, code_digest(root / "plugins" / "ssh"))
         self.assertEqual(loaded.manifest, SSHPlugin().describe())
-        self.assertEqual(loaded.manifest, json.loads((root / "control_plane/plugins/ssh_manifest.json").read_text(encoding="utf-8")))
-        self.assertNotIn("from control_plane.plugins.ssh import", (root / "plugins/ssh/plugin.py").read_text(encoding="utf-8"))
         context = self.context()
         prepared = loaded.implementation.prepare("list_host_options", {}, context)
         self.assertEqual(loaded.implementation.execute(prepared, context).output, [{"id": "test", "name": "test"}])

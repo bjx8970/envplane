@@ -39,7 +39,7 @@ class AdmissionTests(unittest.TestCase):
             self.actor, _, _, self.env, self.group = graph(connection)
         self.request = dict(actor_id=self.actor, request_key=uuid4().hex, request_digest='same-request',
             environment_id=self.env, execution_group_id=self.group, logical_invocation_id=uuid4(),
-            kind='create', input={}, execution_snapshot={})
+            kind='create', input={}, execution_snapshot={"workflow": {"kind": "create", "steps": []}})
         self.calls = []
         outer = self
         class Policy:

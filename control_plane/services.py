@@ -1,8 +1,7 @@
 """Explicit composition of trusted plugins, P3 business services, and execution.
 
 A deployment configuration enables loading trusted packages, never Python paths
-from the database. Without it the P0/P1 database/coordinator-only mode remains
-available, but is not represented as a functioning business execution service.
+from the database.
 """
 from __future__ import annotations
 
@@ -59,7 +58,6 @@ class PluginServices:
         self._listener = None
         self.sessions = None
         self.session_openings = None
-        self.admission = None
         self.business = self.identity = self.templates = self.credentials = self.access = None
         self._state = 'stopped'
 
@@ -88,8 +86,6 @@ class PluginServices:
                                                   safe_json=self.secrets.safe_json)
         self.contexts = ContextBuilder(self.runtime._engine, self.runtime, self.registry, self.secrets)
         self.capacity.start()
-        from .admission import AdmissionController
-        self.admission = AdmissionController(self.runtime, self.capacity, max_pending_jobs=data['max_pending_jobs'])
         from .access import AccessService
         from .business import BusinessService, authorize_job
         from .credentials import CredentialService

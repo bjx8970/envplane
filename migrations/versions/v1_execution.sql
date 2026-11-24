@@ -46,7 +46,12 @@ CREATE TABLE control_plane.jobs (
     retry_of UUID,
     kind TEXT NOT NULL CHECK (length(kind) > 0),
     input JSONB NOT NULL CHECK (control_plane.bounded_json(input, 'object')),
-    execution_snapshot JSONB NOT NULL CHECK (control_plane.bounded_json(execution_snapshot, 'object')),
+    execution_snapshot JSONB NOT NULL CHECK (
+        control_plane.bounded_json(execution_snapshot, 'object')
+        AND jsonb_typeof(execution_snapshot->'workflow') IS NOT DISTINCT FROM 'object'
+        AND COALESCE(execution_snapshot #>> '{workflow,kind}' IN ('create', 'action', 'cleanup', 'session_open'), false)
+        AND jsonb_typeof(execution_snapshot #> '{workflow,steps}') IS NOT DISTINCT FROM 'array'
+    ),
     state TEXT NOT NULL DEFAULT 'queued' CHECK (state IN
         ('queued', 'running', 'cancel_requested', 'blocked', 'succeeded', 'failed', 'cancelled')),
     priority INTEGER NOT NULL DEFAULT 0,
@@ -92,12 +97,18 @@ CREATE TABLE control_plane.job_steps (
         ('pending', 'running', 'waiting_external', 'blocked', 'succeeded', 'failed', 'cancelled', 'skipped')),
     input JSONB NOT NULL DEFAULT '{}' CHECK (control_plane.bounded_json(input)),
     output JSONB CHECK (output IS NULL OR control_plane.bounded_json(output)),
+    prepare_started_at TIMESTAMPTZ,
+    prepare_deadline_at TIMESTAMPTZ,
+    prepare_error JSONB CHECK (prepare_error IS NULL OR control_plane.bounded_json(prepare_error, 'object')),
     expansion JSONB CHECK (expansion IS NULL OR control_plane.bounded_json(expansion)),
     error JSONB CHECK (error IS NULL OR control_plane.bounded_json(error, 'object')),
     current_operation_id UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     finished_at TIMESTAMPTZ,
+    CONSTRAINT step_prepare_budget CHECK (
+        (prepare_started_at IS NULL AND prepare_deadline_at IS NULL) OR
+        (prepare_started_at IS NOT NULL AND prepare_deadline_at IS NOT NULL AND prepare_deadline_at > prepare_started_at)),
     UNIQUE (job_id, step_path, item_key), UNIQUE (id, job_id),
     CHECK (state NOT IN ('running', 'waiting_external', 'succeeded') OR current_operation_id IS NOT NULL)
 );
@@ -150,6 +161,30 @@ ALTER TABLE control_plane.job_steps ADD CONSTRAINT job_steps_current_operation_f
     FOREIGN KEY (current_operation_id, id) REFERENCES control_plane.operations(id, step_id)
     ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED;
 
+CREATE TABLE control_plane.operation_call_attempts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    operation_id UUID NOT NULL REFERENCES control_plane.operations(id) ON DELETE RESTRICT,
+    method TEXT NOT NULL CHECK (method IN ('execute', 'poll', 'cancel')),
+    job_lease_owner TEXT NOT NULL CHECK (length(job_lease_owner) > 0),
+    job_lease_token UUID NOT NULL,
+    coordinator_owner UUID NOT NULL,
+    coordinator_revision BIGINT NOT NULL CHECK (coordinator_revision >= 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    deadline_at TIMESTAMPTZ NOT NULL,
+    retry_of_call_id UUID,
+    UNIQUE (id, operation_id),
+    CHECK (deadline_at > created_at),
+    CHECK (retry_of_call_id IS DISTINCT FROM id),
+    FOREIGN KEY (retry_of_call_id, operation_id)
+        REFERENCES control_plane.operation_call_attempts(id, operation_id) ON DELETE RESTRICT
+);
+CREATE INDEX operation_calls_operation_idx
+    ON control_plane.operation_call_attempts(operation_id, created_at, id);
+CREATE TRIGGER operation_calls_append_only BEFORE UPDATE OR DELETE ON control_plane.operation_call_attempts
+    FOR EACH ROW EXECUTE FUNCTION control_plane.protect_record();
+CREATE TRIGGER operation_calls_no_truncate BEFORE TRUNCATE ON control_plane.operation_call_attempts
+    FOR EACH STATEMENT EXECUTE FUNCTION control_plane.protect_record();
+
 CREATE TABLE control_plane.operation_evidence (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     operation_id UUID NOT NULL REFERENCES control_plane.operations(id) ON DELETE RESTRICT,
@@ -158,8 +193,17 @@ CREATE TABLE control_plane.operation_evidence (
     revision BIGINT NOT NULL CHECK (revision > 0),
     data JSONB NOT NULL CHECK (control_plane.bounded_json(data)),
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    call_attempt_id UUID NOT NULL,
+    event_id TEXT NOT NULL CHECK (length(event_id) > 0),
+    event_digest TEXT NOT NULL CHECK (length(event_digest) > 0),
+    observed_at TIMESTAMPTZ NOT NULL,
+    trusted_for_derivation BOOLEAN NOT NULL DEFAULT false,
+    CONSTRAINT evidence_call_fk FOREIGN KEY (call_attempt_id, operation_id)
+        REFERENCES control_plane.operation_call_attempts(id, operation_id) ON DELETE RESTRICT,
+    CONSTRAINT evidence_source_unique UNIQUE (id, operation_id),
     UNIQUE (operation_id, kind, ref_key, revision)
 );
+CREATE UNIQUE INDEX operation_evidence_event_idx ON control_plane.operation_evidence(operation_id, event_id);
 CREATE INDEX operation_evidence_read_idx ON control_plane.operation_evidence(operation_id, created_at, id);
 
 CREATE TABLE control_plane.job_logs (
@@ -277,7 +321,19 @@ CREATE TABLE control_plane.job_secret_refs (
     secret_version_id UUID NOT NULL REFERENCES control_plane.secret_versions(id) ON DELETE RESTRICT,
     derived BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (job_id, secret_version_id)
+    plugin_instance_id UUID NOT NULL,
+    source_operation_id UUID,
+    source_evidence_id UUID,
+    PRIMARY KEY (job_id, plugin_instance_id, secret_version_id),
+    CONSTRAINT job_secret_instance_fk FOREIGN KEY (job_id, plugin_instance_id)
+        REFERENCES control_plane.job_plugin_snapshots(job_id, instance_id) ON DELETE RESTRICT,
+    CONSTRAINT job_secret_provenance CHECK (
+        (NOT derived AND source_operation_id IS NULL AND source_evidence_id IS NULL) OR
+        (derived AND source_operation_id IS NOT NULL)),
+    CONSTRAINT job_secret_operation_fk FOREIGN KEY (source_operation_id, plugin_instance_id)
+        REFERENCES control_plane.operations(id, plugin_instance_id) ON DELETE RESTRICT,
+    CONSTRAINT job_secret_evidence_fk FOREIGN KEY (source_evidence_id, source_operation_id)
+        REFERENCES control_plane.operation_evidence(id, operation_id) ON DELETE RESTRICT
 );
 
 CREATE TABLE control_plane.interactive_sessions (
@@ -293,6 +349,9 @@ CREATE TABLE control_plane.interactive_sessions (
     template_entry TEXT NOT NULL CHECK (length(template_entry) > 0),
     state TEXT NOT NULL DEFAULT 'opening' CHECK (state IN ('opening', 'active', 'closing', 'closed', 'failed', 'disconnected')),
     controller_id UUID REFERENCES control_plane.users(id) ON DELETE RESTRICT,
+    session_type TEXT NOT NULL DEFAULT 'terminal' CHECK (length(session_type) > 0),
+    last_activity_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    controller_revision BIGINT NOT NULL DEFAULT 0 CHECK (controller_revision >= 0),
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     opened_at TIMESTAMPTZ,
     closed_at TIMESTAMPTZ,
@@ -301,7 +360,8 @@ CREATE TABLE control_plane.interactive_sessions (
     FOREIGN KEY (job_id, environment_id) REFERENCES control_plane.jobs(id, environment_id) ON DELETE RESTRICT,
     FOREIGN KEY (open_operation_id, job_id) REFERENCES control_plane.operations(id, job_id) ON DELETE RESTRICT,
     FOREIGN KEY (open_operation_id, plugin_instance_id) REFERENCES control_plane.operations(id, plugin_instance_id) ON DELETE RESTRICT,
-    FOREIGN KEY (job_id, secret_version_id) REFERENCES control_plane.job_secret_refs(job_id, secret_version_id) ON DELETE RESTRICT
+    CONSTRAINT session_secret_instance_fk FOREIGN KEY (job_id, plugin_instance_id, secret_version_id)
+        REFERENCES control_plane.job_secret_refs(job_id, plugin_instance_id, secret_version_id) ON DELETE RESTRICT
 );
 CREATE INDEX interactive_sessions_environment_idx ON control_plane.interactive_sessions(environment_id, state);
 
@@ -382,3 +442,108 @@ CREATE TRIGGER job_logs_append_only BEFORE UPDATE OR DELETE ON control_plane.job
     FOR EACH ROW EXECUTE FUNCTION control_plane.protect_record();
 CREATE TRIGGER audit_events_append_only BEFORE UPDATE OR DELETE ON control_plane.audit_events
     FOR EACH ROW EXECUTE FUNCTION control_plane.protect_record();
+
+CREATE FUNCTION control_plane.check_job_secret_source() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.derived THEN
+        -- An explicit recovery Job can consume the original exact output or
+        -- checkpoint, but an unrelated Job/group cannot manufacture a grant.
+        -- Job environment/group identities are immutable under the database guards.
+        IF NOT EXISTS (
+            SELECT 1 FROM control_plane.operations source
+            JOIN control_plane.jobs producer ON producer.id=source.job_id
+            JOIN control_plane.jobs consumer ON consumer.id=NEW.job_id
+            WHERE source.id=NEW.source_operation_id
+              AND producer.environment_id=consumer.environment_id
+              AND producer.execution_group_id=consumer.execution_group_id
+        ) THEN
+            RAISE EXCEPTION 'derived secret source must belong to the same environment and execution group' USING ERRCODE='23514';
+        END IF;
+        IF NEW.source_evidence_id IS NULL THEN
+            IF NOT EXISTS (SELECT 1 FROM control_plane.operations WHERE id=NEW.source_operation_id AND state='succeeded') THEN
+                RAISE EXCEPTION 'derived secret requires successful output or checkpoint provenance' USING ERRCODE='23514';
+            END IF;
+        ELSIF NOT EXISTS (SELECT 1 FROM control_plane.operation_evidence
+            WHERE id=NEW.source_evidence_id AND operation_id=NEW.source_operation_id
+              AND kind='checkpoint' AND trusted_for_derivation) THEN
+            RAISE EXCEPTION 'derived secret requires trusted checkpoint provenance' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END $$;
+CREATE TRIGGER job_secret_source BEFORE INSERT ON control_plane.job_secret_refs
+    FOR EACH ROW EXECUTE FUNCTION control_plane.check_job_secret_source();
+
+CREATE TRIGGER session_identity BEFORE UPDATE OR DELETE ON control_plane.interactive_sessions
+    FOR EACH ROW EXECUTE FUNCTION control_plane.protect_record(
+        'id', 'environment_id', 'resource_id', 'job_id', 'open_operation_id', 'actor_id',
+        'plugin_instance_id', 'target_ref', 'secret_version_id', 'template_entry', 'session_type', 'created_at');
+
+CREATE FUNCTION control_plane.guard_execution_state() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE allowed boolean := false; terminal boolean := false; before_row jsonb; after_row jsonb;
+BEGIN
+    IF TG_TABLE_NAME='jobs' THEN
+        terminal := OLD.state IN ('succeeded','failed','cancelled');
+        allowed := CASE OLD.state
+            WHEN 'queued' THEN NEW.state IN ('running','cancelled','blocked')
+            WHEN 'running' THEN NEW.state IN ('succeeded','failed','cancel_requested','blocked')
+            WHEN 'cancel_requested' THEN NEW.state IN ('cancelled','blocked','succeeded','failed')
+            WHEN 'blocked' THEN NEW.state IN ('running','failed','cancelled') ELSE false END;
+        before_row := to_jsonb(OLD) - ARRAY['updated_at','lease_owner','lease_token','lease_expires_at','heartbeat_at'];
+        after_row := to_jsonb(NEW) - ARRAY['updated_at','lease_owner','lease_token','lease_expires_at','heartbeat_at'];
+    ELSIF TG_TABLE_NAME='job_steps' THEN
+        terminal := OLD.state IN ('succeeded','failed','cancelled','skipped');
+        allowed := CASE OLD.state
+            WHEN 'pending' THEN NEW.state IN ('running','blocked','failed','cancelled','skipped')
+            WHEN 'running' THEN NEW.state IN ('waiting_external','blocked','succeeded','failed','cancelled')
+            WHEN 'waiting_external' THEN NEW.state IN ('blocked','succeeded','failed','cancelled')
+            WHEN 'blocked' THEN NEW.state IN ('running','waiting_external','succeeded','failed','cancelled') ELSE false END;
+        IF NEW.input IS DISTINCT FROM OLD.input
+           OR (OLD.expansion IS NOT NULL AND NEW.expansion IS DISTINCT FROM OLD.expansion)
+           OR (OLD.prepare_started_at IS NOT NULL AND NEW.prepare_started_at IS DISTINCT FROM OLD.prepare_started_at)
+           OR (OLD.prepare_deadline_at IS NOT NULL AND NEW.prepare_deadline_at IS DISTINCT FROM OLD.prepare_deadline_at) THEN
+            RAISE EXCEPTION 'step input, expansion and prepare budget are fixed' USING ERRCODE='23514';
+        END IF;
+        before_row := to_jsonb(OLD) - 'updated_at'; after_row := to_jsonb(NEW) - 'updated_at';
+    ELSIF TG_TABLE_NAME='operations' THEN
+        terminal := OLD.state IN ('succeeded','failed','cancelled');
+        allowed := CASE OLD.state
+            WHEN 'prepared' THEN NEW.state IN ('running','cancelled')
+            WHEN 'running' THEN NEW.state IN ('succeeded','failed','cancelled','pending_external','unknown')
+            WHEN 'pending_external' THEN NEW.state IN ('succeeded','failed','cancelled','unknown')
+            WHEN 'unknown' THEN NEW.state IN ('pending_external','succeeded','failed','cancelled') ELSE false END;
+        IF (OLD.dispatch_intent_at IS NOT NULL AND NEW.dispatch_intent_at IS DISTINCT FROM OLD.dispatch_intent_at)
+           OR (OLD.deadline_at IS NOT NULL AND NEW.deadline_at IS DISTINCT FROM OLD.deadline_at) THEN
+            RAISE EXCEPTION 'operation dispatch budget is fixed' USING ERRCODE='23514';
+        END IF;
+        before_row := to_jsonb(OLD) - ARRAY['updated_at','cancel_requested_at','cancellation_result'];
+        after_row := to_jsonb(NEW) - ARRAY['updated_at','cancel_requested_at','cancellation_result'];
+    ELSIF TG_TABLE_NAME='interactive_sessions' THEN
+        terminal := OLD.state IN ('closed','failed','disconnected');
+        allowed := CASE OLD.state
+            WHEN 'opening' THEN NEW.state IN ('active','failed','disconnected')
+            WHEN 'active' THEN NEW.state IN ('closing','disconnected')
+            WHEN 'closing' THEN NEW.state IN ('closed','disconnected') ELSE false END;
+        IF NEW.last_activity_at < OLD.last_activity_at
+           OR (NEW.controller_id IS DISTINCT FROM OLD.controller_id AND NEW.controller_revision <> OLD.controller_revision+1)
+           OR (NEW.controller_id IS NOT DISTINCT FROM OLD.controller_id AND NEW.controller_revision <> OLD.controller_revision) THEN
+            RAISE EXCEPTION 'session activity and controller revision must be monotonic' USING ERRCODE='23514';
+        END IF;
+        before_row := to_jsonb(OLD); after_row := to_jsonb(NEW);
+    END IF;
+    IF NEW.state IS DISTINCT FROM OLD.state AND NOT allowed THEN
+        RAISE EXCEPTION 'illegal execution state transition' USING ERRCODE='23514';
+    END IF;
+    IF terminal AND before_row IS DISTINCT FROM after_row THEN
+        RAISE EXCEPTION 'terminal execution fact is immutable' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END $$;
+CREATE TRIGGER jobs_state_guard BEFORE UPDATE ON control_plane.jobs
+    FOR EACH ROW EXECUTE FUNCTION control_plane.guard_execution_state();
+CREATE TRIGGER steps_state_guard BEFORE UPDATE ON control_plane.job_steps
+    FOR EACH ROW EXECUTE FUNCTION control_plane.guard_execution_state();
+CREATE TRIGGER operations_state_guard BEFORE UPDATE ON control_plane.operations
+    FOR EACH ROW EXECUTE FUNCTION control_plane.guard_execution_state();
+CREATE TRIGGER sessions_state_guard BEFORE UPDATE ON control_plane.interactive_sessions
+    FOR EACH ROW EXECUTE FUNCTION control_plane.guard_execution_state();

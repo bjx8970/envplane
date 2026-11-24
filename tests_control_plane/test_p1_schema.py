@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import unittest
 from uuid import uuid4
@@ -15,6 +15,8 @@ from tests_control_plane.pg_harness import engine_for
 
 
 def insert(connection, table, **values):
+    if table == "plugin_instances":
+        values.setdefault("instance_alias", "test-" + uuid4().hex)
     columns = ",".join(f'"{key}"' for key in values)
     parameters = ",".join(f"CAST(:{key} AS jsonb)" if isinstance(value, (dict, list)) else f":{key}" for key, value in values.items())
     encoded = {key: json.dumps(value) if isinstance(value, (dict, list)) else value for key, value in values.items()}
@@ -38,7 +40,7 @@ def job_arguments(connection):
     actor, course, version, environment, group = graph(connection)
     return dict(actor_id=actor, request_key=uuid4().hex, request_digest="b" * 64,
                 environment_id=environment, execution_group_id=group,
-                logical_invocation_id=uuid4(), kind="create", input={}, execution_snapshot={})
+                logical_invocation_id=uuid4(), kind="create", input={}, execution_snapshot={"workflow": {"kind": "create", "steps": []}})
 
 
 def operation_arguments(connection, job, step):
@@ -53,6 +55,23 @@ def operation_arguments(connection, job, step):
     """), {"job": job, "instance": plugin, "snapshot": snapshot, "digest": "e" * 64})
     return dict(job_id=job, step_id=step, attempt=1, invocation_key=uuid4().hex,
                 plugin_instance_id=plugin, plugin_version="1", code_digest="e" * 64, prepared_call={})
+
+
+def call_arguments(operation, **changes):
+    now = datetime.now(timezone.utc)
+    return dict(operation_id=operation, method="execute", job_lease_owner="test-worker",
+                job_lease_token=uuid4(), coordinator_owner=uuid4(), coordinator_revision=1,
+                created_at=now, deadline_at=now + timedelta(seconds=30), **changes)
+
+
+def recorded_evidence(connection, operation, *, call=None, **changes):
+    if call is None:
+        call = insert(connection, "operation_call_attempts", **call_arguments(operation))
+    values = dict(operation_id=operation, call_attempt_id=call, kind="checkpoint",
+                  ref_key=uuid4().hex, revision=1, data={}, event_id=uuid4().hex,
+                  event_digest="test-digest", observed_at=datetime.now(timezone.utc))
+    values.update(changes)
+    return insert(connection, "operation_evidence", **values)
 
 
 class SchemaConstraintTests(unittest.TestCase):
@@ -110,7 +129,10 @@ class SchemaConstraintTests(unittest.TestCase):
             admit_job(self.conn, **{**args, "request_digest": "c" * 64})
 
     def test_job_request_and_snapshot_are_immutable(self):
-        job, _ = admit_job(self.conn, **job_arguments(self.conn))
+        args = job_arguments(self.conn)
+        with self.assertRaises(DBAPIError), self.conn.begin_nested():
+            admit_job(self.conn, **{**args, "execution_snapshot": {}})
+        job, _ = admit_job(self.conn, **args)
         self.rejects("UPDATE control_plane.jobs SET request_digest=:digest WHERE id=:id", {"id": job, "digest": "d" * 64})
         self.rejects("UPDATE control_plane.jobs SET execution_snapshot=CAST(:value AS jsonb) WHERE id=:id", {"id": job, "value": '{"changed":true}'})
         self.rejects("DELETE FROM control_plane.jobs WHERE id=:id", {"id": job})
@@ -231,7 +253,7 @@ class SchemaConstraintTests(unittest.TestCase):
         operation = operation_arguments(self.conn, job, step)
         op = insert(self.conn, "operations", **operation)
         self.rejects("UPDATE control_plane.operations SET state='retryable' WHERE id=:id", {"id": op})
-        evidence = insert(self.conn, "operation_evidence", operation_id=op, kind="external_ref",
+        evidence = recorded_evidence(self.conn, op, kind="external_ref",
                           ref_key="remote", revision=1, data={"reference": "opaque"})
         self.rejects("DELETE FROM control_plane.operation_evidence WHERE id=:id", {"id": evidence})
         self.rejects("UPDATE control_plane.job_plugin_snapshots SET configuration_revision=2 WHERE job_id=:id", {"id": job})
@@ -240,12 +262,14 @@ class SchemaConstraintTests(unittest.TestCase):
     def test_job_cannot_reference_another_environments_secret(self):
         args = job_arguments(self.conn)
         job, _ = admit_job(self.conn, **args)
+        step = insert(self.conn, "job_steps", job_id=job, step_path="use-secret")
+        instance = operation_arguments(self.conn, job, step)["plugin_instance_id"]
         _, _, _, other_env, _ = graph(self.conn)
         secret = insert(self.conn, "secrets", purpose="environment", environment_id=other_env)
         version = insert(self.conn, "secret_versions", secret_id=secret, version=1,
                          ciphertext=b"encrypted", encryption_key_id="test-key")
-        self.rejects("INSERT INTO control_plane.job_secret_refs(job_id,secret_version_id) VALUES (:job,:secret)",
-                     {"job": job, "secret": version})
+        self.rejects("INSERT INTO control_plane.job_secret_refs(job_id,plugin_instance_id,secret_version_id) VALUES (:job,:instance,:secret)",
+                     {"job": job, "instance": instance, "secret": version})
 
     def test_session_cannot_use_management_secret(self):
         args = job_arguments(self.conn)
@@ -256,8 +280,8 @@ class SchemaConstraintTests(unittest.TestCase):
         secret = insert(self.conn, "secrets", purpose="admin_connection")
         version = insert(self.conn, "secret_versions", secret_id=secret, version=1,
                          ciphertext=b"encrypted", encryption_key_id="test-key")
-        self.conn.execute(text("INSERT INTO control_plane.job_secret_refs(job_id,secret_version_id) VALUES (:job,:secret)"),
-                          {"job": job, "secret": version})
+        self.conn.execute(text("INSERT INTO control_plane.job_secret_refs(job_id,plugin_instance_id,secret_version_id) VALUES (:job,:instance,:secret)"),
+                          {"job": job, "instance": operation["plugin_instance_id"], "secret": version})
         with self.assertRaises(DBAPIError):
             with self.conn.begin_nested():
                 insert(self.conn, "interactive_sessions", environment_id=args["environment_id"],
@@ -267,8 +291,8 @@ class SchemaConstraintTests(unittest.TestCase):
         environment_secret = insert(self.conn, "secrets", purpose="environment", environment_id=args["environment_id"])
         environment_version = insert(self.conn, "secret_versions", secret_id=environment_secret, version=1,
                                      ciphertext=b"encrypted", encryption_key_id="test-key")
-        self.conn.execute(text("INSERT INTO control_plane.job_secret_refs(job_id,secret_version_id) VALUES (:job,:secret)"),
-                          {"job": job, "secret": environment_version})
+        self.conn.execute(text("INSERT INTO control_plane.job_secret_refs(job_id,plugin_instance_id,secret_version_id) VALUES (:job,:instance,:secret)"),
+                          {"job": job, "instance": operation["plugin_instance_id"], "secret": environment_version})
         insert(self.conn, "interactive_sessions", environment_id=args["environment_id"],
                job_id=job, open_operation_id=op, actor_id=args["actor_id"],
                plugin_instance_id=operation["plugin_instance_id"], target_ref={},

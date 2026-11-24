@@ -619,7 +619,7 @@ async function showPlugins() {
   });
   secretForm.append(ref);
   for (const item of instances) {
-    const pane = section(area, (item.instance_alias || item.id) + " · " + item.plugin_key);
+    const pane = section(area, item.instance_alias + " · " + item.plugin_key);
     pane.append(el("p", item.available ? "可用" : "不可用"));
     const path = "/admin/plugins/" + item.id;
     const edit = formIn(pane);
@@ -636,7 +636,7 @@ async function showPlugins() {
 }
 
 async function showStorage(item, path) {
-  const area = changePage(item.instance_alias || item.plugin_key, "插件实例");
+  const area = changePage(item.instance_alias, "插件实例");
   const data = await api(path + "/storage");
   const pane = section(area, "实例存储");
   const form = formIn(pane);

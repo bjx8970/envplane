@@ -26,7 +26,7 @@ class EvidenceTests(TestCase):
         env, job, group = uuid4(), uuid4(), uuid4()
         now = datetime.now(timezone.utc)
         source = SimpleNamespace(id=job, kind="create", state="failed", execution_group_id=group,
-                                 execution_snapshot={"workflow": {"steps": [{"id": "provision"}, {"id": "unused"}]}})
+                                 execution_snapshot={"workflow": {"kind": "create", "steps": [{"id": "provision"}, {"id": "unused"}]}})
         step = SimpleNamespace(job_id=job, step_path="provision", item_key="item1")
         ops = [SimpleNamespace(id=uuid4(), attempt=n, job_id=job, step_path="provision", item_key="item1",
                                state="failed", target_ref={"key": "fixed"}, external_execution_ref=None,

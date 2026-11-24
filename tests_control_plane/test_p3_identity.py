@@ -149,7 +149,7 @@ class IdentityTests(unittest.TestCase):
             job = insert(db, "jobs", actor_id=self.teacher, environment_id=self.env,
                          execution_group_id=self.execution_group, logical_invocation_id=invocation,
                          request_key=uuid4().hex, request_digest="digest", kind="create",
-                         input={}, execution_snapshot={})
+                         input={}, execution_snapshot={"workflow": {"kind": "create", "steps": []}})
             step = insert(db, "job_steps", job_id=job, step_path="observe")
             op = insert(db, "operations", **operation_arguments(db, job, step))
             resource = insert(db, "experiment_resources", environment_id=self.env, logical_invocation_id=invocation,

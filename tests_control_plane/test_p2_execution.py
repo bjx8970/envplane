@@ -62,7 +62,7 @@ class P2DatabaseCase(unittest.TestCase):
             self.actor, self.course, self.version, self.env, self.group = graph(c)
             self.job = insert(c, "jobs", actor_id=self.actor, environment_id=self.env,
                               execution_group_id=self.group, request_key=uuid4().hex,
-                              request_digest="digest", kind="create", input={}, execution_snapshot={})
+                              request_digest="digest", kind="create", input={}, execution_snapshot={"workflow": {"kind": "create", "steps": []}})
             self.instance = insert(c, "plugin_instances", plugin_key="fake")
             insert(c, "plugin_instance_versions", instance_id=self.instance, revision=1,
                    configuration={}, plugin_version="1", code_digest="e" * 64)
@@ -268,7 +268,7 @@ class ExecutionRepositoryTests(P2DatabaseCase):
         self.assertIsNone(self.row("operations", op["id"])["output"])
         self.assertEqual(self.row("job_steps", self.step)["state"], "blocked")
         self.assertEqual(self.row("environments", self.env)["create_results"], {})
-        self.assertEqual(self.row("environments", self.env)["lifecycle"], "creating")
+        self.assertEqual(self.row("environments", self.env)["lifecycle"], "blocked")
         with self.engine.connect() as c:
             self.assertEqual(c.scalar(text("SELECT count(*) FROM control_plane.experiment_resources WHERE environment_id=:env"), {"env": self.env}), 0)
             self.assertEqual(c.scalar(text("SELECT data->'output' FROM control_plane.operation_evidence WHERE operation_id=:op AND event_id=:event"), {"op": op["id"], "event": "result:" + str(call.id)}), {"ok": True})

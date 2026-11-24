@@ -1,6 +1,6 @@
 """Persistent execution kernel; imports never start workers or connect to DB."""
 from .repository import (
-    Repository, ExecutionRepository, JobLease, CallAttempt, JobLeaseLost,
+    Repository, JobLease, CallAttempt, JobLeaseLost,
     ExecutionConflict, InvalidTransition,
 )
 from .adapters import (
@@ -11,7 +11,7 @@ from .adapters import (
 from .driver import ExecutionDriver, Driver, DriverSettings
 
 __all__ = [
-    "Repository", "ExecutionRepository", "JobLease", "CallAttempt", "JobLeaseLost",
+    "Repository", "JobLease", "CallAttempt", "JobLeaseLost",
     "ExecutionConflict", "InvalidTransition", "Projection", "LocalOutcomeApplicator",
     "AdmissionPolicy", "WorkflowPlanner", "ResultProjector", "OutcomeApplicator",
     "AdapterUnavailable", "UNAVAILABLE", "admit_request", "ExecutionDriver", "Driver",

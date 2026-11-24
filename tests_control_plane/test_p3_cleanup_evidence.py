@@ -6,23 +6,30 @@ from sqlalchemy import text
 from control_plane.business import _evidence
 from control_plane.plugins.sdk import canonical_json
 from control_plane.workflows import TemplateWorkflow
+from tests_control_plane.test_p1_schema import recorded_evidence
 from tests_control_plane.test_p2_storage import ServicesFixture
 
 
 class CleanupEvidenceTests(ServicesFixture, unittest.TestCase):
     def insert_job(self, uow, kind, state, flow):
-        return uow.scalar(text("""
+        snapshot = {"workflow": {**flow, "kind": kind}}
+        if kind == "create":
+            capture = self.configurations.capture_in(uow, self.instance, self.secrets, self.environment)
+            snapshot["plugins"] = {str(self.instance): capture}
+        job = uow.scalar(text("""
             INSERT INTO control_plane.jobs
                 (environment_id,execution_group_id,actor_id,request_key,request_digest,kind,input,execution_snapshot,state)
             VALUES (:env,:group,:actor,:key,'test',:kind,'{}',CAST(:snapshot AS jsonb),:state) RETURNING id
         """), {"env": self.environment, "group": self.group, "actor": self.teacher, "key": uuid4().hex,
-               "kind": kind, "state": state, "snapshot": canonical_json({"workflow": flow})})
+               "kind": kind, "state": state, "snapshot": canonical_json(snapshot)})
+        if kind == "create":
+            self.configurations.bind_capture_in(uow, job, self.instance, capture, self.secrets)
+        return job
 
     def test_unexpanded_cleanup_can_iterate_frozen_operation_and_ref_after_reload(self):
         with self.lease.fenced_transaction() as uow:
             source = self.insert_job(uow, "create", "failed", {
                 "steps": [{"id": "provision"}, {"id": "per_host"}, {"id": "never_started"}]})
-            self.configurations.pin_job_in(uow, source, self.instance, self.secrets)
         ops = {}
         for path, key in (("provision", ""), ("per_host", "unexpanded")):
             with self.lease.fenced_transaction() as uow:
@@ -33,15 +40,11 @@ class CleanupEvidenceTests(ServicesFixture, unittest.TestCase):
             op, _ = self.source(source, step, {}, state="failed")
             ops[path] = str(op)
             with self.lease.fenced_transaction() as uow:
-                uow.execute(text("""
-                    INSERT INTO control_plane.operation_evidence(operation_id,kind,ref_key,revision,data)
-                    VALUES (:op,'external_ref','vm',1,CAST(:ref AS jsonb))
-                """), {"op": op, "ref": canonical_json({"id": path + "-vm"})})
+                recorded_evidence(uow, op, kind="external_ref", ref_key="vm", data={"id": path + "-vm"})
 
         with self.lease.fenced_transaction() as uow:
             evidence = _evidence(uow, self.environment)
-            # This is also the evidence shape stored before the addressable view existed.
-            self.assertNotIn("unexpanded", evidence)
+            self.assertIn("provision", evidence["unexpanded"])
             self.assertIn("", evidence["steps"]["provision"])
             cleanup_step = {
                 "id": "release", "action": "echo", "plugin_instance": "fake", "timeout_seconds": 5,

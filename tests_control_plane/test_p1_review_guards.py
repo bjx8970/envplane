@@ -8,7 +8,7 @@ from sqlalchemy.exc import DBAPIError
 
 from control_plane.config import COORDINATOR_LOCK_KEY, RuntimeSettings
 from control_plane.coordination import CoordinatorLease, LeaseLost
-from control_plane.migrations import BASELINE_REVISION, SchemaMismatch, run_migrations
+from control_plane.migrations import run_migrations
 from control_plane.permissions import RuntimePermissionError
 from control_plane.persistence import admit_job, write_storage
 from control_plane.runtime import ControlPlaneRuntime
@@ -231,16 +231,12 @@ class ReviewDeploymentTests(unittest.TestCase):
                     runtime.start()
             runtime.stop()
 
-    def test_0001_requires_explicit_upgrade_and_0002_downgrades_cleanly(self):
+    def test_initial_schema_protects_evidence_from_truncate(self):
         with fresh_database() as url:
             settings = RuntimeSettings.from_env({"CONTROL_PLANE_DATABASE_URL": url})
-            run_migrations(settings, BASELINE_REVISION)
+            run_migrations(settings)
             engine = engine_for(url)
             try:
-                lease = CoordinatorLease(engine, COORDINATOR_LOCK_KEY)
-                with self.assertRaises(SchemaMismatch):
-                    lease.acquire()
-                run_migrations(settings)
                 with engine.begin() as conn:
                     for table in ("audit_events", "operation_evidence", "job_logs"):
                         with self.assertRaises(DBAPIError) as raised:
@@ -248,8 +244,8 @@ class ReviewDeploymentTests(unittest.TestCase):
                                 conn.execute(text(f"TRUNCATE control_plane.{table}"))
                         code = raised.exception.orig.args[0]["C"]
                         if table == "operation_evidence":
-                            # P2 provenance adds an incoming composite FK. PostgreSQL
-                            # can reject owner TRUNCATE before its statement trigger.
+                            # The evidence provenance FK allows PostgreSQL to
+                            # reject owner TRUNCATE before its statement trigger.
                             self.assertIn(code, ("23514", "0A000"))
                         else:
                             self.assertEqual(code, "23514")

@@ -152,19 +152,3 @@ class ConfigurationService:
              'snapshot': capture['storage_snapshot_id'], 'version': capture['plugin_version'], 'digest': capture['code_digest']})
         secret_service.bind_captured_refs_in(uow, job_id, instance_id, capture['environment_id'], capture['secret_refs'])
         return capture
-
-    def pin_job_in(self, uow, job_id, instance_id, secret_service):
-        require_fenced_connection(uow)
-        # Lock the namespace before selecting config/storage so administrative updates serialize.
-        uow.scalar(text('SELECT id FROM control_plane.plugin_instances WHERE id=:id FOR UPDATE'), {'id': instance_id})
-        config = self.get_in(uow, instance_id)
-        snapshot = self._storage.snapshot_in(uow, instance_id)
-        uow.execute(text('''INSERT INTO control_plane.job_plugin_snapshots
-            (job_id,instance_id,configuration_revision,storage_snapshot_id,plugin_version,code_digest)
-            VALUES (:job,:instance,:revision,:snapshot,:version,:digest)'''),
-            {'job': job_id, 'instance': instance_id, 'revision': config.revision, 'snapshot': snapshot.id,
-             'version': config.plugin_version, 'digest': config.code_digest})
-        secret_service.pin_job_in(uow, job_id, instance_id, config.id)
-        return {'instance_id': str(instance_id), 'configuration_revision': config.revision,
-                'storage_snapshot_id': snapshot.id, 'namespace_revision': snapshot.namespace_revision,
-                'plugin_version': config.plugin_version, 'code_digest': config.code_digest}

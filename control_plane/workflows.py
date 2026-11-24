@@ -38,19 +38,8 @@ def _context(flow, grouped, item_key=None):
                                             if r["state"] == "succeeded"}}
     context = {key: flow[key] for key in ("params", "action_params", "environment", "resource", "evidence")
                if flow.get(key) is not None}
-    if context.get("evidence"):
-        context["evidence"] = cleanup_evidence_context(context["evidence"])
     context["steps"] = outputs
     return context
-
-
-def cleanup_evidence_context(evidence):
-    # Preserve the frozen shape and expose ordinary attempts without colliding
-    # with any expanded item key, including for previously queued jobs.
-    return {**evidence, "unexpanded": {
-        path: instances.get("", {"operations": []})
-        for path, instances in evidence.get("steps", {}).items()
-    }}
 
 
 def _step_refs(value):
@@ -343,9 +332,7 @@ class TemplateWorkflow:
 def record_interruption(uow, job, *, blocked, cancelled=False):
     """Preserve ownership and partial outputs across failures, blocks, and cancellations."""
     from .quota import finish_quota
-    flow = job["execution_snapshot"].get("workflow")
-    if not isinstance(flow, dict):
-        return  # Historical P2 jobs have no environment lifecycle contract.
+    flow = job["execution_snapshot"]["workflow"]
     kind = flow["kind"]
     values = {"env": job["environment_id"], "group": job["execution_group_id"], "job": job["id"],
               "actor": job["actor_id"]}
