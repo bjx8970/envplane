@@ -24,12 +24,15 @@
       "template_fixed_inputs": ["command"],
       "input_schema": {
         "type": "object", "additionalProperties": false,
-        "properties": {"host_id": {"type": "string", "minLength": 1, "maxLength": 240, "pattern": "^[^/]+$"}, "command": {"type": "string", "minLength": 1, "maxLength": 65536}},
+        "properties": {"host_id": {"type": "string", "minLength": 1, "maxLength": 240, "pattern": "^[^/]+$"}, "command": {"type": "string", "minLength": 1, "maxLength": 65536},
+          "include_target_fingerprint": {"type": "boolean"},
+          "expected_target_fingerprint": {"type": "string", "pattern": "^[a-f0-9]{64}$"}},
         "required": ["host_id", "command"]
       },
       "output_schema": {
         "type": "object", "additionalProperties": false,
-        "properties": {"exit_code": {"type": "integer"}, "stdout": {"type": "string", "maxLength": 1048576}, "stderr": {"type": "string", "maxLength": 1048576}},
+        "properties": {"exit_code": {"type": "integer"}, "stdout": {"type": "string", "maxLength": 1048576}, "stderr": {"type": "string", "maxLength": 1048576},
+          "target_fingerprint": {"type": "string", "pattern": "^[a-f0-9]{64}$"}},
         "required": ["exit_code", "stdout", "stderr"]
       },
       "execution": {"effect": "mutating", "idempotency": "unsupported", "recovery": "unsupported", "cancellation": "unsupported"}

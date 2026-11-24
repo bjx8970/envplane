@@ -180,7 +180,8 @@ UI 只显示模板向角色开放且插件可执行的动作。插件不可用�
         "action": "execute_command",
         "input": {
           "host_id": {"$ref": "params.target_host"},
-          "command": "uname -s"
+          "command": "uname -s",
+          "include_target_fingerprint": true
         },
         "timeout_seconds": 30
       }
@@ -193,7 +194,8 @@ UI 只显示模板向角色开放且插件可执行的动作。插件不可用�
       "type_label": "检查结果",
       "data": {
         "host_id": {"$ref": "params.target_host"},
-        "system": {"$ref": "steps.inspect.output.stdout"}
+        "system": {"$ref": "steps.inspect.output.stdout"},
+        "target_fingerprint": {"$ref": "steps.inspect.output.target_fingerprint"}
       },
       "actions": {
         "inspect_again": {
@@ -207,7 +209,8 @@ UI 只显示模板向角色开放且插件可执行的动作。插件不可用�
               "action": "execute_command",
               "input": {
                 "host_id": {"$ref": "resource.data.host_id"},
-                "command": "uname -s"
+                "command": "uname -s",
+                "expected_target_fingerprint": {"$ref": "resource.data.target_fingerprint"}
               },
               "timeout_seconds": 30
             }
@@ -226,7 +229,7 @@ UI 只显示模板向角色开放且插件可执行的动作。插件不可用�
 }
 ```
 
-此模板登记的是平台检查产出，不是自动登记 SSH 管理主机资产。一个不需要产出的模板可以将 resources 设为空。空 cleanup 只适用于管理员明确声明无外部清理需求的流程，不能据此消除 unknown 调用。
+模板把首次成功执行的 SSH 目标指纹保存在资源数据中。后续独立动作从新 Job 的快照解析清单项，并在 prepare 校验指纹。IP、端口、用户名或主机密钥变化时需要核对目标，凭据轮换可以继续使用原目标。一个不需要产出的模板可以将 resources 设为空。空 cleanup 只适用于管理员明确声明无外部清理需求的流程，不能据此消除 unknown 调用。
 
 VM 模板可将创建结果的 vm_ref 放入 resource.data，并将启动、停止、重启动作绑定到插件；核心无需改变类型逻辑。这是后续插件用例，不表示首版已有 PVE 插件。
 

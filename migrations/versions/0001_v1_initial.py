@@ -16,12 +16,12 @@ _TABLES = (
     "jobs", "job_steps", "operations", "operation_evidence", "operation_call_attempts",
     "job_logs", "local_resource_items", "job_plugin_snapshots", "job_secret_refs", "secrets",
     "secret_versions", "interactive_sessions", "audit_events", "coordinator_leases",
-    "environment_credential_confirmations", "access_revocations",
+    "environment_credential_confirmations", "access_revocations", "execution_recovery_requests",
 )
 
 
 def upgrade():
-    for file in ("v1_core.sql", "v1_execution.sql", "v1_credentials.sql"):
+    for file in ("v1_core.sql", "v1_execution.sql", "v1_credentials.sql", "v1_recovery.sql"):
         op.execute(Path(__file__).with_name(file).read_text(encoding="utf-8"))
     for table in (
         "plugin_instance_versions", "plugin_storage_versions", "plugin_storage_snapshots",

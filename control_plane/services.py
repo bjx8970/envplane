@@ -55,6 +55,7 @@ class PluginServices:
         self.secrets = None
         self.configuration = None
         self.driver = None
+        self.recovery = None
         self._listener = None
         self.sessions = None
         self.session_openings = None
@@ -110,8 +111,11 @@ class PluginServices:
             # Unavailable optional packages only block dependent workflows.
             workflow = TemplateWorkflow()
             repository = Repository(self.runtime, authorize_job=partial(authorize_job, registry=self.registry))
+            from .execution.recovery import RecoveryRequests
+            self.recovery = repository.recovery = RecoveryRequests(repository, data["max_pending_jobs"])
             self.driver = ExecutionDriver(repository, self.capacity, self.registry, self.contexts,
-                                          planner=workflow, projector=workflow, applicator=workflow)
+                                          planner=workflow, projector=workflow, applicator=workflow,
+                                          recovery=self.recovery)
             if self.session_factory is None:
                 from .session_jobs import SessionOpenJobs
                 self.session_openings = SessionOpenJobs(self, repository, workflow,

@@ -36,7 +36,7 @@ def check_schema(connection) -> None:
         "jobs", "job_steps", "operations", "operation_evidence", "job_logs", "local_resource_items",
         "job_plugin_snapshots", "job_secret_refs", "secrets", "secret_versions", "interactive_sessions",
         "audit_events", "coordinator_leases", "operation_call_attempts",
-        "environment_credential_confirmations", "access_revocations",
+        "environment_credential_confirmations", "access_revocations", "execution_recovery_requests",
     }
     tables = set(connection.scalars(text("SELECT tablename FROM pg_tables WHERE schemaname='control_plane'")))
     if not required <= tables:

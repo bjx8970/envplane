@@ -132,7 +132,7 @@ class MigrationTests(unittest.TestCase):
                 engine.dispose()
 
     def test_retired_revision_refuses_start_upgrade_and_downgrade(self):
-        retired_revision = "0004_p3_business_services"
+        retired_revision = "0005_admin_recovery"
         with migrated_database() as url:
             engine = engine_for(url)
             try:

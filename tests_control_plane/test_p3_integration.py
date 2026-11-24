@@ -98,10 +98,10 @@ class BusinessIntegrationTests(unittest.TestCase):
         self.services.templates.publish(self.admin, self.version)
 
     @contextmanager
-    def endpoint(self, mode="success"):
+    def endpoint(self, mode="success", port=0):
         context = multiprocessing.get_context("spawn")
         parent, child = context.Pipe(duplex=False)
-        process = context.Process(target=_server, args=(self.private_key, child, mode), daemon=True)
+        process = context.Process(target=_server, args=(self.private_key, child, mode, port), daemon=True)
         process.start()
         child.close()
         try:
@@ -174,7 +174,9 @@ class BusinessIntegrationTests(unittest.TestCase):
         resource = self.one("""SELECT id,resource_slot,data,access_snapshot
             FROM control_plane.experiment_resources WHERE environment_id=:env""", env=env)
         self.assertEqual(resource.resource_slot, "report")
-        self.assertEqual(resource.data, {"host_id": "test", "system": "test-output\n"})
+        self.assertEqual(resource.data["host_id"], "test")
+        self.assertEqual(resource.data["system"], "test-output\n")
+        self.assertRegex(resource.data["target_fingerprint"], r"^[a-f0-9]{64}$")
         self.assertEqual(resource.access_snapshot, {})
         self.assertEqual(self.one("""SELECT e.lifecycle,q.state FROM control_plane.environments e
             JOIN control_plane.quota_reservations q ON q.environment_id=e.id WHERE e.id=:env""",
@@ -188,10 +190,17 @@ class BusinessIntegrationTests(unittest.TestCase):
         with self.assertRaises(AuthorizationDenied):
             self.business.cleanup(self.student, environment_id=env, request_key="delete")
         self.services.templates.disable(self.admin, self.version)
-        with self.endpoint():
+        port = self.storage.get("hosts/test").value["port"]
+        with self.endpoint(port=port):
             inspect_job, replay = self.business.run_action(self.student, **action)
             self.assertFalse(replay)
             self.finish(inspect_job)
+        previous = self.storage.get("hosts/test").value
+        self.host_version = self.storage.put("hosts/test", {**previous, "hostname": "127.0.0.2"}, self.host_version)
+        rejected_job, _ = self.business.run_action(self.student, **dict(action, request_key="remapped"))
+        self.finish(rejected_job, "failed")
+        self.assertEqual(self.one("SELECT count(*) FROM control_plane.operations WHERE job_id=:job",
+                                  job=rejected_job)[0], 0)
         self.identity.revoke_assignment(self.teacher, assignment)
         with self.assertRaises(AuthorizationDenied):
             self.business.run_action(self.student, **action)

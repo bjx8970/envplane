@@ -69,6 +69,11 @@ output { display: block; }
 #feedback { position: fixed; right: 1rem; bottom: 1rem; max-width: min(35rem, 92vw); z-index: 10; }
 #feedback:not(:empty) { padding: .7rem 1rem; background: #14243e; color: white; border-radius: .35rem; }
 .terminal { height: 23rem; min-height: 12rem; background: #131c2d; padding: .5rem; }
+.operations-list { list-style: none; padding: 0; }
+.operations-list li { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin: .5rem 0; }
+.operations-item + .operations-item { border-top: 1px solid var(--border); margin-top: .75rem; padding-top: .5rem; }
+.capacity-table { border-collapse: collapse; width: 100%; margin: .75rem 0; }
+.capacity-table :is(th, td) { border-bottom: 1px solid var(--border); padding: .45rem; text-align: left; }
 @media (max-width: 700px) {
   .workspace { display: block; }
   nav { flex-direction: row; flex-wrap: wrap; margin-bottom: 1rem; }

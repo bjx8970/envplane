@@ -120,7 +120,8 @@ function drawNavigation() {
   nav.append(button("实验环境", showEnvironments));
   if (state.user.role !== "student") nav.append(button("课程与成员", showCourses));
   if (state.user.role === "admin") {
-    nav.append(button("模板版本", showTemplates), button("插件实例", showPlugins), button("账户与配额", showAccounts));
+    nav.append(button("模板版本", showTemplates), button("插件实例", showPlugins),
+      button("账户与配额", showAccounts), button("运维", () => showOperations()));
   }
   nav.append(button("个人资料", showProfile));
 }
@@ -261,6 +262,229 @@ async function showJob(jobId) {
     logs.replaceChildren(logs.firstChild, el("pre", events.length ?
       events.map(item => item.sequence + " · " + item.code + " · " + item.created_at).join("\n") : "暂无日志事件"));
   }));
+}
+
+async function showOperations(before) {
+  const area = changePage("运维", "运维");
+  const screen = state.screen;
+  const suffix = before ? "?before=" + encodeURIComponent(before) : "";
+  const [status, page] = await Promise.all([
+    api("/admin/operations/status"), api("/admin/blocked-jobs" + suffix),
+  ]);
+  if (state.screen !== screen) return;
+  const overview = section(area, "控制面状态");
+  const lease = status.coordinator;
+  const quota = status.quarantined_quota;
+  overview.append(el("p", status.status === "ready" ? "就绪" : "降级", { role: "status" }),
+    el("p", `协调租约 ${lease.state} · 版本 ${lease.revision} · 上次续租 ${lease.heartbeat_at || "—"} · 到期 ${lease.expires_at || "—"}`),
+    el("p", `隔离配额 · ${quota.affected_environments} 个受影响环境 · ${quota.environments} 环境额度 · ${quota.vms} VM · ${quota.vcpu} vCPU · ${quota.memory_mb} MiB`));
+  if (status.capacity) {
+    const table = el("table", "", { "aria-label": "执行池容量", class: "capacity-table" });
+    const head = el("thead");
+    const heading = el("tr");
+    for (const label of ["执行池", "线程", "运行", "排队", "超期"]) {
+      heading.append(el("th", label, { scope: "col" }));
+    }
+    head.append(heading);
+    const body = el("tbody");
+    const lanes = { ordinary: "普通操作", control: "控制调用", session: "交互会话" };
+    for (const [lane, values] of Object.entries(status.capacity.lanes)) {
+      const row = el("tr");
+      row.append(el("th", lanes[lane] || lane, { scope: "row" }));
+      for (const key of ["workers", "active", "queued", "overdue"]) row.append(el("td", values[key]));
+      body.append(row);
+    }
+    table.append(head, body);
+    overview.append(table);
+    if (status.capacity.manual_restart_required) overview.append(el("p", "存在超期调用，需要人工重启。"));
+  }
+  overview.append(button("刷新运维状态", () => showOperations(before)));
+  const jobs = section(area, "阻断 Job");
+  if (!page.jobs.length) jobs.append(el("p", "暂无阻断 Job"));
+  const list = el("ul", "", { class: "operations-list" });
+  for (const job of page.jobs) {
+    const item = el("li");
+    item.append(button("查看 " + job.environment_name, () => showBlockedJob(job.job_id)),
+      el("span", `${job.kind} · ${job.reason || job.state} · ${job.updated_at}`));
+    list.append(item);
+  }
+  jobs.append(list);
+  if (before) jobs.append(button("返回第一页", () => showOperations()));
+  if (page.next_before) jobs.append(button("下一页", () => showOperations(page.next_before)));
+}
+
+const RECOVERY_ACTIONS = {
+  review: "记录核对", poll: "查询原调用", apply_result: "应用已保存结果",
+};
+const RECOVERY_REASONS = {
+  evidence_reviewed: "已阅览证据摘要", evidence_inconclusive: "证据不足，仍需核对",
+  check_remote_status: "确认原调用的远端状态", apply_verified_result: "采用已保存的成功证据",
+  external_success_declared: "管理员声明已独立核实外部成功",
+};
+const RECOVERY_STATES = {
+  queued: "等待处理", running: "处置中", completed: "已完成", blocked: "仍阻断",
+};
+const RECOVERY_OUTCOMES = {
+  reviewed: "已保存核对记录", result_applied: "已应用成功结果",
+  remote_succeeded: "插件查询报告成功", remote_failed: "插件查询报告失败",
+  external_verification_declared: "已保存外部核验声明",
+  remote_still_pending: "远端仍在执行", unknown_external_result: "远端结果仍未知",
+  protocol_error: "结果未通过协议验证", recovery_interrupted: "处置中断",
+  recovery_could_not_proceed: "当前授权或依赖无法完成处置",
+  request_no_longer_eligible: "原 Job 或授权条件已变化",
+  call_deadline_exceeded: "查询超期", dispatch_capacity_unavailable: "查询容量不足",
+};
+const VERIFICATION_SOURCES = {
+  provider_console: "供应商控制台", provider_api: "供应商 API", independent_record: "独立运维记录",
+};
+const VERIFICATION_METHODS = {
+  matched_execution: "核对原调用记录", checked_resource_state: "检查外部资源状态",
+  cross_checked_records: "交叉核对操作记录",
+};
+
+function externalVerificationForm(panel, save) {
+  const form = formIn(panel);
+  form.append(el("p", "请依据独立来源核实外部执行事实。平台将把以下内容记录为管理员声明。"));
+  const source = select(form, "外部核验来源", Object.entries(VERIFICATION_SOURCES),
+    { empty: "选择来源", required: true });
+  const method = select(form, "外部核验方法", Object.entries(VERIFICATION_METHODS),
+    { empty: "选择方法", required: true });
+  const reference = field(form, "外部核验记录编号", { attrs: { required: "", maxlength: 128 } });
+  const conclusion = select(form, "外部核验结论", [["confirmed_succeeded", "已独立核实原调用成功"]],
+    { empty: "选择结论", required: true });
+  submit(form, "保存外部核验声明", () => save({
+    source: source.value, method: method.value, reference: reference.value, conclusion: conclusion.value,
+  }));
+}
+
+function renderEvidenceSummary(panel, detail) {
+  if (detail.outcome) panel.append(el("p", "插件报告 · " + detail.outcome));
+  if (detail.protocol_error) panel.append(el("p", "结果未通过协议校验"));
+  const labels = { target: "固定目标", current_reference: "当前续查引用",
+    reported_reference: "返回的续查引用", evidence: "证据内容", output: "结果输出" };
+  for (const [key, label] of Object.entries(labels)) {
+    const value = detail[key];
+    if (value) panel.append(el("p", `${label} · ${value.type} · ${value.bytes} 字节 · 指纹 ${value.fingerprint}`));
+  }
+  if (detail.method) panel.append(el("p", "来源方式 · " + detail.method));
+  if (detail.external_reference_count !== undefined) {
+    panel.append(el("p", `外部引用 ${detail.external_reference_count} 条 · 检查点 ${detail.checkpoint_count} 条`));
+  }
+}
+
+async function showBlockedJob(jobId) {
+  const area = changePage("阻断 Job", "运维");
+  const screen = state.screen;
+  const path = "/admin/blocked-jobs/" + jobId;
+  const content = el("div");
+  let timer;
+  state.onLeave.push(() => clearTimeout(timer));
+  area.append(button("返回运维", () => showOperations()), content);
+
+  async function refresh() {
+    clearTimeout(timer);
+    const job = await api(path);
+    if (state.screen !== screen) return;
+    content.replaceChildren();
+    const info = section(content, job.environment_name);
+    info.append(el("p", `${job.kind} · ${job.state} · ${job.reason || job.group_state}`),
+      el("p", "Job " + job.job_id), button("刷新处置状态", refresh));
+    const busy = job.requests.some(request => ["queued", "running"].includes(request.state));
+
+    function sendRecovery(action) {
+      let pending;
+      return async details => {
+        const payload = { action, expected_revision: job.group_revision, ...details };
+        const signature = JSON.stringify(payload);
+        if (!pending || pending.signature !== signature) pending = { signature, key: crypto.randomUUID() };
+        await api(path + "/recovery", "POST", { ...payload, request_key: pending.key });
+        await refresh();
+      };
+    }
+
+    const operations = section(content, "关联 Operation");
+    if (!job.operations.length) operations.append(el("p", "暂无 Operation"));
+    for (const operation of job.operations) {
+      const item = el("div", "", { class: "operations-item" });
+      item.append(el("h3", operation.step_path),
+        el("p", `${operation.state} · ${operation.operation_id}`),
+        el("p", operation.dispatch_intent_at ? "派发意图记录于 " + operation.dispatch_intent_at : "暂无派发意图"));
+      if (job.recoverable && operation.can_poll && !busy) {
+        const send = sendRecovery("poll");
+        item.append(button("查询原调用", () => send({
+          operation_id: operation.operation_id, reason: "check_remote_status",
+        })));
+      }
+      operations.append(item);
+    }
+
+    const evidence = section(content, "证据");
+    if (!job.evidence.length) evidence.append(el("p", "暂无执行证据"));
+    for (const record of job.evidence) {
+      const item = el("div", "", { class: "operations-item" });
+      item.append(el("p", `${record.kind} · ${record.created_at}`), el("p", "证据 " + record.evidence_id),
+        el("p", "Operation " + record.operation_id),
+        el("p", record.call_attempt_id ? "来源调用 " + record.call_attempt_id : "来源调用未知"));
+      const details = el("div");
+      const attestation = job.requests.find(request => request.action === "review" &&
+        request.actor_id === state.user.id && request.reason === "external_success_declared" &&
+        request.evidence_id === record.evidence_id && request.expected_revision === job.group_revision);
+      const review = sendRecovery("review");
+      item.append(button("查看证据详情", async () => {
+        const detail = await api(path + "/evidence/" + record.evidence_id);
+        details.replaceChildren();
+        renderEvidenceSummary(details, detail);
+        if (job.state === "blocked" && !busy && detail.group_revision === job.group_revision) {
+          details.append(button("记录已阅览摘要", () => review({
+            operation_id: record.operation_id, evidence_id: record.evidence_id, reason: "evidence_reviewed",
+          })));
+          if (job.recoverable && record.can_apply && !attestation) {
+            externalVerificationForm(details, verification => review({
+              operation_id: record.operation_id, evidence_id: record.evidence_id,
+              reason: "external_success_declared", verification,
+            }));
+          }
+        }
+      }), details);
+      if (job.recoverable && record.can_apply && !busy) {
+        if (attestation) {
+          const send = sendRecovery("apply_result");
+          item.append(button("应用已保存结果", () => send({
+            operation_id: record.operation_id, evidence_id: record.evidence_id,
+            confirmed_review_id: attestation.request_id, reason: "apply_verified_result",
+          })));
+        } else {
+          item.append(el("p", "应用结果前请查看证据详情，并提交外部核验声明。"));
+        }
+      }
+      evidence.append(item);
+    }
+
+    const history = section(content, "处置记录");
+    if (!job.requests.length) history.append(el("p", "暂无处置记录"));
+    for (const request of job.requests) {
+      const record = el("div", "", { class: "operations-item" });
+      const outcome = RECOVERY_OUTCOMES[request.outcome] || RECOVERY_STATES[request.state];
+      record.append(el("p", `${RECOVERY_ACTIONS[request.action]} · ${outcome}`),
+        el("p", `${RECOVERY_REASONS[request.reason]} · ${request.created_at}`),
+        el("p", "管理员 " + request.actor_id));
+      if (request.verification) {
+        const verification = request.verification;
+        record.append(el("p", `管理员外部核验 · ${VERIFICATION_SOURCES[verification.source]}` +
+          ` · ${VERIFICATION_METHODS[verification.method]} · 原调用成功 · 记录指纹 ${verification.reference_fingerprint}`));
+      }
+      history.append(record);
+    }
+    if (job.state === "blocked" && !busy) {
+      const form = formIn(history);
+      const reason = select(form, "核对结论", ["evidence_reviewed", "evidence_inconclusive"]
+        .map(key => [key, RECOVERY_REASONS[key]]));
+      const send = sendRecovery("review");
+      submit(form, "保存核对记录", () => send({ reason: reason.value }));
+    }
+    if (busy) timer = setTimeout(() => refresh().catch(error => announce(error.message)), 1200);
+  }
+  await refresh();
 }
 
 async function showEnvironments() {
@@ -622,6 +846,14 @@ async function showPlugins() {
     const pane = section(area, item.instance_alias + " · " + item.plugin_key);
     pane.append(el("p", item.available ? "可用" : "不可用"));
     const path = "/admin/plugins/" + item.id;
+    if (item.needs_rebind) {
+      pane.append(el("p", "当前配置版本绑定了旧插件代码。核对配置后可为新任务发布版本。"),
+        button("为已加载插件发布配置", async () => {
+          if (!window.confirm("确认将当前配置用于已加载插件？既有 Job 仍按各自的固定版本处理。")) return;
+          await api(path + "/rebind", "POST", { expected_revision: item.configuration_revision });
+          await showPlugins();
+        }));
+    }
     const edit = formIn(pane);
     const config = jsonField(edit, "当前配置（JSON）", item.configuration);
     submit(edit, "保存配置版本", async () => {

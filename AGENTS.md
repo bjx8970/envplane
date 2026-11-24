@@ -9,7 +9,7 @@
 - [执行与持久化](docs/execution-persistence-contract.md)
 - [身份、授权与安全](docs/identity-security-contract.md)
 
-专题文档定义 v1 目标设计。控制面入口为 `python -m control_plane`，已接入 P0 启动、P1 持久化协调和最小权限、P2 插件运行时和 Job/Operation 执行、P3 模板与业务授权/配额，以及 P5 HTTP、模板界面和浏览器终端。变更说明区分设计、实现和实测。验收使用回环 SSH 与隔离数据库，范围见 [P5 验收记录](tests_control_plane/browser/P5_ACCEPTANCE.md)。
+专题文档定义 v1 目标设计。控制面入口为 `python -m control_plane`，已接入 P0 启动、P1 持久化协调和最小权限、P2 插件运行时和 Job/Operation 执行、P3 模板与业务授权/配额，以及 P5 HTTP、模板界面和浏览器终端。管理员可查询运维状态并按证据处置阻断 Job。变更说明区分设计、实现和实测。验收使用回环 SSH 与隔离数据库，范围见 [P5 验收记录](tests_control_plane/browser/P5_ACCEPTANCE.md)。
 
 ## 不得偏离的产品边界
 
